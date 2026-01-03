@@ -43,7 +43,6 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, co
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
 model = CDEModel(len(features)* 2 + 1, static_features_dim, LATENT_DIM, device).to(device)
-print(model)
 model.load_state_dict(torch.load('EXPs/LME_exp/model_latent_4_CDE_diagoG.pth', map_location='cpu')['model_state_dict'])
 
 random_effect_std_devs = torch.exp(model.decoder.log_std_devs)
@@ -53,8 +52,8 @@ print("Learned Random Effect Standard Deviations:", random_effect_std_devs)
 residual_std_dev = torch.sqrt(torch.exp(model.decoder.log_residual_var))
 print(f"\nLearned Residual Standard Deviation: {residual_std_dev.item():.4f}")
 
-# train_mse, train_pop_mse = calculate_fit_mse_with_blup(model, train_loader, device)
-# print(f"train fitted MSE: {train_mse:.4f}, {train_pop_mse:.4f}")
+train_mse, train_pop_mse = calculate_fit_mse_with_blup(model, train_loader, device)
+print(f"train fitted MSE: {train_mse:.4f}, {train_pop_mse:.4f}")
 
 # validation_mse, val_pop_mse = calculate_fit_mse_with_blup(model, val_loader, device)
 # print(f"Validation fitted MSE: {validation_mse:.4f}, {val_pop_mse:.4f}")
@@ -62,8 +61,8 @@ print(f"\nLearned Residual Standard Deviation: {residual_std_dev.item():.4f}")
 # log_likelihood = lme_log_likelihood(model, val_loader, device)
 # print("validation dataset likelihood", log_likelihood)
 
-train_log_likelihood = lme_log_likelihood(model, train_loader, device)
-print("train dataset likelihood", train_log_likelihood)
+# train_log_likelihood = lme_log_likelihood(model, train_loader, device)
+# print("train dataset likelihood", train_log_likelihood)
 
 # validation_mse = calculate_prediction_mse_with_blup(model, val_loader, device)
 # print(f"Validation pred MSE: {validation_mse:.4f}")
@@ -74,7 +73,6 @@ print("train dataset likelihood", train_log_likelihood)
 
 ###random select participant to plot 
 sample_ids = train_df['NUM_ID'].sample(n=45, random_state=2).tolist()
-#List of 15 patient IDs (replace with actual IDs from your dataset)
 
 hlme_predictions = pd.read_csv('results/ISA15_Model_4_train_predicted.csv', sep=',')
 fig, axes = plt.subplots(5, 5, figsize=(22, 12), sharex=True, sharey=True)
@@ -85,6 +83,8 @@ for idx, patient_id in enumerate(sample_ids):
     sample_patient_data = filter_patient_with_id(patient_id, train_dataset)
     
     # Compute predicted trajectory
+    t_points, seq_preds, actual_y, pop_preds = fitted_trajectory(model, sample_patient_data, device)
+    # Compute fitted trajectory
     t_points, seq_preds, actual_y, pop_preds = calculate_sequential_blup_forecasting(model, sample_patient_data, device)
 
     hlme_prediction = hlme_predictions[hlme_predictions.NUM_ID==patient_id]
@@ -100,7 +100,7 @@ for idx, patient_id in enumerate(sample_ids):
     ax = axes[count]
     # Plot actual vs predicted
     ax.plot(t_points, actual_y, 'o', label='Real data', color='royalblue', markersize=6, zorder=5)
-    ax.plot(t_points, seq_preds, label='BLUP', color='forestgreen', linewidth=2, linestyle='--')
+    ax.plot(t_points, seq_preds, label='CDE_LMM', color='forestgreen', linewidth=2, linestyle='--')
     ax.plot(t_points, hlme_prediction['Y_predicted'], label='HLME', color='black', linewidth=2, linestyle='--')
 
     ax.set_title(f'Patient ID: {patient_id}', fontsize=10)

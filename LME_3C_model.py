@@ -45,11 +45,11 @@ def masked_NLL(predicted_mean, targets, V, mask):
     loss = 0.5 * (logdet_V + quad_term + log_2pi_term)
     return loss.mean()
 
-    
 class Decoder_with_static(nn.Module):
     def __init__(self, latent_dim, static_dim, response_dim, device, fullG=False):
         super().__init__()
         self.device = device
+
         # Non-linear decoder for fixed effects
         # self.fixed_effects_decoder = nn.Sequential(
         #     nn.Linear(latent_dim, latent_dim * 2),
@@ -67,10 +67,10 @@ class Decoder_with_static(nn.Module):
         self.output_layer = nn.Linear(latent_dim *2, response_dim)
         self.fullG = fullG
 
-        # Revert to a single linear layer
+        # A single linear layer decoder
         # self.fixed_effects_decoder = nn.Linear(latent_dim, response_dim)
+
         if fullG:
-            # self.fixed_effects_decoder = nn.Linear(latent_dim, response_dim)
             # Random effects: full covariance via Cholesky
             self.num_random_effects = latent_dim + 1  # intercept + latent dims
             L_init = 0.01 * torch.randn(self.num_random_effects, self.num_random_effects)
@@ -90,15 +90,13 @@ class Decoder_with_static(nn.Module):
 
     def forward(self, z_t, s_i, CDE=True, return_components=False):
         N, T, _ = z_t.shape
-        # z_t = self.z_ln(z_t)
-        # z_t_static = torch.cat([z_t, s_i.unsqueeze(1).expand(-1, T, -1)], dim=-1)
+
         if CDE and T > 1:
             z_t_norm = (z_t - z_t.mean(dim=1, keepdim=True)) / (z_t.std(dim=1, keepdim=True) + 1e-8)
             # z_t_static = torch.cat([z_t_norm, s_i.unsqueeze(1).expand(-1, T, -1)], dim=-1)
             # predicted_mean = self.fixed_effects_decoder(z_t_norm)
             h_out, _ = self.decoder_gru(z_t_norm)
         else:
-            fixed_effects_input = z_t
             z_t_static = torch.cat([z_t, s_i.unsqueeze(1).expand(-1, T, -1)], dim=-1)
             # predicted_mean = self.fixed_effects_decoder(z_t)
             h_out, _ = self.decoder_gru(z_t)
@@ -110,27 +108,28 @@ class Decoder_with_static(nn.Module):
 
         if not self.fullG:
             random_effect_vars = torch.exp(self.log_std_devs)**2
-            G = torch.diag(random_effect_vars)
+            D = torch.diag(random_effect_vars)
         else:
             # Build full random effect covariance G = L L^T
-            G = self.L @ self.L.T + 1e-4 * torch.eye(self.num_random_effects, device=self.device)
+            D = self.L @ self.L.T + 1e-4 * torch.eye(self.num_random_effects, device=self.device)
 
-        V_random = (Z @ G) @ Z.permute(0, 2, 1)
+        V_random = (Z @ D) @ Z.permute(0, 2, 1)
 
         residual_variance = torch.exp(self.log_residual_var)
         R = residual_variance * torch.eye(T, device=self.device).unsqueeze(0).repeat(N, 1, 1)
 
-        V = V_random + R
+        V = V_random + R #marginal variance
 
         if return_components:
-            return predicted_mean, V, Z, G
+            return predicted_mean, V, Z, D
         else:
             return predicted_mean, V
 
 class ODEFunc(nn.Module):
     def __init__(self, hidden_dim, static_dim):
         super(ODEFunc, self).__init__()
-        # Your sequential model defines the dynamics dy/dt = f(t, y)
+
+        # The sequential model defines the dynamics dy/dt = f(t, y)
         self.dynamics_func = nn.Sequential(
             nn.Linear(hidden_dim + static_dim, 16),
             nn.Tanh(),
@@ -144,6 +143,7 @@ class ODEFunc(nn.Module):
 class VectorField_with_static(nn.Module):
     def __init__(self, hidden_dim, input_dim, static_dim):
         super().__init__()
+
         # hidden_dim is the full augmented dimension (dynamic_dim + static_dim)
         self.hidden_dim_augmented = hidden_dim
         self.static_dim = static_dim
@@ -176,6 +176,7 @@ class VectorField_with_static(nn.Module):
 class ODENet(nn.Module):
     def __init__(self, scripted_ode_func, static_feature_dim, hidden_dim, device, fullG=False):
         super(ODENet, self).__init__()
+
         # 1. The Encoder: Maps static features to the initial hidden state z0
         self.encoder = nn.Sequential(
             nn.Linear(static_feature_dim, 16),
@@ -204,6 +205,7 @@ class ODENet(nn.Module):
                 nn.init.zeros_(layer.bias)
 
     def forward(self, s_i, t, CDE = False, metabolic_baseline=None, return_components=False):
+
         if isinstance(metabolic_baseline, torch.Tensor):
             s_i = torch.cat([s_i, metabolic_baseline], dim=1)
 
@@ -216,19 +218,18 @@ class ODENet(nn.Module):
         func = lambda t, z: self.dynamics_func(t, z, s_i)
         z_t = odeint(func, z0, t, method='rk4')
         
-        # The solver returns the hidden state at each time point in t
+        # The solver returns the hidden state at each time point
         # Shape: (num_time_points, batch_size, hidden_dim)
-        
-        # For this example, let's reorder to (batch, time, channels)
+        # let's reorder to (batch, time, channels)
         z_t = z_t.permute(1, 0, 2)
         
         # Decode the trajectory to get the final output
         return self.decoder(z_t, CDE=CDE, return_components=return_components)
 
-    
 class CDEModel(nn.Module):
     def __init__(self, input_dim, static_dim, hidden_dim, device, fullG=False):
         super().__init__()
+
         # self.encoder = nn.GRU(input_size=input_dim + static_dim,
         #               hidden_size=hidden_dim,
         #               batch_first=True)
@@ -241,7 +242,6 @@ class CDEModel(nn.Module):
 
         self.func = VectorField_with_static(
             hidden_dim=(hidden_dim + static_dim),
-            # hidden_dim=hidden_dim,
             input_dim=input_dim,
             static_dim=static_dim
 
@@ -283,13 +283,9 @@ class CDEModel(nn.Module):
 
             dynamic_hidden_dim = z0.shape[-1]
             dynamic_z_t = z_t_augmented[..., :dynamic_hidden_dim]
-
-            # z_t = torchcde.cdeint(X=X, z0=z0, func=self.func, t=t, method='rk4', adjoint=False)
             return self.decoder(dynamic_z_t, s_i, return_components=return_components)
         else:
             z0 = z0.unsqueeze(1)
-            # for name, p in self.encoder.named_parameters():
-            #     print(name, p)
             return self.decoder(z0, s_i, return_components=return_components)
     
 # --- DATA HANDLING ---
@@ -332,7 +328,7 @@ def process_data(df, id_col, time_varying_features, static_features, target_col,
             while j in used and j < len(expected_times) - 1:
                 j += 1
 
-            # if you run out of slots, keep the last slot (or set NaN instead)
+            # if running out of slots, keep the last slot (or set NaN instead)
             if j in used:              # all remaining slots are already used
                 j = len(expected_times) - 1
                 # alternatively: final_idx.append(np.nan); continue
@@ -345,7 +341,7 @@ def process_data(df, id_col, time_varying_features, static_features, target_col,
         g["time_slot"] = expected_times[final_idx]
         return g
     
-    for name, group in df_encoded.groupby(id_col):
+    for _, group in df_encoded.groupby(id_col):
         
         patient_df = group.copy().sort_values(by="SUIVI")
         
@@ -464,11 +460,7 @@ def collate_fn(batch):
       to use for the spline interpolation.
     """
     # Find the patient with the longest sequence
-    longest_patient = max(batch, key=lambda p: p['y'].shape[0])
-    max_len = longest_patient['y'].shape[0]
-    t_for_spline = longest_patient['t'] # This is the correct, monotonic time vector
     only_static_feature = True
-    batch_size = len(batch)
     use_aug = 'x_aug' in batch[0]
     expected_times = torch.Tensor(np.array([0, 2, 4, 7, 10, 12]))
 
@@ -492,11 +484,11 @@ def collate_fn(batch):
 
     # Return collated batch
     output = {
-        't': expected_times,              # [max_len]
+        't': expected_times,
         'y': y,                 
         's_i': s_i ,
         'mask': mask,
-        'id':   torch.stack([p['patient_id'] for p in batch])              # [B, ...]
+        'id':   torch.stack([p['patient_id'] for p in batch])
     }
 
     if 'metabolic_baseline' in batch[0].keys():
