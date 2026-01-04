@@ -11,7 +11,6 @@ from sklearn.cluster import KMeans
 from scipy.spatial.distance import cdist
 import pandas as pd
 from LME_3C_model import *
-from torch.utils.data import DataLoader
 
 def get_representative_indices_latent(model, dataloader, num_subjects=20, device='cuda'):
     """
@@ -272,6 +271,23 @@ def compute_pdp(
 
     return np.array(pdp_curves)
 
+def convert_pred_list_to_df(pred_list, value_col, time_col):
+     # ---- Convert list of prediction dicts → DataFrame ----
+    rows = []
+    for d in pred_list:
+        times = d["time"]
+        values = np.asarray(d[value_col])
+        if "id" in d.keys():
+            pid = d["id"]
+        else:
+            pid = d['NUM_ID']
+        
+        for t, v in zip(times, values):
+            rows.append({time_col: t, value_col: v, "id": pid})
+
+    df = pd.DataFrame(rows)
+    return df
+
 def get_medical_grid(X_tensor, feature_name, num_points=5):
     """
     Generates a grid based on data distribution + medical logic.
@@ -444,3 +460,259 @@ def permute_bmi_keep_length_truncate_or_keep(
 
     d["BMI_donor_id"] = d["BMI_donor_id"].astype("object")
     return d, used_time, mapping
+
+import numpy as np
+import pandas as pd
+from scipy.stats import t
+
+def compute_global_bin_means_with_ci(
+    df, time_col, value_col,
+    bins=None, ci=0.95, include_count=True
+):
+    if bins is None:
+        bins = np.array([0., 1., 3., 5.5, 8.5, 11., 14.])
+
+    k = 6  # number of bins
+    qs = np.linspace(0, 1, k+1)
+    bins_q = np.unique(np.quantile(df[time_col].dropna(), qs))
+
+    df["qbin"] = pd.cut(df[time_col], bins=bins_q, include_lowest=True, labels=False)
+
+    df = df.copy()
+    df["bin"] = pd.cut(df[time_col], bins=bins, labels=False, include_lowest=True)
+
+    out_rows = []
+    for b in range(len(bins) - 1):
+        sub = df[df["bin"] == b][value_col].dropna()
+        n = len(sub)
+
+        mean = sub.mean() if n else np.nan
+        std  = sub.std(ddof=1) if n > 1 else np.nan
+        se   = (std / np.sqrt(n)) if n > 1 else np.nan
+
+        # t critical for the bin (better than 1.96 for small n)
+        if n > 1:
+            alpha = 1 - ci
+            tcrit = t.ppf(1 - alpha/2, df=n-1)
+            ci_low  = mean - 1.96 * se
+            ci_high = mean + 1.96 * se
+        else:
+            ci_low = np.nan
+            ci_high = np.nan
+
+        row = {
+            "segment_start": bins[b],
+            "segment_end": bins[b + 1],
+            "mean": mean,
+            "std": std,
+            "se": se,
+            "ci_low": ci_low,
+            "ci_high": ci_high,
+        }
+        if include_count:
+            row["count"] = n
+
+        out_rows.append(row)
+
+    return pd.DataFrame(out_rows)
+
+
+def compute_binned_means_with_ci(
+    df: pd.DataFrame,
+    time_col: str,
+    value_col: str,
+    bins=None,
+    ci: float = 0.95,
+    method: str = "t",                 # "t" (i.i.d.) or "subject_bootstrap"
+    subject_col: str | None = None,    # required if method="subject_bootstrap"
+    subject_weighted: bool = True,     # only used for subject_bootstrap
+    n_boot: int = 2000,
+    random_state: int = 0,
+    include_count: bool = True,
+    right: bool = False,               # matches your original (right=False) behavior
+    include_lowest: bool = True,
+) -> pd.DataFrame:
+    """
+    Compute binned means and CIs for REAL observed data.
+
+    - method="t": classic t-interval per bin (assumes i.i.d. within bin)
+    - method="subject_bootstrap": subject-level bootstrap (recommended for longitudinal data)
+
+    subject_weighted=True (recommended):
+        1) average within (subject, bin)
+        2) then average across subjects
+      This avoids subjects with many measurements dominating a bin.
+
+    Returns a DataFrame with bin edges, midpoints, mean, CI, and counts.
+    """
+
+    if bins is None:
+        bins = [0, 1.5, 3.5, 5.5, 8.5, 11, 14]
+    bins = np.asarray(bins, dtype=float)
+    if np.any(np.diff(bins) <= 0):
+        raise ValueError("`bins` must be strictly increasing bin edges.")
+
+    df0 = df[[time_col, value_col] + ([subject_col] if subject_col else [])].copy()
+    df0 = df0.dropna(subset=[time_col, value_col])
+
+    # Create bin index 0..K-1 and keep interval endpoints
+    cut = pd.cut(df0[time_col], bins=bins, labels=False, right=right, include_lowest=include_lowest)
+    df0["_bin"] = cut.astype("float")  # float to allow NaN
+    df0 = df0.dropna(subset=["_bin"])
+    df0["_bin"] = df0["_bin"].astype(int)
+
+    K = len(bins) - 1
+    bin_left = bins[:-1]
+    bin_right = bins[1:]
+    bin_mid = 0.5 * (bin_left + bin_right)
+
+    out = pd.DataFrame({
+        "segment_start": bin_left,
+        "segment_end": bin_right,
+        "segment_mid": bin_mid,
+        "bin": np.arange(K, dtype=int),
+    })
+
+    if method.lower() == "t":
+        # Classic per-bin stats (i.i.d. assumption)
+        g = df0.groupby("_bin", sort=False)[value_col]
+        mean = g.mean()
+        std = g.std(ddof=1)
+        n = g.size()
+
+        out["mean"] = out["bin"].map(mean).to_numpy()
+        out["std"]  = out["bin"].map(std).to_numpy()
+        out["count"] = out["bin"].map(n).fillna(0).astype(int).to_numpy()
+
+        # SE and t-interval
+        se = out["std"] / np.sqrt(out["count"].replace(0, np.nan))
+        out["se"] = se
+
+        alpha = 1 - ci
+        # t critical depends on df = n-1, so compute rowwise safely
+        tcrit = np.full(K, np.nan, dtype=float)
+        valid = out["count"].to_numpy() > 1
+        tcrit[valid] = t.ppf(1 - alpha / 2, df=out.loc[valid, "count"].to_numpy() - 1)
+
+        out["ci_low"]  = out["mean"] - tcrit * out["se"]
+        out["ci_high"] = out["mean"] + tcrit * out["se"]
+
+        if not include_count:
+            out = out.drop(columns=["count"])
+
+        # order columns similar to your original
+        cols = ["segment_start", "segment_end", "segment_mid", "mean", "std", "se", "ci_low", "ci_high"]
+        if include_count:
+            cols.append("count")
+        return out[cols]
+
+    elif method.lower() == "subject_bootstrap":
+        if subject_col is None:
+            raise ValueError("subject_col must be provided when method='subject_bootstrap'.")
+
+        df1 = df[[subject_col, time_col, value_col]].copy()
+        df1 = df1.dropna(subset=[time_col, value_col])
+        df1["_bin"] = pd.cut(df1[time_col], bins=bins, labels=False, right=right, include_lowest=include_lowest)
+        df1 = df1.dropna(subset=["_bin"])
+        df1["_bin"] = df1["_bin"].astype(int)
+
+        subjects = df1[subject_col].unique()
+        if len(subjects) == 0:
+            raise ValueError("No subjects found after binning/NA removal.")
+
+        # Point estimate
+        if subject_weighted:
+            sbm = (
+                df1.groupby([subject_col, "_bin"], sort=False)[value_col]
+                   .mean()
+                   .reset_index()
+            )
+            point = sbm.groupby("_bin", sort=False)[value_col].mean()
+            n_subjects_bin = sbm.groupby("_bin", sort=False)[subject_col].nunique()
+        else:
+            point = df1.groupby("_bin", sort=False)[value_col].mean()
+            n_subjects_bin = df1.groupby("_bin", sort=False)[subject_col].nunique()
+
+        n_obs_bin = df1.groupby("_bin", sort=False)[value_col].size()
+
+        out["mean"] = out["bin"].map(point).to_numpy()
+        out["n_obs"] = out["bin"].map(n_obs_bin).fillna(0).astype(int).to_numpy()
+        out["n_subjects"] = out["bin"].map(n_subjects_bin).fillna(0).astype(int).to_numpy()
+
+        # Pre-split by subject for fast bootstrap
+        groups = {sid: g for sid, g in df1.groupby(subject_col, sort=False)}
+        rng = np.random.default_rng(random_state)
+
+        boot = np.full((n_boot, K), np.nan, dtype=float)
+
+        for b in range(n_boot):
+            sampled = rng.choice(subjects, size=len(subjects), replace=True)
+            boot_df = pd.concat([groups[sid] for sid in sampled], ignore_index=True)
+
+            if subject_weighted:
+                boot_sbm = (
+                    boot_df.groupby([subject_col, "_bin"], sort=False)[value_col]
+                           .mean()
+                           .reset_index()
+                )
+                m = boot_sbm.groupby("_bin", sort=False)[value_col].mean()
+            else:
+                m = boot_df.groupby("_bin", sort=False)[value_col].mean()
+
+            # align to all bins 0..K-1
+            boot[b, :] = pd.Series(m).reindex(np.arange(K)).to_numpy()
+
+        alpha = 1 - ci
+        out["ci_low"] = np.nanpercentile(boot, 100 * (alpha / 2), axis=0)
+        out["ci_high"] = np.nanpercentile(boot, 100 * (1 - alpha / 2), axis=0)
+
+        # Optional: bootstrap sd/se for the mean estimate (informative, not required)
+        out["boot_sd_mean"] = np.nanstd(boot, axis=0, ddof=1)
+
+        cols = [
+            "segment_start", "segment_end", "segment_mid",
+            "mean", "ci_low", "ci_high",
+            "n_obs", "n_subjects", "boot_sd_mean"
+        ]
+        if not include_count:
+            cols = [c for c in cols if c not in ("n_obs", "n_subjects")]
+        return out[cols]
+
+    else:
+        raise ValueError("method must be 't' or 'subject_bootstrap'.")
+
+
+
+# ------------------- Example usage -------------------
+# df must have columns like: subject_id, time_bin, y
+# df = pd.read_csv("your_data.csv")
+# ci_df = subject_bootstrap_mean_ci(
+#     df, subject_col="subject_id", time_col="time", y_col="y",
+#     n_boot=2000, ci=0.95, random_state=42
+# )
+# print(ci_df)
+
+# Optional plotting (matplotlib, no custom colors)
+# import matplotlib.pyplot as plt
+# plt.figure()
+# plt.plot(ci_df["time"], ci_df["mean"])
+# plt.fill_between(ci_df["time"], ci_df["ci_low"], ci_df["ci_high"], alpha=0.2)
+# plt.xlabel("time")
+# plt.ylabel("mean(y)")
+# plt.show()
+
+
+
+def save_CDE_predictions(model, dataset, df):
+    predicitons = []
+    for _, patient_id in enumerate(df['NUM_ID'].unique().tolist()):
+        # ax = axes[idx]
+        # Get individual patient data
+        sample_patient_data = filter_patient_with_id(patient_id, dataset)
+        
+        # Compute predicted trajectory
+        t_points, seq_preds, actual_y, pop_preds = calculate_sequential_blup_forecasting(model, sample_patient_data, device)
+        pred_dict = {'time':t_points, 'ISA15':seq_preds, "id": patient_id, 'pop_pred':pop_preds}
+        predicitons.append(pred_dict)
+
+    np.save("results/CDE_3C_predictions.npy", predicitons)

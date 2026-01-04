@@ -22,7 +22,7 @@ df = pd.read_csv("3C_dataset/train_3C_data_1.csv", na_values=["NA", ""])
 df["SUIVI"] = pd.to_datetime(df["SUIVI"])
 
 model = CDEModel(len(features)*2+1, len(static_features), LATENT_DIM, device).to(device)
-model.load_state_dict(torch.load('EXPs/LME_exp/model_latent_4_CDE_diagoG.pth', map_location='cpu')['model_state_dict'])
+model.load_state_dict(torch.load('EXPs/model_latent_4_CDE_diagoG.pth', map_location='cpu')['model_state_dict'])
 
 permuted_df, _, _ = permute_bmi_keep_length_truncate_or_keep(df)
 permuted_features = ['GLUC', 'HDL', 'PAD', 'BMI_perm']
@@ -92,22 +92,4 @@ print("nopermuted train dataset likelihood", train_log_likelihood)
 prediction_mse = calculate_prediction_mse_with_blup(model, loader, device)
 print(f"nopermuted train dataset pred MSE: {prediction_mse:.4f}")
 
-# ###PDP/ICE####
 
-# grids = {}
-# name = 'BMI'
-# grids[name] = get_medical_grid(df, name, num_points=6)
-# print(f"{name} Grid: {grids[name]} for {N_subject}")
-# profils = create_fictive_profiles(grids[name])
-# compute_pdp(model, loader, features.index(name), profils)
-
-# representative_indices = get_representative_indices_latent(model, loader, num_subjects=20, device='cuda')
-# # Create a subset of your original dataset
-# ice_dataset = Subset(dataset, representative_indices)
-# # Create a generic dataloader for these specific people (batch_size=1 is easiest for ICE)
-# ice_loader = DataLoader(ice_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
-# # Run calculation
-# results = compute_cde_ice_representatives(model, ice_loader, feature_idx=3, test_values=profils)
-
-# # Plot
-# plot_representative_ice(results, name)
