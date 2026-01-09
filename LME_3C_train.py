@@ -27,7 +27,7 @@ if __name__ == "__main__":
     # static_features, target_col, id_col = ["DIPNIV_1","DIPNIV_2","DIPNIV_3", "SEX_1", "SEX_2", "AGE0"], "ISA15", "NUM_ID"
     with_only_static_features = False
     scale_dynamic_features = False
-    metabolic_features_baselines = False
+    metabolic_features_baselines = True
 
     # full_df = pd.read_csv("data_3C.csv", na_values=["NA", ""])
     train_df = pd.read_csv("3C_dataset/train_3C_data_1.csv", na_values=["NA", ""])

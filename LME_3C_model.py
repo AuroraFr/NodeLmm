@@ -46,7 +46,7 @@ def masked_NLL(predicted_mean, targets, V, mask):
     return loss.mean()
 
 class Decoder_with_static(nn.Module):
-    def __init__(self, latent_dim, static_dim, response_dim, device, fullG=False):
+    def __init__(self, latent_dim, response_dim, device, fullG=False):
         super().__init__()
         self.device = device
 
@@ -174,14 +174,14 @@ class VectorField_with_static(nn.Module):
 
     
 class ODENet(nn.Module):
-    def __init__(self, scripted_ode_func, static_feature_dim, hidden_dim, device, fullG=False):
+    def __init__(self, scripted_ode_func, feature_dim, hidden_dim, device, fullG=False):
         super(ODENet, self).__init__()
 
         # 1. The Encoder: Maps static features to the initial hidden state z0
         self.encoder = nn.Sequential(
-            nn.Linear(static_feature_dim, 16),
+            nn.Linear(feature_dim, 32),
             nn.ReLU(),
-            nn.Linear(16, hidden_dim) # Output is z0
+            nn.Linear(32, hidden_dim) # Output is z0
         )
         
         # 2. The Dynamics Function: The core of the Neural ODE
@@ -204,7 +204,7 @@ class ODENet(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, s_i, t, CDE = False, metabolic_baseline=None, return_components=False):
+    def forward(self, t, metabolic_baseline=None, return_components=False):
 
         if isinstance(metabolic_baseline, torch.Tensor):
             s_i = torch.cat([s_i, metabolic_baseline], dim=1)
@@ -224,7 +224,7 @@ class ODENet(nn.Module):
         z_t = z_t.permute(1, 0, 2)
         
         # Decode the trajectory to get the final output
-        return self.decoder(z_t, CDE=CDE, return_components=return_components)
+        return self.decoder(z_t, return_components=return_components)
 
 class CDEModel(nn.Module):
     def __init__(self, input_dim, static_dim, hidden_dim, device, fullG=False):
@@ -251,7 +251,6 @@ class CDEModel(nn.Module):
         # if not fullG:
         self.decoder = Decoder_with_static(
             latent_dim=hidden_dim,
-            static_dim=static_dim,
             response_dim=1,
             device=device,
             fullG=fullG

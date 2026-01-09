@@ -25,56 +25,46 @@ def get_medical_grid(X_tensor, feature_name, num_points=5):
     
     return grid
 
-def create_fictive_profiles(grid, n_time=6, jump_idx=3):
+def create_fictive_profiles(grid, n_time=6):
     """
-    Create 6 fictive profiles for a given feature based on a grid of values.
-    
-    grid: array-like of values returned by get_medical_grid(...)
-          e.g. shape (5,) or (num_points,)
-    n_time: number of timepoints (default: 6)
-    jump_idx: time index where the jump begins (default: 3)
-    
+    Create fictive profiles for a given feature based on a grid of values.
+
     Returns:
-        profiles: Torch tensor (6, n_time)
-            6 scenarios × n_time timepoints
+        profiles: Torch tensor (5, n_time)
+            5 scenarios × n_time timepoints:
+            - constant low
+            - constant mid
+            - constant high
+            - increasing (low -> high)
+            - decreasing (high -> low)
     """
     assert len(grid) >= 2, "Grid must have at least 2 values."
 
+    plt.rcParams["font.size"] = 16
+
     low = grid[0]
     high = grid[-1]
-    
-    # Some extra intermediate values (optional)
-    mid_low = grid[1] if len(grid) > 2 else (low + high) / 3
-    mid     = grid[len(grid)//2]
-    mid_high = grid[-2] if len(grid) > 2 else (2*high + low) / 3
-    
+    mid = grid[len(grid)//2]
+
     profiles = []
 
     # 1) Constant low
     profiles.append(torch.full((n_time,), low))
 
-    # 2) Constant mid-low
-    profiles.append(torch.full((n_time,), mid_low))
-
-    # 3) Constant mid
+    # 2) Constant mid
     profiles.append(torch.full((n_time,), mid))
 
-    # 4) Constant mid-high
-    profiles.append(torch.full((n_time,), mid_high))
-
-    # 5) Constant high
+    # 3) Constant high
     profiles.append(torch.full((n_time,), high))
 
-    # 6) Jump profile (low → high)
-    jump_profile = torch.full((n_time,), low)
-    jump_profile[jump_idx:] = high
+    # 4) Increasing profile (low -> high)
+    inc_profile = torch.linspace(low, high, steps=n_time)
 
-    jump_profile2 = torch.full((n_time,), high)
-    jump_profile2[jump_idx:] = low
+    # 5) Decreasing profile (high -> low)
+    dec_profile = torch.linspace(high, low, steps=n_time)
 
-    profiles.append(jump_profile)
-    profiles.append(jump_profile2)
-    print(profiles)
+    profiles.append(inc_profile)
+    profiles.append(dec_profile)
 
     return torch.stack(profiles, dim=0)
 
@@ -85,8 +75,8 @@ train_df["time"] = (
     (train_df["SUIVI"] - train_df.groupby("NUM_ID")["SUIVI"].transform("min"))
       .dt.total_seconds() / (60 * 60 * 24 * 365)
 )
-
-fig, ax = plt.subplots(figsize=(8, 5))
+plt.rcParams["font.size"] = 16
+fig, ax = plt.subplots(figsize=(8, 6))
 print(len(train_df['NUM_ID'].unique()))
 grids = {}
 name = 'BMI'
@@ -99,14 +89,15 @@ sample_ids = train_df['NUM_ID'].sample(n=500, random_state=42).tolist()
 for subject, df_sub in train_df.groupby("NUM_ID"):
     if subject in sample_ids:
         plot_df = df_sub.dropna(subset=["BMI", "time"])
-        ax.plot(plot_df["time"], plot_df["BMI"], alpha=0.4)
+        ax.plot(plot_df["time"], plot_df["BMI"], alpha=0.4, color='grey')
 
-for profil in profils:
-    ax.plot(np.array([0, 2, 4, 7, 10, 12]), profil, 'bo', alpha=0.4)
-ax.set_xlabel("Time (years)")
+colors = plt.cm.viridis(np.linspace(0, 1, 5))
+for idx, profil in enumerate(profils):
+    ax.plot(np.array([0, 2, 4, 7, 10, 12]), profil, color=colors[idx])
+ax.set_xlabel("Time since the first visit (years)")
 ax.set_ylabel("BMI")
 
-plt.savefig("figures/BMI_data.pdf")
+plt.savefig("figures/BMI_data_fictives_profils.pdf")
 plt.close()
 
 

@@ -12,6 +12,9 @@ from scipy.spatial.distance import cdist
 import pandas as pd
 from LME_3C_model import *
 
+import torch
+import torchcde
+
 def get_representative_indices_latent(model, dataloader, num_subjects=20, device='cuda'):
     """
     1. Extracts latent vectors (z) for all test subjects.
@@ -61,56 +64,44 @@ def get_representative_indices_latent(model, dataloader, num_subjects=20, device
     print(f"Selected Indices: {representative_indices}")
     return representative_indices
 
-def create_fictive_profiles(grid, n_time=6, jump_idx=3):
+def create_fictive_profiles(grid, n_time=6):
     """
-    Create 6 fictive profiles for a given feature based on a grid of values.
-    
-    grid: array-like of values returned by get_medical_grid(...)
-          e.g. shape (5,) or (num_points,)
-    n_time: number of timepoints (default: 6)
-    jump_idx: time index where the jump begins (default: 3)
-    
+    Create fictive profiles for a given feature based on a grid of values.
+
     Returns:
-        profiles: Torch tensor (6, n_time)
-            6 scenarios × n_time timepoints
+        profiles: Torch tensor (5, n_time)
+            5 scenarios × n_time timepoints:
+            - constant low
+            - constant mid
+            - constant high
+            - increasing (low -> high)
+            - decreasing (high -> low)
     """
     assert len(grid) >= 2, "Grid must have at least 2 values."
 
     low = grid[0]
     high = grid[-1]
-    
-    # Some extra intermediate values (optional)
-    mid_low = grid[1] if len(grid) > 2 else (low + high) / 3
-    mid     = grid[len(grid)//2]
-    mid_high = grid[-2] if len(grid) > 2 else (2*high + low) / 3
-    
+    mid = grid[len(grid)//2]
+
     profiles = []
 
     # 1) Constant low
     profiles.append(torch.full((n_time,), low))
 
-    # 2) Constant mid-low
-    profiles.append(torch.full((n_time,), mid_low))
-
-    # 3) Constant mid
+    # 2) Constant mid
     profiles.append(torch.full((n_time,), mid))
 
-    # 4) Constant mid-high
-    profiles.append(torch.full((n_time,), mid_high))
-
-    # 5) Constant high
+    # 3) Constant high
     profiles.append(torch.full((n_time,), high))
 
-    # 6) Jump profile (low → high)
-    jump_profile = torch.full((n_time,), low)
-    jump_profile[jump_idx:] = high
+    # 4) Increasing profile (low -> high)
+    inc_profile = torch.linspace(low, high, steps=n_time)
 
-    jump_profile2 = torch.full((n_time,), high)
-    jump_profile2[jump_idx:] = low
+    # 5) Decreasing profile (high -> low)
+    dec_profile = torch.linspace(high, low, steps=n_time)
 
-    profiles.append(jump_profile)
-    profiles.append(jump_profile2)
-    print(profiles)
+    profiles.append(inc_profile)
+    profiles.append(dec_profile)
 
     return torch.stack(profiles, dim=0)
 
@@ -122,154 +113,8 @@ def get_modified_batch(X_batch, feature_idx, target_val):
     """
     X_mod = X_batch.clone()
     X_mod[:, :, feature_idx] = target_val
-    # X_mod[:, :, feature_idx] = torch.nan_to_num(
-    #     X_mod[:, :, feature_idx], 
-    #     nan=float(target_val)
-    # )
     
     return X_mod
-
-def compute_cde_ice_representatives(
-    model, 
-    ice_loader,       # The dataloader containing ONLY the K representatives
-    feature_idx, 
-    test_values,      # e.g., [Low_Value, High_Value] or a grid
-    device='cuda'
-):
-    model.eval()
-    model.to(device)
-    print(test_values)
-    # Storage: Dictionary to hold results per subject
-    # Structure: { subject_id: { val_1: curve, val_2: curve } }
-    ice_results = {}
-    
-    print(f"Computing ICE for {len(ice_loader)} representatives...")
-    
-    with torch.no_grad():
-        # Iterate through each representative subject
-        for i, batch in enumerate(ice_loader):
-            
-            # Unpack (Batch size is 1 here)
-            t, y, s_i, mask, id, t_i, x_aug = [d.to(device) for d in batch.values()]
-            
-            # Get the unique ID or index of this subject for labeling
-            subj_id = f"Subject_Cluster_{i}" 
-            ice_results[subj_id] = {}
-            
-            # Loop through the grid values (Counterfactuals)
-            for val in test_values:
-                time_length = 10
-                
-                # 1. SHIFT PERTURBATION
-                x_aug_shifted = get_modified_batch(x_aug, feature_idx, val)
-                
-                # 2. RE-INTERPOLATION
-                coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_aug_shifted)
-                X_cde = torchcde.CubicSpline(coeffs)
-                
-                # 3. PREDICT (Fixed Effects)
-                # We use Fixed Effects to see how the model structure treats this profile
-                pred_mean = model(s_i, X_cde, time_length, return_components=True)[0]
-                
-                # 4. CLEAN OUTPUT
-                if pred_mean.dim() == 3:
-                    pred_mean = pred_mean.squeeze(-1)
-                
-                ice_results[subj_id][val] = pred_mean.detach().cpu().numpy()
-
-    return ice_results
-
-def compute_pdp(
-    model, 
-    dataloader, 
-    features,
-    feature_idx, 
-    grid_values, 
-    device='cuda'
-):
-    """
-    Computes PDP for Neural CDE using Fixed Effects.
-    """
-    model.eval()
-    model.to(device)
-    
-    # Storage for the final averaged curves
-    pdp_curves = []
-    
-    # Setup plotting
-    plt.figure(figsize=(10, 6))
-    colors = plt.cm.viridis(np.linspace(0, 1, len(grid_values))) # Generate colors
-    
-    pred_means_original = []
-    labels = [
-    "Constant Low",
-    "Constant Mid-Low",
-    "Constant Mid",
-    "Constant Mid-High",
-    "Constant High",
-    "Jump Low→High",
-    "Jump High→Low"
-]
-    
-    for i, val in enumerate(tqdm(grid_values, desc="Grid Loop")):
-        pred_means = []
-        time_length = 10
-        
-        with torch.no_grad():
-            for batch in dataloader:
-                t, y, s_i, mask, id, t_i, x_aug = [d.to(device) for d in batch.values()]
-                B, T, D = x_aug.size()
-
-                x_aug_modified = get_modified_batch(x_aug, feature_idx, val)
-
-                preds_over_time = []  # will hold arrays of shape (B,)
-
-                for j in range(1, time_length):  # j = 1..time_length-1
-                    x_hist = x_aug_modified[:, :j+1, :]  # (B, j+1, D)
-
-                    coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_hist)
-                    X = torchcde.CubicSpline(coeffs)
-
-                    pred_j = model(s_i, X, j+1, return_components=True)[0]  # expected (B, j+1, 1) or (B, j+1)
-
-                    if pred_j.dim() == 3 and pred_j.size(-1) == 1:
-                        pred_j = pred_j.squeeze(-1)  # -> (B, j+1)
-
-                    pred_j = pred_j.detach().cpu().numpy()  # (B, j+1)
-
-                    if j == 1:
-                        preds_over_time.append(pred_j[:, 0])   # t0  -> (B,)
-                    preds_over_time.append(pred_j[:, -1])      # tj  -> (B,)
-
-                pred_mean_batch = np.stack(preds_over_time, axis=0).T  # (B, time_length)
-                pred_means.append(pred_mean_batch)
-        
-        
-        pred_means = np.concatenate(pred_means, axis=0).reshape(-1, time_length)
-        pred_means_low = np.percentile(pred_means, 5, axis=0)
-        pred_means_high = np.percentile(pred_means, 95, axis=0)
-        
-        avg_trajectory = pred_means.mean(axis=0)
-        # yerr = np.vstack([avg_trajectory - pred_means_low, pred_means_high - avg_trajectory])
-        
-        pdp_curves.append(avg_trajectory)
-        # plt.errorbar(np.linspace(0, 12, 10), avg_trajectory, yerr=yerr, fmt='D',         # Diamond marker
-        #      color=colors[i], ecolor=colors[i],
-        #      elinewidth=2, capsize=6)
-        plt.plot(np.linspace(0, 12, 10), avg_trajectory, label=f'Val={labels[i]}', color=colors[i], alpha=0.8)
-    
-    pred_means_original = np.array(pred_means_original)
-    avg_trajectory_original = pred_means_original.mean(axis=0)
-    # plt.plot(np.linspace(0, 12, 10), avg_trajectory_original, label=f'real_data', color='grey', linestyle='--')
-    # Finalize Plot
-    plt.xlabel('Time Steps')
-    plt.ylabel('Predicted Outcome (Fixed Effect)')
-    plt.title(f'PDP Trajectories: Feature '+features[feature_idx])
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig("figures/PDP_"+features[feature_idx]+".pdf")
-
-    return np.array(pdp_curves)
 
 def convert_pred_list_to_df(pred_list, value_col, time_col):
      # ---- Convert list of prediction dicts → DataFrame ----
@@ -310,57 +155,344 @@ def get_medical_grid(X_tensor, feature_name, num_points=5):
     
     return grid
 
-def plot_representative_ice(ice_results, feature_name):
+
+def _resample_to_common_real_time_grid(x_aug, t_i, mask, t_query, time_ch=None):
     """
-    Plots one subplot per representative subject.
-    Each subplot contains the curves for the different grid values.
+    Resample each subject's (irregular) covariate path onto a shared real-time grid t_query.
+    Uses a *subject-specific* spline parameterized by that subject's real times tb.
+
+    Args
+    ----
+    x_aug:   (B,T,D) padded covariates (may include time as a channel)
+    t_i:     (B,T)   padded real times
+    mask:    (B,T)   bool or {0,1}, True where valid
+    t_query: (Q,)    shared real-time grid (e.g., linspace(0,12,10))
+    time_ch: int or None, index of the time channel in x_aug (if present)
+
+    Returns
+    -------
+    x_q:          (B,Q,D) covariates evaluated at t_query
+    support_mask: (B,Q)   True where t_query is within [tmin, tmax] for that subject
     """
-    subjects = list(ice_results.keys())
-    num_sub = len(subjects)
+    B, T, D = x_aug.shape
+    Q = t_query.numel()
+    device = x_aug.device
+    dtype = x_aug.dtype
+    print(x_aug, t_i)
+
+    x_q = torch.empty((B, Q, D), device=device, dtype=dtype)
+    support_mask = torch.empty((B, Q), device=device, dtype=torch.bool)
+
+    maskb = mask.bool() if mask.dtype != torch.bool else mask
+
+    for b in range(B):
+        mb = maskb[b]
+        tb = t_i[b, mb]
+        if tb.dim() == 2 and tb.size(-1) == 1:
+            tb = tb.squeeze(-1)          # (Tb,)
+        tb = tb.reshape(-1)              # force 1D
+        xb = x_aug[b, mb, :]   # (Tb,D)
+        # Subject-specific spline in REAL time
+        coeffs_b = torchcde.hermite_cubic_coefficients_with_backward_differences(xb, t=tb)
+        Xb = torchcde.CubicSpline(coeffs_b)
+
+        # Evaluate covariates at shared real-time grid
+        xqb = Xb.evaluate(t_query)  # (Q,D)
+
+        x_q[b] = xqb
+
+        tmin, tmax = tb[0], tb[-1]
+        support_mask[b] = (t_query >= tmin) & (t_query <= tmax)
+
+    return x_q, support_mask
+
+
+@torch.no_grad()
+def _predict_on_shared_grid_like_training(model, s_i, X, Q=None):
+    """
+    The model was trained with index-time splines, with real time supplied as a channel.
+    So here we build the spline WITHOUT passing t=... (index-time), but x_q contains time_ch=t_query.
+    """
+    coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(X)  # index-time
+    X = torchcde.CubicSpline(coeffs)
+    pred = model(s_i, X, 6, return_components=True)[0]  # (B,Q,1) or (B,Q)
+    if pred.dim() == 3 and pred.size(-1) == 1:
+        pred = pred.squeeze(-1)
+    return pred  # (B,Q)
+
+
+def compute_pdp_delta_ice(
+    model,
+    dataloader,
+    features,
+    feature_idx,
+    grid_values,
+    *,
+    time_ch=None,                 # index of time channel in x_aug, e.g. TIME_CH
+    t_query=None,                 # torch tensor (Q,), e.g. torch.linspace(0,12,10)
+    device="cuda",
+    use_delta=False,               # True => plot mean(delta-ICE); False => plot mean(pred_mod)
+    savepath=None
+):
+    """
+    PDP for Neural CDE on a shared *real-time* grid + delta-ICE.
+
+    - Resamples each subject's irregular path (t_i varies) onto a common grid t_query.
+    - Predicts baseline and modified predictions on that grid.
+    - delta-ICE = pred_mod - pred_orig
+    - PDP curve = mean over subjects of delta-ICE (recommended) or pred_mod (if use_delta=False)
+    - CI: pointwise normal CI of the mean using only subjects supported at that time (no extrapolation).
+
+    Returns
+    -------
+    pdp_curves: (len(grid_values), Q) numpy array
+    """
+
+    model.eval()
+    model.to(device)
+
+    # if t_query is None:
+    #     t_query = torch.linspace(0.0, 12.0, 10, device=device)
+    # else:
+    #     t_query = t_query.to(device)
+    # Q = t_query.numel()
+    # t_query_np = t_query.detach().cpu().numpy()
+
     labels = [
-    "Constant Low",
-    "Constant Mid-Low",
-    "Constant Mid",
-    "Constant Mid-High",
-    "Constant High",
-    "Jump Low→High",
-    "Jump High→Low"
-]
-    
-    # Dynamic grid layout
-    cols = 2
-    rows = math.ceil(num_sub / cols)
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(12, 5 * rows), sharex=True, sharey=True)
-    axes = axes.flatten()
-    
-    # Color map for the different grid values
-    test_vals = list(ice_results[subjects[0]].keys())
-    colors = plt.cm.viridis(np.linspace(0, 1, len(test_vals)))
-    
-    for idx, subj in enumerate(subjects):
-        ax = axes[idx]
-        
-        curves = ice_results[subj]
-        
-        for i, (val, curve) in enumerate(curves.items()):
-            time_steps = np.linspace(0, 12, len(curve))
-            ax.plot(time_steps, curve, label=f'{labels[i]}', 
-                    color=colors[i], linewidth=2)
-            
-        ax.set_title(f"Representative: {subj}")
-        ax.grid(True, alpha=0.3)
-        
-        # Only put legend on the first plot to avoid clutter
-        if idx == 0:
-            ax.legend(fontsize='small')
+        "Constant Low",
+        "Constant Mid",
+        "Constant High",
+        "Inscreasing",
+        "Decreasing",
+    ]
 
-    # Labels
-    fig.text(0.5, 0.04, 'Time Steps', ha='center', fontsize=12)
-    fig.text(0.04, 0.5, 'Predicted Outcome (Fixed Effect)', va='center', rotation='vertical', fontsize=12)
-    plt.suptitle(f"ICE Analysis: Heterogeneity of {feature_name} Effect", fontsize=16)
-    plt.savefig("figures/ICE_"+feature_name+".pdf")
+    plt.figure(figsize=(8, 6))
+    plt.rcParams["font.size"] = 16
+    colors = plt.cm.viridis(np.linspace(0, 1, len(grid_values)))
 
+    pdp_curves = []
+
+    for gi, val in enumerate(tqdm(grid_values, desc="Grid Loop")):
+
+        all_effects = []     # list of (B,Q) tensors/arrays
+        all_support = []     # list of (B,Q) bool arrays
+        all_ti = []
+
+        with torch.no_grad():
+            for batch in dataloader:
+                t, y, s_i, mask, ids, t_i, x_aug = [d.to(device) for d in batch.values()]
+
+                # # 1) Resample ORIGINAL covariates to shared real-time grid
+                # x_q, support = _resample_to_common_real_time_grid(
+                #     x_aug=x_aug, t_i=t_i, mask=mask, t_query=t_query, time_ch=time_ch
+                # )
+
+                # 2) Baseline prediction
+                pred_orig = _predict_on_shared_grid_like_training(model, s_i, x_aug)  # (B,Q)
+
+                # 3) Modify covariates on the shared grid (your existing function)
+                x_aug_mod = get_modified_batch(x_aug, feature_idx, val)
+
+                # 4) Modified prediction
+                pred_mod = _predict_on_shared_grid_like_training(model, s_i, x_aug_mod)  # (B,Q)
+
+                # 5) delta-ICE (recommended) or absolute
+                eff = (pred_mod - pred_orig) if use_delta else pred_mod
+
+                all_effects.append(eff.detach().cpu().numpy())          # (B,Q)
+                all_support.append(mask.detach().cpu().numpy()) 
+                all_ti.append(t_i.detach().cpu().numpy())     # (B,Q)
+
+        eff_np = np.concatenate(all_effects, axis=0)  
+        ti_np = np.concatenate(all_ti, axis=0).squeeze()     # (N,Q)
+        support = np.concatenate(all_support, axis=0) # (N,Q) bool
+        N = eff_np.shape[0]
+
+        centers = np.array([0, 2, 4, 7, 10, 12], dtype=float)
+        edges = np.concatenate(([-np.inf], (centers[:-1] + centers[1:]) / 2, [np.inf]))
+
+        N, Q = eff.shape
+        K = len(edges) - 1
+
+        mean_curve = np.full(K, np.nan, dtype=float)
+        se_curve   = np.full(K, np.nan, dtype=float)
+        nsubj_curve = np.zeros(K, dtype=int)
+
+        N, Q = eff_np.shape
+
+        # support: (N,Q) -> boolean
+        support = (support > 0.5)
+
+        mean_curve = np.full(K, np.nan, dtype=float)
+        se_curve   = np.full(K, np.nan, dtype=float)
+
+        for k in range(K):
+            lo, hi = edges[k], edges[k+1]
+
+            idx = support & (ti_np >= lo) & (ti_np < hi)   # (N,Q) boolean
+
+            vals = eff_np[idx]  # 1D array of all points in the bin
+            n_k = vals.size
+
+            if n_k > 0:
+                mean_curve[k] = vals.mean()
+                se_curve[k] = vals.std(ddof=1) / np.sqrt(n_k) if n_k > 1 else 0.0
+
+        ci_low  = mean_curve - 1.96 * se_curve
+        ci_high = mean_curve + 1.96 * se_curve
+        yerr = np.vstack([mean_curve - ci_low, ci_high - mean_curve])
+
+        pdp_curves.append(mean_curve)
+        print(yerr.shape)
+
+        plt.errorbar(
+            centers[1:,], mean_curve[1:,], yerr=yerr[:,1:], fmt="D",
+            color=colors[gi], ecolor=colors[gi], elinewidth=2, capsize=6
+        )
+        plt.plot(centers[1:,], mean_curve[1:,], color=colors[gi], alpha=0.85, label=labels[gi])
+
+    plt.xlabel("Time (years)")
+    plt.ylabel("Mean delta-ICE" if use_delta else "Mean ISA15 prediction")
+    plt.title(f"PDP ({'delta-ICE' if use_delta else 'pred'}): {features[feature_idx]}")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    if savepath is None:
+        savepath = (
+            f"figures/PDP_{features[feature_idx]}_deltaICE.pdf"
+            if use_delta else
+            f"figures/PDP_{features[feature_idx]}.pdf"
+        )
+    plt.savefig(savepath)
+
+    return np.stack(pdp_curves, axis=0)
+
+def select_ids_by_bmi(
+    df: pd.DataFrame,
+    bmi_min: float = None,
+    bmi_max: float = None,
+    *,
+    how: str = "baseline",
+    baseline_time: float = 0.0,
+    min_visits: int = 1,
+) -> pd.Index:
+    d = df.dropna(subset=["NUM_ID", "time", "BMI"]).copy()
+    d = d.sort_values(["NUM_ID", "time"])
+
+    def in_range(x):
+        ok = np.ones(len(x), dtype=bool)
+        if bmi_min is not None:
+            ok &= (x >= bmi_min)
+        if bmi_max is not None:
+            ok &= (x <= bmi_max)
+        return ok
+
+    g = d.groupby("NUM_ID", sort=False)
+
+    counts = g.size()
+    keep_ids = counts[counts >= min_visits].index
+    d = d[d["NUM_ID"].isin(keep_ids)]
+    g = d.groupby("NUM_ID", sort=False)
+
+    if how == "baseline":
+        idx = g.apply(lambda x: (x["time"] - baseline_time).abs().idxmin())
+        base = d.loc[idx.values, ["NUM_ID", "BMI"]].set_index("NUM_ID")
+        return base.index[in_range(base["BMI"].values)]
+
+    if how == "mean":
+        m = g["BMI"].mean()
+        return m.index[in_range(m.values)]
+
+    if how == "last":
+        last = g.tail(1).set_index("NUM_ID")
+        return last.index[in_range(last["BMI"].values)]
+
+    if how == "ever":
+        ever = g["BMI"].apply(lambda s: in_range(s.values).any())
+        return ever[ever].index
+
+    if how == "always":
+        always = g["BMI"].apply(lambda s: in_range(s.values).all())
+        return always[always].index
+
+    raise ValueError(f"Unknown how={how}")
+
+
+def binned_mean_ci(
+    df: pd.DataFrame,
+    *,
+    time_col="time",
+    y_col="ISA15",
+    id_col="NUM_ID",
+    bins=None,
+    bin_labels=None,
+    min_n: int = 10,
+):
+    """
+    Compute mean + 95% CI per time bin.
+    CI is normal approx: mean ± 1.96 * (sd/sqrt(n)) within bin.
+    (For repeated measures this is descriptive, not a strict inference.)
+    """
+    d = df.dropna(subset=[time_col, y_col]).copy()
+
+    if bins is None:
+        # Example bins aligned with your visit schedule
+        bins = [-0.5, 1, 3, 5.5, 8.5, 11, 13]  # -> around 0,2,4,7,10,12
+    if bin_labels is None:
+        # use bin midpoints as labels
+        mids = [(bins[i] + bins[i+1]) / 2 for i in range(len(bins) - 1)]
+        bin_labels = [f"{m:.1f}" for m in mids]
+
+    d["time_bin"] = pd.cut(d[time_col], bins=bins, labels=bin_labels, include_lowest=True)
+
+    out = (
+        d.groupby("time_bin", observed=True)[y_col]
+        .agg(n="count", mean="mean", std="std")
+        .reset_index()
+    )
+
+    out["se"] = out["std"] / np.sqrt(out["n"])
+    out["ci_low"] = out["mean"] - 1.96 * out["se"]
+    out["ci_high"] = out["mean"] + 1.96 * out["se"]
+
+    # drop bins with too few points
+    out = out[out["n"] >= min_n].copy()
+
+    # numeric x for plotting (use midpoints)
+    x_mids = np.array([float(s) for s in out["time_bin"].astype(str)])
+    out["x"] = x_mids
+    return out.sort_values("x")
+
+
+def plot_binned_groups(
+    df: pd.DataFrame,
+    groups: dict,
+    *,
+    bins=None,
+    min_n=10,
+    title="ISA15 mean by time bins",
+):
+    """
+    groups: dict name -> ids (iterable)
+    """
+    plt.figure(figsize=(10, 6))
+
+    for name, ids in groups.items():
+        dsub = df[df["NUM_ID"].isin(ids)]
+        stats = binned_mean_ci(dsub, bins=bins, min_n=min_n)
+
+        x = stats["x"].to_numpy()
+        y = stats["mean"].to_numpy()
+        yerr = np.vstack([y - stats["ci_low"].to_numpy(), stats["ci_high"].to_numpy() - y])
+
+        plt.errorbar(x, y, yerr=yerr, fmt="o-", capsize=5, linewidth=2, label=f"{name} (npts={stats['n'].sum()})")
+
+    plt.xlabel("Time (years, bin midpoints)")
+    plt.ylabel("ISA15 (mean ± 95% CI)")
+    plt.title(title)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.savefig('figures/'+title+'.pdf')
 
 def permute_bmi_keep_length_truncate_or_keep(
     df: pd.DataFrame,
@@ -461,10 +593,6 @@ def permute_bmi_keep_length_truncate_or_keep(
     d["BMI_donor_id"] = d["BMI_donor_id"].astype("object")
     return d, used_time, mapping
 
-import numpy as np
-import pandas as pd
-from scipy.stats import t
-
 def compute_global_bin_means_with_ci(
     df, time_col, value_col,
     bins=None, ci=0.95, include_count=True
@@ -476,7 +604,7 @@ def compute_global_bin_means_with_ci(
     qs = np.linspace(0, 1, k+1)
     bins_q = np.unique(np.quantile(df[time_col].dropna(), qs))
 
-    df["qbin"] = pd.cut(df[time_col], bins=bins_q, include_lowest=True, labels=False)
+    # df["qbin"] = pd.cut(df[time_col], bins=bins_q, include_lowest=True, labels=False)
 
     df = df.copy()
     df["bin"] = pd.cut(df[time_col], bins=bins, labels=False, include_lowest=True)
@@ -492,8 +620,6 @@ def compute_global_bin_means_with_ci(
 
         # t critical for the bin (better than 1.96 for small n)
         if n > 1:
-            alpha = 1 - ci
-            tcrit = t.ppf(1 - alpha/2, df=n-1)
             ci_low  = mean - 1.96 * se
             ci_high = mean + 1.96 * se
         else:
@@ -516,6 +642,7 @@ def compute_global_bin_means_with_ci(
 
     return pd.DataFrame(out_rows)
 
+from scipy.stats import t
 
 def compute_binned_means_with_ci(
     df: pd.DataFrame,
@@ -682,37 +809,19 @@ def compute_binned_means_with_ci(
         raise ValueError("method must be 't' or 'subject_bootstrap'.")
 
 
-
-# ------------------- Example usage -------------------
-# df must have columns like: subject_id, time_bin, y
-# df = pd.read_csv("your_data.csv")
-# ci_df = subject_bootstrap_mean_ci(
-#     df, subject_col="subject_id", time_col="time", y_col="y",
-#     n_boot=2000, ci=0.95, random_state=42
-# )
-# print(ci_df)
-
-# Optional plotting (matplotlib, no custom colors)
-# import matplotlib.pyplot as plt
-# plt.figure()
-# plt.plot(ci_df["time"], ci_df["mean"])
-# plt.fill_between(ci_df["time"], ci_df["ci_low"], ci_df["ci_high"], alpha=0.2)
-# plt.xlabel("time")
-# plt.ylabel("mean(y)")
-# plt.show()
-
-
-
-def save_CDE_predictions(model, dataset, df):
+def save_CDE_predictions(model, dataset, df, mode='fit'):
     predicitons = []
     for _, patient_id in enumerate(df['NUM_ID'].unique().tolist()):
-        # ax = axes[idx]
-        # Get individual patient data
+
         sample_patient_data = filter_patient_with_id(patient_id, dataset)
         
         # Compute predicted trajectory
-        t_points, seq_preds, actual_y, pop_preds = calculate_sequential_blup_forecasting(model, sample_patient_data, device)
+        if mode == "fit":
+            t_points, seq_preds, actual_y, pop_preds = fitted_trajectory(model, sample_patient_data, device)
+        elif mode == "pred":
+            t_points, seq_preds, actual_y, pop_preds = calculate_sequential_blup_forecasting(model, sample_patient_data, device)
+        
         pred_dict = {'time':t_points, 'ISA15':seq_preds, "id": patient_id, 'pop_pred':pop_preds}
         predicitons.append(pred_dict)
 
-    np.save("results/CDE_3C_predictions.npy", predicitons)
+    np.save("results/CDE_3C_"+mode+".npy", predicitons)
