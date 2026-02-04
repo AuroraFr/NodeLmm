@@ -77,19 +77,16 @@ train_df["time"] = (
 )
 plt.rcParams["font.size"] = 16
 fig, ax = plt.subplots(figsize=(8, 6))
-print(len(train_df['NUM_ID'].unique()))
 grids = {}
 name = 'BMI'
 grids[name] = get_medical_grid(train_df, name, num_points=6)
 print(f"{name} Grid: {grids[name]} for {len(train_df['NUM_ID'].unique())}")
 profils = create_fictive_profiles(grids[name])
-print(profils)
 
 sample_ids = train_df['NUM_ID'].sample(n=500, random_state=42).tolist()
 for subject, df_sub in train_df.groupby("NUM_ID"):
-    if subject in sample_ids:
-        plot_df = df_sub.dropna(subset=["BMI", "time"])
-        ax.plot(plot_df["time"], plot_df["BMI"], alpha=0.4, color='grey')
+    plot_df = df_sub.dropna(subset=["BMI", "time"])
+    ax.plot(plot_df["time"], plot_df["BMI"], alpha=0.4, color='grey')
 
 colors = plt.cm.viridis(np.linspace(0, 1, 5))
 for idx, profil in enumerate(profils):

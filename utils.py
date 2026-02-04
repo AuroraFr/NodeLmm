@@ -221,7 +221,7 @@ def _predict_on_shared_grid_like_training(model, s_i, X, Q=None):
     return pred  # (B,Q)
 
 
-def compute_pdp_delta_ice(
+def compute_pdp(
     model,
     dataloader,
     features,
@@ -809,7 +809,7 @@ def compute_binned_means_with_ci(
         raise ValueError("method must be 't' or 'subject_bootstrap'.")
 
 
-def save_CDE_predictions(model, dataset, df, mode='fit'):
+def save_predictions(model, dataset, df, mode='fit'):
     predicitons = []
     for _, patient_id in enumerate(df['NUM_ID'].unique().tolist()):
 
@@ -825,3 +825,81 @@ def save_CDE_predictions(model, dataset, df, mode='fit'):
         predicitons.append(pred_dict)
 
     np.save("results/CDE_3C_"+mode+".npy", predicitons)
+
+
+def plot_mean_predictions(train_df, model="CDE", mode="pred",
+                          prediction_file="results/CDE_3C_train_predictions.npy", hlme_prediction_file="results/ISA15_Model_4_train_pred.csv"):
+    CDE_predictions = np.load(prediction_file, allow_pickle=True)
+    CDE_predictions_list = CDE_predictions.tolist()
+    predictions_df = pd.DataFrame(CDE_predictions_list)
+    # predictions_df = predictions_df.drop(columns=["pop_pred"])
+    cols_to_explode = ["time", "ISA15"]
+
+    df_long = (
+        predictions_df
+        .explode(cols_to_explode, ignore_index=True)
+        .assign(
+            time=lambda d: pd.to_numeric(d["time"]),
+            ISA15=lambda d: pd.to_numeric(d["ISA15"])
+        )
+    )
+
+    hlme_predictions = pd.read_csv(hlme_prediction_file, sep=',')
+    value_col = "ISA15"
+    time_col  = "time"
+
+    # df_y0 = (df_long.sort_values([ "id", time_col ])
+    #                  .groupby("id", as_index=False)
+    #                  .first()[["id", value_col]]
+    #         )
+
+    # id_to_y0 = dict(zip(df_y0["id"], df_y0[value_col]))
+    # new_rows = pd.DataFrame({
+    #     "NUM_ID": list(id_to_y0.keys()),
+    #     "time": 0,
+    #     "Y_predicted": list(id_to_y0.values()),
+    #     "Y_observed": list(id_to_y0.values())
+    # })
+
+    # hlme_predictions = (
+    #     pd.concat([new_rows, hlme_predictions], ignore_index=True)
+    #       .sort_values(by=["NUM_ID", "time"], ascending=[True, True])
+    #       .reset_index(drop=True)
+    # )
+    import textwrap
+    train_df["time"] = (
+        (train_df["SUIVI"] - train_df.groupby("NUM_ID")["SUIVI"].transform("min"))
+          .dt.total_seconds() / (60 * 60 * 24 * 365)
+    )
+    value_col = "ISA15"
+    binned_mean_observations = compute_global_bin_means_with_ci(train_df, time_col, value_col)
+    binned_mean_predictions = compute_global_bin_means_with_ci(df_long, time_col, value_col)
+    value_col = "Yfitted"
+    binned_mean_predictions_hlme = compute_global_bin_means_with_ci(hlme_predictions, time_col, value_col)
+    x = (binned_mean_observations["segment_start"] + binned_mean_observations["segment_end"]) / 2
+    y = binned_mean_observations["mean"]
+    hat_y = binned_mean_predictions["mean"]
+    hat_y_hlme = binned_mean_predictions_hlme['mean']
+
+    yerr_lower = binned_mean_observations["mean"] - binned_mean_observations["ci_low"]
+    yerr_upper = binned_mean_observations["ci_high"] - binned_mean_observations["mean"]
+    yerr = np.vstack([yerr_lower[1:,], yerr_upper[1:,]])
+
+    yerr_lower = binned_mean_predictions["mean"] - binned_mean_predictions["ci_low"]
+    yerr_upper = binned_mean_predictions["ci_high"] - binned_mean_predictions["mean"]
+    hat_yerr = np.vstack([yerr_lower, yerr_upper])
+
+    plt.figure(figsize=(8,4))
+    plt.errorbar(x[1:,], y[1:,], yerr=yerr, fmt='-',elinewidth=2, capthick=2,capsize=5, label="observations", alpha=0.4)
+    # plt.errorbar(x, hat_y, yerr=yerr, fmt='D',elinewidth=2, capthick=2,capsize=5, label="CDE predictions")
+    plt.scatter(x[1:,], hat_y[1:,], marker="D", label="ODE conditional predictions", color="black")
+    plt.scatter(x[1:,], hat_y_hlme[1:,], marker='o',label="HLME conditional predictions", color="orange")
+    plt.xlabel("Follow-up time (years since first visit)")
+    plt.ylabel("ISA15")
+    plt.ylim(30, 36)
+    plt.legend(loc="best")
+    title = "Mean of the observations (with 95% confidence interval) and of the conditional predictions from CDE model and of the conditional predictions from HLME model by time intervals defined according to visit times"
+    # plt.title("\n".join(textwrap.wrap(title, width=50)))
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig("figures/"+model+"_mean_trajectory_"+mode+".pdf",format='pdf', bbox_inches='tight')

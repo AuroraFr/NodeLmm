@@ -2,6 +2,8 @@
 .vscode
 figures/
 results/
-EXPs/
 3C_dataset/
 __pycache__/
+checkpoints/
+simu_datasets/
+EXPs/

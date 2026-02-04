@@ -46,26 +46,28 @@ def masked_NLL(predicted_mean, targets, V, mask):
     return loss.mean()
 
 class Decoder_with_static(nn.Module):
-    def __init__(self, latent_dim, response_dim, device, fullG=False):
+    def __init__(self, latent_dim, response_dim, device, fullG=False, GRU=False):
         super().__init__()
         self.device = device
 
         # Non-linear decoder for fixed effects
-        # self.fixed_effects_decoder = nn.Sequential(
-        #     nn.Linear(latent_dim, latent_dim * 2),
-        #     nn.ReLU(),
-        #     nn.Dropout(p=0.3),
-        #     nn.Linear(latent_dim * 2, response_dim)
-        # )
-
-        self.decoder_gru = nn.GRU(
-            input_size=latent_dim,
-            hidden_size=latent_dim*2,
-            batch_first=True,
-            num_layers=2
-        )
-        self.output_layer = nn.Linear(latent_dim *2, response_dim)
+        if not GRU:
+            self.fixed_effects_decoder = nn.Sequential(
+                nn.Linear(latent_dim, latent_dim * 2),
+                nn.ReLU(),
+                nn.Dropout(p=0.3),
+                nn.Linear(latent_dim * 2, response_dim)
+            )
+        else:
+            self.decoder_gru = nn.GRU(
+                input_size=latent_dim,
+                hidden_size=latent_dim*2,
+                batch_first=True,
+                num_layers=2
+            )
+            self.output_layer = nn.Linear(latent_dim *2, response_dim)
         self.fullG = fullG
+        self.GRU = GRU
 
         # A single linear layer decoder
         # self.fixed_effects_decoder = nn.Linear(latent_dim, response_dim)
@@ -92,16 +94,20 @@ class Decoder_with_static(nn.Module):
         N, T, _ = z_t.shape
 
         if CDE and T > 1:
+
             z_t_norm = (z_t - z_t.mean(dim=1, keepdim=True)) / (z_t.std(dim=1, keepdim=True) + 1e-8)
             # z_t_static = torch.cat([z_t_norm, s_i.unsqueeze(1).expand(-1, T, -1)], dim=-1)
             # predicted_mean = self.fixed_effects_decoder(z_t_norm)
             h_out, _ = self.decoder_gru(z_t_norm)
-        else:
-            z_t_static = torch.cat([z_t, s_i.unsqueeze(1).expand(-1, T, -1)], dim=-1)
-            # predicted_mean = self.fixed_effects_decoder(z_t)
-            h_out, _ = self.decoder_gru(z_t)
+            predicted_mean = self.output_layer(h_out).squeeze() 
 
-        predicted_mean = self.output_layer(h_out).squeeze()      # (N, T, response_dim)
+        else:
+            # z_t_static = torch.cat([z_t, s_i.unsqueeze(1).expand(-1, T, -1)], dim=-1)
+            if not self.GRU:
+                predicted_mean = self.fixed_effects_decoder(z_t).squeeze() 
+            else:
+                h_out, _ = self.decoder_gru(z_t)
+                predicted_mean = self.output_layer(h_out).squeeze()
 
         random_intercepts = torch.ones((N, T, 1), device=self.device)
         Z = torch.cat([random_intercepts, z_t], dim=-1) # Use original z_t for random effects
@@ -131,14 +137,14 @@ class ODEFunc(nn.Module):
 
         # The sequential model defines the dynamics dy/dt = f(t, y)
         self.dynamics_func = nn.Sequential(
-            nn.Linear(hidden_dim + static_dim, 16),
+            nn.Linear(hidden_dim, 16),
             nn.Tanh(),
             nn.Linear(16, hidden_dim)
         )
 
     def forward(self, t, state, static_features):
-        combined_input = torch.cat([state, static_features], dim=1)
-        return self.dynamics_func(combined_input)
+        # combined_input = torch.cat([state, static_features], dim=1)
+        return self.dynamics_func(state)
 
 class VectorField_with_static(nn.Module):
     def __init__(self, hidden_dim, input_dim, static_dim):
@@ -174,7 +180,7 @@ class VectorField_with_static(nn.Module):
 
     
 class ODENet(nn.Module):
-    def __init__(self, scripted_ode_func, feature_dim, hidden_dim, device, fullG=False):
+    def __init__(self, scripted_ode_func, feature_dim, hidden_dim, device, fullG=False, GRU=False):
         super(ODENet, self).__init__()
 
         # 1. The Encoder: Maps static features to the initial hidden state z0
@@ -194,7 +200,8 @@ class ODENet(nn.Module):
             latent_dim=hidden_dim,
             response_dim=1,
             device=device,
-            fullG=fullG)
+            fullG=fullG,
+            GRU = GRU)
 
         self._apply_weights_init()
     
@@ -204,30 +211,42 @@ class ODENet(nn.Module):
                 nn.init.xavier_uniform_(layer.weight)
                 nn.init.zeros_(layer.bias)
 
-    def forward(self, t, metabolic_baseline=None, return_components=False):
+    def forward(self, s_i, t, metabolic_baseline=None, return_components=False):
 
         if isinstance(metabolic_baseline, torch.Tensor):
             s_i = torch.cat([s_i, metabolic_baseline], dim=1)
 
         # Use the encoder to get the initial state z0 from static features
         z0 = self.encoder(s_i)
-        
+        all_t = torch.unique(t).sort().values
         # Use an ODE solver to integrate the dynamics from z0 over time t
         # This requires a library like torchdiffeq
         from torchdiffeq import odeint
         func = lambda t, z: self.dynamics_func(t, z, s_i)
-        z_t = odeint(func, z0, t, method='rk4')
+        z_all = odeint(func, z0, all_t)
         
         # The solver returns the hidden state at each time point
         # Shape: (num_time_points, batch_size, hidden_dim)
         # let's reorder to (batch, time, channels)
-        z_t = z_t.permute(1, 0, 2)
+        T, B, H = z_all.shape
+        B2, K = t.shape
+        assert B2 == B
+
+        # IMPORTANT: searchsorted assumes t_filled values are in all_t (exactly).
+        # If times are floats with rounding noise, round them before unique/searchsorted.
+        idx = torch.searchsorted(all_t, t).clamp(0, T - 1)  # (B, K)
+
+        b_idx = torch.arange(B, device=z_all.device)[:, None].expand(B, K)  # (B, K)
+
+        # Advanced indexing: z_all[idx, b_idx] -> (B, K, H)
+        z_t = z_all[idx, b_idx]
+        # z_t = z_bt.permute(1, 0, 2)
         
         # Decode the trajectory to get the final output
-        return self.decoder(z_t, return_components=return_components)
+        return self.decoder(z_t, s_i, CDE=False, return_components=return_components)
 
 class CDEModel(nn.Module):
-    def __init__(self, input_dim, static_dim, hidden_dim, device, fullG=False):
+    def __init__(self, input_dim, static_dim, hidden_dim, device, fullG=False, GRU=False):
         super().__init__()
 
         # self.encoder = nn.GRU(input_size=input_dim + static_dim,
@@ -253,7 +272,8 @@ class CDEModel(nn.Module):
             latent_dim=hidden_dim,
             response_dim=1,
             device=device,
-            fullG=fullG
+            fullG=fullG,
+            GRU=GRU
         )
         self._apply_weights_init()
 
@@ -278,7 +298,7 @@ class CDEModel(nn.Module):
         z0 = self.encoder(rnn_input)
         if N_timepoints > 1:
             z0_augmented = torch.cat([z0, s_i], dim=-1)
-            z_t_augmented = torchcde.cdeint(X=X, z0=z0_augmented, func=self.func, t=t, method='rk4', adjoint=False)
+            z_t_augmented = torchcde.cdeint(X=X, z0=z0_augmented, func=self.func, t=t, adjoint=False)
 
             dynamic_hidden_dim = z0.shape[-1]
             dynamic_z_t = z_t_augmented[..., :dynamic_hidden_dim]
@@ -340,7 +360,7 @@ def process_data(df, id_col, time_varying_features, static_features, target_col,
         g["time_slot"] = expected_times[final_idx]
         return g
     
-    for _, group in df_encoded.groupby(id_col):
+    for name, group in df_encoded.groupby(id_col):
         
         patient_df = group.copy().sort_values(by="SUIVI")
         
@@ -483,7 +503,7 @@ def collate_fn(batch):
 
     # Return collated batch
     output = {
-        't': expected_times,
+        't': t_i,
         'y': y,                 
         's_i': s_i ,
         'mask': mask,

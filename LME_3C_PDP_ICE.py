@@ -27,38 +27,24 @@ df["time"] = (
 
 # Make sure ISA15 is numeric (in case it was read as strings)
 df["ISA15"] = pd.to_numeric(df["ISA15"], errors="coerce")
-
-# pick 50 subjects that have at least 1 non-missing ISA15
-eligible_ids = (
-    df.loc[df["ISA15"].notna(), "NUM_ID"]
-      .dropna()
-      .unique()
-)
-
-np.random.seed(0)
-selected_ids = np.random.choice(eligible_ids, size=1000, replace=False)
-
-d50 = (
-    df.loc[df["NUM_ID"].isin(selected_ids), ["NUM_ID", "time", "ISA15", 'BMI', 'GLUC', 'HDL', 'PAD']]
-      .dropna(subset=["NUM_ID", "time", "ISA15", 'BMI', 'GLUC', 'HDL', 'PAD'])
-      .sort_values(["NUM_ID", "time"])
-)
 plt.figure(figsize=(8, 6))
 plt.rcParams["font.size"] = 16
 
-for sid, g in d50.groupby("NUM_ID"):
-    plt.plot(g["time"], g["ISA15"], color="black", alpha=0.6)
+# for sid, g in df.groupby("NUM_ID"):
+#     plt.plot(g["time"], g["ISA15"], color="black", alpha=0.6)
 
-plt.xlabel("Follow-up time (years since first visit)")
-plt.ylabel("ISA15")
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.savefig("figures/ISA15_data.pdf")
-plt.close()
+# plt.xlabel("Follow-up time (years since first visit)")
+# plt.ylabel("ISA15")
+# plt.grid(True, alpha=0.3)
+# plt.tight_layout()
+# plt.savefig("figures/ISA15_data.pdf")
+# plt.close()
 
 plt.figure(figsize=(8, 6))
-for sid, g in d50.groupby("NUM_ID"):
-    plt.plot(g["time"], g["BMI"], color="green", alpha=0.6)
+count = 0
+for sid, g in df.groupby("NUM_ID"):
+    g2 = g.dropna(subset=["BMI"])
+    plt.plot(g2["time"], g2["BMI"], color="green", alpha=0.6)
 
 plt.xlabel("Follow-up time (years since first visit)")
 plt.ylabel("Body Mass Index (KG/CM²)")
@@ -68,8 +54,12 @@ plt.savefig("figures/BMI_data.pdf")
 plt.close()
 
 plt.figure(figsize=(8, 6))
-for sid, g in d50.groupby("NUM_ID"):
-    plt.plot(g["time"], g["GLUC"], color="blue", alpha=0.6)
+count = 0
+for sid, g in df.groupby("NUM_ID"):
+    if len(g['GLUC'].dropna().values) > 1:
+        count += 1
+    g2 = g.dropna(subset=["GLUC"])
+    plt.plot(g2["time"], g2["GLUC"], color="blue", alpha=0.6)
 
 plt.xlabel("Follow-up time (years since first visit)")
 plt.ylabel("Glucose (mmol/L)")
@@ -79,8 +69,9 @@ plt.savefig("figures/GLUC_data.pdf")
 plt.close()
 
 plt.figure(figsize=(8, 6))
-for sid, g in d50.groupby("NUM_ID"):
-    plt.plot(g["time"], g["HDL"], color="magenta", alpha=0.6)
+for sid, g in df.groupby("NUM_ID"):
+    g2 = g.dropna(subset=["HDL"])
+    plt.plot(g2["time"], g2["HDL"], color="magenta", alpha=0.6)
 
 plt.xlabel("Follow-up time (years since first visit)")
 plt.ylabel("HDL cholesterol")
@@ -89,16 +80,16 @@ plt.tight_layout()
 plt.savefig("figures/HDL_data.pdf")
 plt.close()
 
-plt.figure(figsize=(8, 6))
-for sid, g in d50.groupby("NUM_ID"):
-    plt.plot(g["time"], g["PAD"], color="orange", alpha=0.6)
+# plt.figure(figsize=(8, 6))
+# for sid, g in df.groupby("NUM_ID"):
+#     plt.plot(g["time"], g["PAD"], color="orange", alpha=0.6)
 
-plt.xlabel("Follow-up time (years since first visit)")
-plt.ylabel("Diastolic blood pressure")
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.savefig("figures/PAD_data.pdf")
-plt.close()
+# plt.xlabel("Follow-up time (years since first visit)")
+# plt.ylabel("Diastolic blood pressure")
+# plt.grid(True, alpha=0.3)
+# plt.tight_layout()
+# plt.savefig("figures/PAD_data.pdf")
+# plt.close()
 
 # # Define bins around your visit schedule
 # bins = [-0.5, 1, 3, 5.5, 8.5, 11, 13]  # bins centered on 0,2,4,7,10,12

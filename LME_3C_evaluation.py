@@ -31,51 +31,89 @@ def calculate_prediction_mse_with_blup(model, data_loader, device):
 
     with torch.no_grad():
         for batch in data_loader:
-            t, y, s_i, mask, _, t_i, x_aug = [d.to(device) for d in batch.values()]
-            N, T, D = x_aug.shape
+            if "x_aug" in batch.keys():
+                t, y, s_i, mask, _, t_i, x_aug = [d.to(device) for d in batch.values()]
+                N, T, D = x_aug.shape
+                blup_adjusted = torch.zeros_like(y)
 
-            blup_adjusted = torch.zeros_like(y)
+                for j in range(1, T):
+                    # build batch of partial input paths up to time j
+                    x_aug_hist = x_aug[:, :j+1, :]                         # (N, j+1, D)
+                    t_hist = t[:j+1]                                       # (j+1,)
 
-            for j in range(1, T):
-                # build batch of partial input paths up to time j
-                x_aug_hist = x_aug[:, :j+1, :]                         # (N, j+1, D)
-                t_hist = t[:j+1]                                       # (j+1,)
+                    # batch build linear splines (much faster than cubic)
+                    coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_aug_hist)
+                    X = torchcde.CubicSpline(coeffs)
 
-                # batch build linear splines (much faster than cubic)
-                coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_aug_hist)
-                X = torchcde.CubicSpline(coeffs)
+                    # predict mean and components up to time j
+                    pred_mean_hist, V_hist, Z_hist, G = model(s_i, X, j+1, return_components=True)
 
-                # predict mean and components up to time j
-                pred_mean_hist, V_hist, Z_hist, G = model(s_i, X, j+1, return_components=True)
+                    for i in range(N):
+                        if mask[i, j] == 0:
+                            continue
 
-                for i in range(N):
-                    if mask[i, j] == 0:
-                        continue
+                        current_pred = pred_mean_hist[i, -1]
 
-                    current_pred = pred_mean_hist[i, -1]
+                        valid_obs = mask[i, :j] == 1
+                        if valid_obs.sum() == 0:
+                            blup_adjusted[i, j] = current_pred
+                            continue
 
-                    valid_obs = mask[i, :j] == 1
-                    if valid_obs.sum() == 0:
-                        blup_adjusted[i, j] = current_pred
-                        continue
+                        y_obs = y[i, :j][valid_obs]
+                        mu_obs = pred_mean_hist[i, :j][valid_obs]
+                        Z_obs = Z_hist[i, :j, :][valid_obs]
+                        V_obs = V_hist[i, :j, :j][valid_obs][:, valid_obs]
 
-                    y_obs = y[i, :j][valid_obs]
-                    mu_obs = pred_mean_hist[i, :j][valid_obs]
-                    Z_obs = Z_hist[i, :j, :][valid_obs]
-                    V_obs = V_hist[i, :j, :j][valid_obs][:, valid_obs]
+                        # BLUP: b̂ = G Zᵗ V⁻¹ (y - μ)
+                        residual = (y_obs - mu_obs).unsqueeze(-1)
+                        V_inv_r = torch.linalg.solve(V_obs, residual)     # (T_obs, 1)
+                        GZ_T = torch.matmul(G, Z_obs.T)                   # (q, T_obs)
+                        b_hat = torch.matmul(GZ_T, V_inv_r).squeeze(-1)   # (q,)
 
-                    # BLUP: b̂ = G Zᵗ V⁻¹ (y - μ)
-                    residual = (y_obs - mu_obs).unsqueeze(-1)
-                    V_inv_r = torch.linalg.solve(V_obs, residual)     # (T_obs, 1)
-                    GZ_T = torch.matmul(G, Z_obs.T)                   # (q, T_obs)
-                    b_hat = torch.matmul(GZ_T, V_inv_r).squeeze(-1)   # (q,)
+                        blup_adjusted[i, j] = current_pred + torch.dot(Z_hist[i, -1, :], b_hat)
 
-                    blup_adjusted[i, j] = current_pred + torch.dot(Z_hist[i, -1, :], b_hat)
+                # MSE over valid points (excluding j=0)
+                squared_error = (blup_adjusted[:, 1:] - y[:, 1:]) ** 2 * mask[:, 1:]
+                total_squared_error += squared_error.sum().item()
+                total_valid_points += mask[:, 1:].sum().item()
 
-            # MSE over valid points (excluding j=0)
-            squared_error = (blup_adjusted[:, 1:] - y[:, 1:]) ** 2 * mask[:, 1:]
-            total_squared_error += squared_error.sum().item()
-            total_valid_points += mask[:, 1:].sum().item()
+            elif "metabolic_baseline" in batch.keys():
+                t, y, s_i, mask, _, metabolic_baselines_data = [d.to(device) for d in batch.values()]
+                N, T = y.shape
+
+                blup_adjusted = torch.zeros_like(y)
+
+                for j in range(1, T):
+                    pred_mean_hist, V_hist, Z_hist, G = model(s_i, t[:,:j+1], metabolic_baseline=metabolic_baselines_data, return_components=True)
+
+                    for i in range(N):
+                        if mask[i, j] == 0:
+                            continue
+
+                        current_pred = pred_mean_hist[i, -1]
+
+                        valid_obs = mask[i, :j] == 1
+                        if valid_obs.sum() == 0:
+                            blup_adjusted[i, j] = current_pred
+                            continue
+
+                        y_obs = y[i, :j][valid_obs]
+                        mu_obs = pred_mean_hist[i, :j][valid_obs]
+                        Z_obs = Z_hist[i, :j, :][valid_obs]
+                        V_obs = V_hist[i, :j, :j][valid_obs][:, valid_obs]
+
+                        # BLUP: b̂ = G Zᵗ V⁻¹ (y - μ)
+                        residual = (y_obs - mu_obs).unsqueeze(-1)
+                        V_inv_r = torch.linalg.solve(V_obs, residual)     # (T_obs, 1)
+                        GZ_T = torch.matmul(G, Z_obs.T)                   # (q, T_obs)
+                        b_hat = torch.matmul(GZ_T, V_inv_r).squeeze(-1)   # (q,)
+
+                        blup_adjusted[i, j] = current_pred + torch.dot(Z_hist[i, -1, :], b_hat)
+
+                # MSE over valid points (excluding j=0)
+                squared_error = (blup_adjusted[:, 1:] - y[:, 1:]) ** 2 * mask[:, 1:]
+                total_squared_error += squared_error.sum().item()
+                total_valid_points += mask[:, 1:].sum().item()
 
     mse = total_squared_error / total_valid_points
     return mse
@@ -165,10 +203,10 @@ def lme_log_likelihood(model, data_loader, device):
                 metabaseline = None
                 use_x_aug=True
             elif 'metabolic_baseline' in batch.keys():
-                t, y, s_i, _, mask, metabolic_baseline = [d.to(device) for d in batch.values()]
+                t, y, s_i, mask, _ ,metabolic_baseline = [d.to(device) for d in batch.values()]
                 use_metabolic_baseline = True
             else:
-                t, y, s_i, _, mask = [d.to(device) for d in batch.values()]
+                t, y, s_i, mask, _ = [d.to(device) for d in batch.values()]
             
             N, T = y.shape
 
@@ -178,7 +216,7 @@ def lme_log_likelihood(model, data_loader, device):
                 coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_aug)
                 X = torchcde.CubicSpline(coeffs)
             
-                mu, V, Z, D = model(s_i, X, len(t), return_components=True)
+                mu, V, Z, D = model(s_i, X, 6, return_components=True)
             elif use_metabolic_baseline:
                 mu, V, Z, D = model(s_i, t, metabolic_baseline=metabolic_baseline, return_components=True)
             else:
@@ -235,8 +273,13 @@ def fitted_trajectory(model, data, device):
     model.eval()
     with torch.no_grad():
         if 'metabolic_baseline' in data.keys():
-            t, y, s_i, mask, _, metabaseline = [d.to(device) for d in data.values()]
+            t, y, s_i, mask, metabaseline, _ = [d.to(device) for d in data.values()]
+            s_i = s_i.unsqueeze(0)
+            t = t.unsqueeze(0)
+            mask = mask.unsqueeze(0)
+            metabaseline = metabaseline.unsqueeze(0)
             pred_mean, V, Z, D = model(s_i, t, metabolic_baseline=metabaseline, return_components=True)
+            t = t.squeeze()
         
         elif 'x_aug' in data.keys():
 
@@ -292,67 +335,114 @@ def fitted_trajectory(model, data, device):
 
 def calculate_sequential_blup_forecasting(model, patient_data, device, eps=1e-5):
 
-    t_points = torch.tensor(patient_data["t"], dtype=torch.float32, device=device).squeeze()
-    y = torch.tensor(patient_data["y"], dtype=torch.float32, device=device).squeeze()  # (T,)
-    x_aug = torch.tensor(patient_data["x_aug"], dtype=torch.float32, device=device)   # (T,D)
-    s_i = torch.tensor(patient_data["s_i"], dtype=torch.float32, device=device).unsqueeze(0)
-    target_mask = torch.tensor(patient_data["target_mask"], dtype=torch.float32, device=device).squeeze()  # (T,)
+    if 'metabolic_baseline' in patient_data.keys():
+        t, y, s_i, mask, metabaseline, _ = [d.to(device) for d in patient_data.values()]
+        s_i = s_i.unsqueeze(0)
+        t = t.unsqueeze(0)
+        N, T = t.shape
+        mask = mask.squeeze()
+        metabaseline = metabaseline.unsqueeze(0)
+        seq_preds, actual_y, pred_means, real_t_points = [], [], [], [0]
 
-    x_aug = x_aug.unsqueeze(0)  # (1,T,D)
+        model.eval()
+        with torch.no_grad():
+            for j in range(T):
+                pred_mean_hist, V_hist, Z_hist, G = model(s_i, t[:,:j+1], metabolic_baseline=metabaseline, return_components=True)
 
-    seq_preds, actual_y, pred_means, real_t_points = [], [], [], [0]
+                if mask[j] == 0:
+                    continue
 
-    model.eval()
-    with torch.no_grad():
-        T = t_points.numel()
-        for j in range(T):
-            if target_mask[j] == 0:
-                continue
+                if j == 0:
+                    # no past y -> just population prediction at j
+                    seq_preds.append(y[0].detach().cpu().item())
+                    actual_y.append(y[0].detach().cpu().item())
+                    continue
 
-            if j == 0:
-                # no past y -> just population prediction at j
-                seq_preds.append(y[0])
-                actual_y.append(y[0])
-                continue
+                current_pred = pred_mean_hist[-1]
+                real_t_points.append(t[:,j].detach().cpu().item())
+                actual_y.append(y[j].detach().cpu().item())
+                valid_obs = mask[:j].bool()
 
-            # Build covariate path up to and including time j (so we can get mu_j, Z_j)
-            x_hist = x_aug[:, :j+1, :]  # (1, j+1, D)
-            coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_hist)
-            X_hist = torchcde.CubicSpline(coeffs)
+                y_obs = y[:j][valid_obs]
+                mu_obs = pred_mean_hist[:j][valid_obs]
+                Z_obs = Z_hist[0][:j, :][valid_obs]
+                V_obs = V_hist[0][:j, :j][valid_obs][:, valid_obs]
 
-            pred_mean_hist, V_hist, Z_hist, D = model(s_i, X_hist, j+1, return_components=True)
-            # pred_mean_hist: (j+1,), V_hist: (1, j+1, j+1), Z_hist: (1, j+1, q), D: (q,q)
-            mu = pred_mean_hist      # (j+1,)
-            V  = V_hist[0]              # (j+1,j+1)
-            Z  = Z_hist[0]          # (j+1,q)
+                # BLUP: b̂ = G Zᵗ V⁻¹ (y - μ)
+                residual = (y_obs - mu_obs).unsqueeze(-1)
+                V_inv_r = torch.linalg.solve(V_obs, residual)     # (T_obs, 1)
+                GZ_T = torch.matmul(G, Z_obs.T)                   # (q, T_obs)
+                b_hat = torch.matmul(GZ_T, V_inv_r).squeeze(-1)   # (q,)
 
-            # Store target/time
-            real_t_points.append(t_points[j].item())
-            actual_y.append(y[j].item())
+                # Predict at time j
+                y_pred_j = current_pred + (Z_hist[0][j, :] @ b_hat)
+                seq_preds.append(y_pred_j.detach().cpu().item())
+                pred_means.append(current_pred.detach().cpu().item())
+        print(seq_preds, pred_means, real_t_points, actual_y)
 
-            # Past observed points among 0..j-1
-            past_valid = target_mask[:j].bool()
-            if past_valid.sum() == 0:
-                seq_preds.append(mu[j].item())
+    elif 'x_aug' in patient_data.keys():
+
+        t_points = torch.tensor(patient_data["t"], dtype=torch.float32, device=device).squeeze()
+        y = torch.tensor(patient_data["y"], dtype=torch.float32, device=device).squeeze()  # (T,)
+        x_aug = torch.tensor(patient_data["x_aug"], dtype=torch.float32, device=device)   # (T,D)
+        s_i = torch.tensor(patient_data["s_i"], dtype=torch.float32, device=device).unsqueeze(0)
+        target_mask = torch.tensor(patient_data["target_mask"], dtype=torch.float32, device=device).squeeze()  # (T,)
+
+        x_aug = x_aug.unsqueeze(0)  # (1,T,D)
+
+        seq_preds, actual_y, pred_means, real_t_points = [], [], [], [0]
+
+        model.eval()
+        with torch.no_grad():
+            T = t_points.numel()
+            for j in range(T):
+                if target_mask[j] == 0:
+                    continue
+
+                if j == 0:
+                    # no past y -> just population prediction at j
+                    seq_preds.append(y[0])
+                    actual_y.append(y[0])
+                    continue
+
+                # Build covariate path up to and including time j (so we can get mu_j, Z_j)
+                x_hist = x_aug[:, :j+1, :]  # (1, j+1, D)
+                coeffs = torchcde.hermite_cubic_coefficients_with_backward_differences(x_hist)
+                X_hist = torchcde.CubicSpline(coeffs)
+
+                pred_mean_hist, V_hist, Z_hist, D = model(s_i, X_hist, j+1, return_components=True)
+                # pred_mean_hist: (j+1,), V_hist: (1, j+1, j+1), Z_hist: (1, j+1, q), D: (q,q)
+                mu = pred_mean_hist      # (j+1,)
+                V  = V_hist[0]              # (j+1,j+1)
+                Z  = Z_hist[0]          # (j+1,q)
+
+                # Store target/time
+                real_t_points.append(t_points[j].item())
+                actual_y.append(y[j].item())
+
+                # Past observed points among 0..j-1
+                past_valid = target_mask[:j].bool()
+                if past_valid.sum() == 0:
+                    seq_preds.append(mu[j].item())
+                    pred_means.append(mu[j].item())
+                    continue
+
+                y_obs  = y[:j][past_valid]                 # (Tobs,)
+                mu_obs = mu[:j][past_valid]                # (Tobs,)
+                Z_obs  = Z[:j, :][past_valid, :]         # (Tobs,q)
+                V_obs  = V[:j, :j][past_valid][:, past_valid]  # (Tobs,Tobs)
+
+                resid = (y_obs - mu_obs).unsqueeze(-1)     # (Tobs,1)
+
+                # BLUP: b = D Z^T V^{-1} r  (V is already marginal)
+                V_obs = V_obs + eps * torch.eye(V_obs.shape[0], device=device)
+                V_inv_r = torch.linalg.solve(V_obs, resid)       # (Tobs,1)
+                b_blup = (D @ Z_obs.T @ V_inv_r).squeeze(-1)      # (q,)
+
+                # Predict at time j
+                y_pred_j = mu[j] + (Z[j, :] @ b_blup)
+                seq_preds.append(y_pred_j.item())
                 pred_means.append(mu[j].item())
-                continue
-
-            y_obs  = y[:j][past_valid]                 # (Tobs,)
-            mu_obs = mu[:j][past_valid]                # (Tobs,)
-            Z_obs  = Z[:j, :][past_valid, :]           # (Tobs,q)
-            V_obs  = V[:j, :j][past_valid][:, past_valid]  # (Tobs,Tobs)
-
-            resid = (y_obs - mu_obs).unsqueeze(-1)     # (Tobs,1)
-
-            # BLUP: b = D Z^T V^{-1} r  (V is already marginal)
-            V_obs = V_obs + eps * torch.eye(V_obs.shape[0], device=device)
-            V_inv_r = torch.linalg.solve(V_obs, resid)       # (Tobs,1)
-            b_blup = (D @ Z_obs.T @ V_inv_r).squeeze(-1)      # (q,)
-
-            # Predict at time j
-            y_pred_j = mu[j] + (Z[j, :] @ b_blup)
-            seq_preds.append(y_pred_j.item())
-            pred_means.append(mu[j].item())
     return np.array(real_t_points), np.array(seq_preds), np.array(actual_y), np.array(pred_means)
 
 def filter_patient_with_id(id, dataset):
