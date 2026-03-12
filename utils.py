@@ -15,6 +15,80 @@ from LME_3C_model import *
 import torch
 import torchcde
 
+def _batched_cholesky_with_jitter(A, jitter0=1e-8, max_tries=10):
+    # symmetrize
+    A = 0.5 * (A + A.transpose(-1, -2))
+    N, K, _ = A.shape
+    I = torch.eye(K, device=A.device, dtype=A.dtype).unsqueeze(0)
+
+    jitter = jitter0
+    for _ in range(max_tries):
+        L, info = torch.linalg.cholesky_ex(A + jitter * I)
+        if (info == 0).all():
+            return L
+        jitter *= 10.0
+    raise torch._C._LinAlgError("Cholesky failed even after jitter escalation.")
+
+def masked_NLL(predicted_mean, targets, V, mask, jitter0=1e-8):
+    """
+    Correct Gaussian NLL with missingness: uses observed submatrix per subject.
+    Batched (no python loop).
+    predicted_mean, targets: (N,T)
+    V: (N,T,T)
+    mask: (N,T) {0,1} or bool
+    """
+    if mask.dtype != torch.bool:
+        mask = mask.bool()
+
+    N, T = targets.shape
+
+    # number of observed points per subject
+    k = mask.sum(dim=1)                 # (N,)
+    Kmax = int(k.max().item())
+    if Kmax == 0:
+        return torch.zeros((), device=targets.device, dtype=targets.dtype, requires_grad=True)
+
+    # indices of observed times (padded to Kmax)
+    t = torch.arange(T, device=targets.device).view(1, T).expand(N, T)
+    scores = torch.where(mask, t, t + T)            # invalid pushed to end
+    idx = scores.argsort(dim=1)[:, :Kmax]           # (N,Kmax)
+
+    # pad mask within the packed dimension
+    pad_mask = (torch.arange(Kmax, device=targets.device).view(1, Kmax) < k.view(N, 1))  # (N,Kmax)
+    pad_mask_f = pad_mask.to(dtype=targets.dtype)
+
+    # gather y and mu
+    y_sel  = targets.gather(1, idx)                 # (N,Kmax)
+    mu_sel = predicted_mean.gather(1, idx)          # (N,Kmax)
+    r = (y_sel - mu_sel) * pad_mask_f               # (N,Kmax)
+
+    # gather V submatrix
+    V_rows = V.gather(1, idx[:, :, None].expand(N, Kmax, T))                 # (N,Kmax,T)
+    V_sel  = V_rows.gather(2, idx[:, None, :].expand(N, Kmax, Kmax))         # (N,Kmax,Kmax)
+
+    # neutralize padded dims so they don't contribute:
+    # set padded block to identity, remove cross terms
+    valid_block = pad_mask.unsqueeze(2) & pad_mask.unsqueeze(1)              # (N,Kmax,Kmax)
+    valid_block_f = valid_block.to(dtype=V.dtype)
+    I = torch.eye(Kmax, device=V.device, dtype=V.dtype).unsqueeze(0)
+    V_sel = V_sel * valid_block_f + I * (1.0 - valid_block_f)
+
+    # cholesky with jitter escalation
+    L = _batched_cholesky_with_jitter(V_sel, jitter0=jitter0)
+
+    # logdet over valid dims
+    diag_L = torch.diagonal(L, dim1=-2, dim2=-1)                             # (N,Kmax)
+    logdet = 2.0 * (torch.log(diag_L + 1e-12) * pad_mask_f).sum(dim=1)       # (N,)
+
+    # quadratic term
+    r_col = r.unsqueeze(-1)                                                  # (N,Kmax,1)
+    Vinv_r = torch.cholesky_solve(r_col, L)                                  # (N,Kmax,1)
+    quad = (r_col.transpose(1, 2) @ Vinv_r).squeeze(-1).squeeze(-1)          # (N,)
+
+    k_f = k.to(dtype=targets.dtype)
+    nll = 0.5 * (logdet + quad + k_f * math.log(2.0 * math.pi))
+    return nll.mean()
+
 def get_representative_indices_latent(model, dataloader, num_subjects=20, device='cuda'):
     """
     1. Extracts latent vectors (z) for all test subjects.
