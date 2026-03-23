@@ -35,9 +35,6 @@ def compute_pdp(model, loader, device, bmi_values, n_tv=1,
     For each BMI value v, replace BMI(t) in x_pad with the counterfactual,
     run the full forward pass, and collect the population mean mu(t).
 
-    The ODE dynamics are INDEPENDENT of BMI (it's not in the control path),
-    so z(t) is the same for all v — only the decoder output changes.
-
     Args:
         model:      NeuralODEModel
         loader:     DataLoader
@@ -113,7 +110,7 @@ def compute_pdp(model, loader, device, bmi_values, n_tv=1,
                     raise ValueError(f"Unknown bmi_mode: '{bmi_mode}'")
 
                 # Forward pass — masks=None (ODE ignores c_mask)
-                mu, V, _, _, _ = model(t_pad, x_cf, masks=None,
+                mu, V, _, _, _, _ = model(t_pad, x_cf, masks=None,
                                        static_covariates=s, bmi_t=x_cf[:, :, bmi_col:bmi_col+1], obs_mask=mask,
                                        y_pad=None)
                 batch_mus.append(mu.cpu())

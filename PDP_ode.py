@@ -28,9 +28,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PDP analysis for Neural ODE model")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_full_skip.pt")
+                        default="checkpoints/best_model_ode_full_skip_0.pt")
     parser.add_argument("--data", type=str,
-                        default="simu_datasets/S2a_sims_2/sim_001.rds")
+                        default="simu_datasets/S2a_sims/sim_001.rds")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--bmi_mode", type=str, default="constant",
                         choices=["constant", "linear", "shifted"])

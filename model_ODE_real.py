@@ -1,18 +1,17 @@
 """
-Neural ODE-LMM with BMI Skip Connection.
+Neural ODE-LMM with optional BMI Skip Connection.
 
 Architecture:
-  - Encoder:  z(0) = Enc(t0, BMI0, static)
-  - Dynamics: dz/dt = f(z, t, static)          ← Neural ODE (no BMI in dynamics)
+  - Encoder:  z(0) = Enc(t0, x0, static)
+  - Dynamics: dz/dt = f(z, t, ode_inject, static)   ← ode_inject = covariates + cumulative masks
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural   ← BMI only here via skip
-  - RE:       Z = [1, rs1(t), rs2(t)]  (classical spline basis)
+  - RE:       Z = [1, rs1(t), rs2(t)]  or g(z(t))
 
-Key insight: BMI is completely removed from the ODE dynamics.
-The CDE/control path machinery is unnecessary — we use simple Euler integration.
-BMI enters the model ONLY through the decoder skip connection (standardized).
-This guarantees PDP separation at all times: the decoder always sees the intervention value directly.
+The ode_inject input to the vector field can be:
+  - Simulation mode: BMI only (n_ode_inject=1)
+  - Real data mode:  K forward-filled covariates + K cumulative masks (n_ode_inject=2K)
 
-For path-dependent scenarios (5, 6), switch back to the full CDE model.
+Covariate skip connections in the decoder are configurable via skip_covariate_cols.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -74,36 +73,40 @@ class BaselineEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# ODE vector field (no BMI — autonomous dynamics)
+# ODE vector field
 # ─────────────────────────────────────────────
 
 class ODEFunc(nn.Module):
     """
-    dz/dt = f(z, t, static)
+    dz/dt = f(z, t, ode_inject, static)
 
-    No covariate path, no BMI — the ODE encodes time structure
-    and static-covariate-dependent dynamics only.
+    The vector field receives:
+      - z(t):        latent state (H)
+      - t:           current time (1)
+      - ode_inject:  time-varying inputs (n_ode_inject) — e.g. K covariates + K cumulative masks
+      - static:      time-invariant covariates (Cs)
     """
-    def __init__(self, hidden_channels, static_dim,
+    def __init__(self, hidden_channels, static_dim, n_ode_inject=1,
                  mlp_hidden=64, depth=2, dropout=0.0):
         super().__init__()
         self.hidden_channels = hidden_channels
-        # Input: [z(t), t, static]
+        # Input: [z(t), t, ode_inject, static]
         self.net = MLP(
-            in_dim=hidden_channels + 1 + static_dim + 1,
+            in_dim=hidden_channels + 1 + n_ode_inject + static_dim,
             hidden_dim=mlp_hidden,
             out_dim=hidden_channels,
             depth=depth, dropout=dropout, activation=nn.ReLU(),
         )
 
-    def forward(self, z, t_scalar, static, bmi_t):
+    def forward(self, z, t_scalar, static, ode_inject=None):
         """
         Args:
-            z:       (N, H)
-            t_scalar: scalar or (N, 1) — current time
-            static:  (N, Cs)
+            z:          (N, H)
+            t_scalar:   scalar or (N,) or (N, 1) — current time
+            static:     (N, Cs)
+            ode_inject: (N, n_ode_inject) — time-varying inputs at current time
         Returns:
-            dz/dt:   (N, H)
+            dz/dt:      (N, H)
         """
         if t_scalar.dim() == 0:
             t_expanded = t_scalar.unsqueeze(0).expand(z.size(0), 1)
@@ -111,8 +114,12 @@ class ODEFunc(nn.Module):
             t_expanded = t_scalar.unsqueeze(-1)
         else:
             t_expanded = t_scalar
-        # inp = torch.cat([z, t_expanded, static], dim=-1)
-        inp = torch.cat([z, t_expanded, bmi_t, static], dim=-1)
+
+        parts = [z, t_expanded]
+        if ode_inject is not None:
+            parts.append(ode_inject)
+        parts.append(static)
+        inp = torch.cat(parts, dim=-1)
         return torch.tanh(self.net(inp))
 
 
@@ -128,9 +135,9 @@ class Decoder(nn.Module):
                  use_neural_re=True,
                  g_hidden=16,
                  re_spline_cols=None,
-                 bmi_mean=0.0, bmi_std=1.0,
+                 x_mean=None, x_std=None,
+                 skip_covariate_cols=None,
                  static_skip_dims=None,
-                 use_bmi_skip=True,
                  reg_mode=None,
                  p_skip=None):
         """
@@ -138,39 +145,17 @@ class Decoder(nn.Module):
             latent_dim: dimension of z(t)
             p: fixed-effect basis dimension (rho output for ODE pathway)
             q: random-effect basis dimension
-            bmi_mean, bmi_std: for standardizing BMI skip input
+            x_mean, x_std: (K,) tensors for standardizing skip covariates.
+                           Required if skip_covariate_cols is not None.
+            skip_covariate_cols: list of column indices in x_pad to skip-connect
+                                to decoder. E.g. [0] for BMI only (simulation),
+                                [0,1,2,3,4] for all covariates (real data).
+                                None = no covariate skip.
             static_skip_dims: list of static covariate dimensions to skip-connect
                               to decoder (e.g., [1] for AGEc). None = no static skip.
             re_spline_cols: column indices in x_pad for RE spline basis
-            use_bmi_skip: if False, decoder sees only z(t) — no direct BMI input.
-                          Use False for path-dependent scenarios (S5, S6).
             reg_mode: None, "l1_skip", or "ortho".
-                None:      standard decoder, single rho network.
-                "l1_skip": single rho network, penalty on |mu_full - mu_no_skip|.
-                           Penalizes marginal skip contribution → parsimony.
-                "ortho":   two separate networks (PHO-style decomposition):
-                             mu = mu_ode(z(t)) + mu_skip(BMI, AGEc)
-                           with orthogonality penalty on their covariance.
-                           Ensures identifiability: each pathway captures
-                           non-overlapping signal.
             p_skip: basis dimension for the skip pathway in ortho mode.
-                    Defaults to p if not specified.
-
-        Theory:
-            reg_mode="l1_skip":
-                L = NLL + lambda * E[|mu(z,s) - mu(z,0)|]
-                Encourages the optimizer to route signal through z(t) unless
-                the skip genuinely improves fit. The L1 penalty induces sparsity
-                in the skip's functional contribution.
-
-            reg_mode="ortho" (PHO decomposition):
-                mu(t) = mu_ode(z(t)) + mu_skip(BMI(t), AGEc)
-                L = NLL + lambda * |Cov(mu_ode, mu_skip)|^2
-                Orthogonality ensures:
-                  1. Identifiability — no information leakage between pathways
-                  2. ΔPDP variance additivity — Var(ΔPDP) = Var(ΔPDP_ode) + Var(ΔPDP_skip)
-                  3. Clean attribution — each pathway's contribution is interpretable
-                Ref: Rügamer (2023), "A new PHO-rmula", ICML.
         """
         super().__init__()
         self.p, self.q = p, q
@@ -180,22 +165,30 @@ class Decoder(nn.Module):
         self.n_static = n_static
         self.reg_mode = reg_mode
 
-        # BMI standardization buffers
-        self.register_buffer('bmi_mean', torch.tensor(float(bmi_mean)))
-        self.register_buffer('bmi_std', torch.tensor(float(bmi_std)))
+        # Covariate skip connection
+        self.skip_covariate_cols = skip_covariate_cols or []
+        n_cov_skip = len(self.skip_covariate_cols)
 
-        # Skip connections
-        self.use_bmi_skip = use_bmi_skip
+        # Per-channel standardization for skip covariates
+        if n_cov_skip > 0:
+            if x_mean is None:
+                raise ValueError("x_mean/x_std required when skip_covariate_cols is set")
+            # Store only the means/stds for the skipped channels
+            skip_mean = torch.as_tensor(x_mean, dtype=torch.float32)[self.skip_covariate_cols]
+            skip_std = torch.as_tensor(x_std, dtype=torch.float32)[self.skip_covariate_cols]
+            self.register_buffer('skip_mean', skip_mean)   # (n_cov_skip,)
+            self.register_buffer('skip_std', skip_std)     # (n_cov_skip,)
+
+        # Static skip connection
         self.static_skip_dims = static_skip_dims
         n_static_skip = len(static_skip_dims) if static_skip_dims else 0
 
-        # Skip dims: BMI (if enabled) + static skips
-        n_bmi_skip = 1 if use_bmi_skip else 0
-        skip_dim = n_bmi_skip + n_static_skip
+        # Total skip dimension
+        skip_dim = n_cov_skip + n_static_skip
         self.skip_dim = skip_dim
 
         if reg_mode == "ortho" and skip_dim == 0:
-            raise ValueError("reg_mode='ortho' requires use_bmi_skip=True or static_skip_dims")
+            raise ValueError("reg_mode='ortho' requires skip_covariate_cols or static_skip_dims")
 
         if p_skip is None:
             p_skip = p
@@ -279,18 +272,19 @@ class Decoder(nn.Module):
         """Build the skip connection input tensor. Returns (N, T, skip_dim) or None."""
         skip_parts = []
 
-        if self.use_bmi_skip:
-            bmi_t = x_pad[:, :, 0:1]                                    # (N, T, 1)
-            bmi_std = (bmi_t - self.bmi_mean) / self.bmi_std             # (N, T, 1)
-            skip_parts.append(bmi_std)
+        if self.skip_covariate_cols:
+            # Extract and standardize skip covariates
+            x_skip = x_pad[:, :, self.skip_covariate_cols]          # (N, T, n_cov_skip)
+            x_skip_std = (x_skip - self.skip_mean) / self.skip_std  # standardized
+            skip_parts.append(x_skip_std)
 
         if self.static_skip_dims:
-            static_expanded = static[:, self.static_skip_dims]           # (N, n_skip)
+            static_expanded = static[:, self.static_skip_dims]       # (N, n_static_skip)
             static_expanded = static_expanded.unsqueeze(1).expand(-1, T, -1)
             skip_parts.append(static_expanded)
 
         if skip_parts:
-            return torch.cat(skip_parts, dim=-1)                         # (N, T, skip_dim)
+            return torch.cat(skip_parts, dim=-1)                     # (N, T, skip_dim)
         return None
 
     def forward(self, z_t, t_pad, x_pad, static, y_pad=None, obs_mask=None,
@@ -464,38 +458,46 @@ class NeuralODEConfig:
 
 class NeuralODEModel(nn.Module):
     """
-    Neural ODE-LMM with BMI skip connection.
+    Neural ODE-LMM with optional BMI skip connection.
 
     Architecture:
-      Encoder:  z(0) = Enc(t0, BMI0, static)
-      ODE:      dz/dt = f(z, t, static)       — no BMI in dynamics
-      Decoder:  mu = rho(z(t), BMI_std(t)) @ beta_neural — BMI only here
+      Encoder:  z(0) = Enc(t0, x0_baseline, static)
+      ODE:      dz/dt = f(z, t, ode_inject, static)
+      Decoder:  mu = rho(z(t), BMI_std(t)) @ beta  — BMI skip optional
 
-    Forward signature is kept compatible with the CDE model's dataloader.
-    The c_mask (cumulative mask) argument is accepted but ignored.
+    Supports two modes:
+      - Simulation: ode_inject = BMI only (n_ode_inject=1)
+      - Real data:  ode_inject = K covariates + K cumulative masks (n_ode_inject=2K)
     """
 
     def __init__(self, x_dim, static_dim=0, cfg=None,
                  n_tv=1,
+                 n_ode_inject=1,
                  use_rho_net=True,
                  use_neural_re=False,
                  g_hidden=16,
                  re_spline_cols=None,
                  fullD=True,
-                 bmi_mean=0.0, bmi_std=1.0,
+                 x_mean=None, x_std=None,
+                 skip_covariate_cols=None,
                  static_skip_dims=None,
-                 use_bmi_skip=True,
                  reg_mode=None,
                  p_skip=None):
         """
         Args:
-            x_dim: total columns in x_pad (e.g. 3 for [BMI_t, rs1, rs2])
+            x_dim: total columns in x_filled (K time-varying features)
             static_dim: number of static covariates
-            n_tv: number of time-varying covariates (only BMI_t = 1)
+            n_tv: number of time-varying covariates for encoder baseline input
+            n_ode_inject: dimension of time-varying input to ODE vector field
+                          (e.g. 2*K for K covariates + K cumulative masks,
+                           or 1 for BMI-only in simulation mode)
+            x_mean: (K,) per-channel mean for standardizing decoder skip covariates.
+            x_std:  (K,) per-channel std.
+            skip_covariate_cols: list of column indices in x_filled to skip-connect
+                                to decoder. E.g. [0] for BMI only (simulation),
+                                list(range(K)) for all covariates (real data).
+                                None = no covariate skip.
             static_skip_dims: indices of static covariates to skip-connect to decoder
-                              e.g. [1] to pass AGEc directly. None = no static skip.
-            use_bmi_skip: if False, decoder sees only z(t) — no direct BMI input.
-                          Use False for path-dependent scenarios (S5, S6).
             reg_mode: None, "l1_skip", or "ortho". See Decoder docstring.
             p_skip: basis dimension for skip pathway in ortho mode.
         """
@@ -506,10 +508,10 @@ class NeuralODEModel(nn.Module):
         self.x_dim = x_dim
         self.static_dim = static_dim
         self.n_tv = n_tv
+        self.n_ode_inject = n_ode_inject
 
-        # Encoder: sees [t0, BMI0] + static
-        # BMI0 is column 0 of x_pad at time 0
-        encoder_input_dim = 1 + n_tv   # t0 + BMI0
+        # Encoder: sees [t0, x0_all] + static
+        encoder_input_dim = 1 + n_tv   # t0 + baseline covariates
         self.encoder = BaselineEncoder(
             input_dim=encoder_input_dim,
             static_dim=static_dim,
@@ -519,10 +521,11 @@ class NeuralODEModel(nn.Module):
             dropout=cfg.dropout,
         )
 
-        # ODE dynamics: f(z, t, static) → dz/dt
+        # ODE dynamics: f(z, t, ode_inject, static) → dz/dt
         self.func = ODEFunc(
             hidden_channels=cfg.hidden_channels,
             static_dim=static_dim,
+            n_ode_inject=n_ode_inject,
             mlp_hidden=cfg.func_mlp_hidden,
             depth=cfg.depth,
             dropout=cfg.dropout,
@@ -530,7 +533,7 @@ class NeuralODEModel(nn.Module):
 
         self.z_norm = nn.LayerNorm(cfg.hidden_channels)
 
-        # Decoder with optional BMI skip
+        # Decoder with covariate skip connections
         self.decoder = Decoder(
             latent_dim=cfg.hidden_channels,
             p=cfg.dec_p,
@@ -542,24 +545,26 @@ class NeuralODEModel(nn.Module):
             use_neural_re=use_neural_re,
             g_hidden=g_hidden,
             re_spline_cols=re_spline_cols,
-            bmi_mean=bmi_mean,
-            bmi_std=bmi_std,
+            x_mean=x_mean,
+            x_std=x_std,
+            skip_covariate_cols=skip_covariate_cols,
             static_skip_dims=static_skip_dims,
-            use_bmi_skip=use_bmi_skip,
             reg_mode=reg_mode,
             p_skip=p_skip,
         )
 
-    def _euler_integrate(self, z0, times, static, bmi_t=None):
+    def _euler_integrate(self, z0, times, static, ode_inject=None):
         """
-        Euler integration of dz/dt = f(z, t, static) on the padded time grid.
+        Euler integration of dz/dt = f(z, t, ode_inject, static) on the padded time grid.
 
         Args:
-            z0:     (N, H) initial state
-            times:  (N, T) observation times
-            static: (N, Cs) static covariates
+            z0:         (N, H) initial state
+            times:      (N, T) observation times
+            static:     (N, Cs) static covariates
+            ode_inject: (N, T, D_inj) time-varying inputs at each grid point,
+                        or None for autonomous ODE.
         Returns:
-            zt:     (N, T, H) latent states at each time
+            zt:         (N, T, H) latent states at each time
         """
         N, T = times.shape
         H = z0.shape[1]
@@ -579,12 +584,13 @@ class NeuralODEModel(nn.Module):
             for s in range(n_sub):
                 t_current = t_start + s * dt_sub   # (N,)
                 alpha = s / n_sub
-                if bmi_t is not None:
-                    bmi_current = (1 - alpha) * bmi_t[:, k] + alpha * bmi_t[:, k + 1]  # (N, 1)
-                    dzdt = self.func(z, t_current, static, bmi_current)  # (N, H)
+                if ode_inject is not None:
+                    # Linear interpolation of all injected channels between grid points
+                    inj_current = (1 - alpha) * ode_inject[:, k] + alpha * ode_inject[:, k + 1]
+                    dzdt = self.func(z, t_current, static, inj_current)
                 else:
-                    dzdt = self.func(z, t_current, static)  # (N, H)
-                z = z + dzdt * dt_sub.unsqueeze(-1)      # (N, H)
+                    dzdt = self.func(z, t_current, static)
+                z = z + dzdt * dt_sub.unsqueeze(-1)
 
             zt[:, k + 1] = z
 
@@ -593,36 +599,31 @@ class NeuralODEModel(nn.Module):
     def forward(
         self,
         t_pad,                                    # (N, T)
-        x_pad,                                    # (N, T, Cx)
-        masks=None,                               # (N, T) cumulative mask — IGNORED
-        static_covariates=None,  
-        bmi_t = None,                 # (N, Cs)
+        x_pad,                                    # (N, T, Cx)  — x_filled covariates (RAW)
+        masks=None,                               # (N, T, K) cumulative mask
+        static_covariates=None,                   # (N, Cs)
+        ode_inject=None,                          # (N, T, D_inj) — covariates + masks for ODE
         obs_mask=None,                            # (N, T) outcome observation mask
         y_pad=None,                               # (N, T)
         return_hidden=False,
-        interp=None,                              # ignored (no spline interpolation needed)
+        interp=None,                              # ignored
     ):
         N, T = t_pad.shape
         device, dtype = t_pad.device, t_pad.dtype
 
         # --- Encoder ---
-        # Input: [t0, BMI0, static]
         t0 = t_pad[:, 0:1]                                  # (N, 1)
-        bmi0 = x_pad[:, 0, 0:self.n_tv]                     # (N, n_tv) — baseline BMI
-        encoder_in = torch.cat([t0, bmi0, static_covariates], dim=-1)
+        x0 = x_pad[:, 0, 0:self.n_tv]                       # (N, n_tv) — baseline covariates
+        encoder_in = torch.cat([t0, x0, static_covariates], dim=-1)
         z0 = self.encoder(encoder_in)                        # (N, H)
 
-        # # Standardize bmi_t for ODE dynamics
-        # if bmi_t is not None:
-        #     bmi_t_std = (bmi_t - self.decoder.bmi_mean) / self.decoder.bmi_std
-        # else:
-        #     bmi_t_std = None
-
         # --- ODE integration ---
-        zt = self._euler_integrate(z0, t_pad, static_covariates, bmi_t)  # (N, T, H)
+        # Raw covariates + cumask injected directly; z_norm handles output scale
+        zt = self._euler_integrate(z0, t_pad, static_covariates, ode_inject)
         zt = self.z_norm(zt)
 
-        # --- Decoder (with BMI skip) ---
+        # --- Decoder ---
+        # Decoder receives RAW x_pad (it has its own BMI standardization)
         result = self.decoder(zt, t_pad, x_pad, static_covariates,
                               y_pad=y_pad, obs_mask=obs_mask)
 
