@@ -18,7 +18,7 @@ import numpy as np
 import pyreadr
 import argparse
 from dataset import LongitudinalDataset, collate_pad
-from model import NeuralCDEModel, NeuralCDEConfig
+from model_CDE import NeuralCDEModel, NeuralCDEConfig
 from utils import masked_NLL
 
 import warnings

@@ -2,17 +2,11 @@
 Neural ODE-LMM with BMI Skip Connection.
 
 Architecture:
-  - Encoder:  z(0) = Enc(t0, BMI0, static)
-  - Dynamics: dz/dt = f(z, t, static)          ← Neural ODE (no BMI in dynamics)
-  - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural   ← BMI only here via skip
-  - RE:       Z = [1, rs1(t), rs2(t)]  (classical spline basis)
+  - Encoder:  z(0) = Enc(t0, static)
+  - Dynamics: dz/dt = f(z, t, static, BMI(t))          ← Neural ODE
+  - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural 
+  - RE:       Z = g(z(t))
 
-Key insight: BMI is completely removed from the ODE dynamics.
-The CDE/control path machinery is unnecessary — we use simple Euler integration.
-BMI enters the model ONLY through the decoder skip connection (standardized).
-This guarantees PDP separation at all times: the decoder always sees the intervention value directly.
-
-For path-dependent scenarios (5, 6), switch back to the full CDE model.
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -74,7 +68,7 @@ class BaselineEncoder(nn.Module):
 
 
 # ─────────────────────────────────────────────
-# ODE vector field (no BMI — autonomous dynamics)
+# ODE vector field
 # ─────────────────────────────────────────────
 
 class ODEFunc(nn.Module):
@@ -88,9 +82,10 @@ class ODEFunc(nn.Module):
                  mlp_hidden=64, depth=2, dropout=0.0):
         super().__init__()
         self.hidden_channels = hidden_channels
-        # Input: [z(t), t, static]
+        
         self.net = MLP(
-            in_dim=hidden_channels + 1 + static_dim + 1,
+            # in_dim=hidden_channels + 1 + static_dim + 1,
+            in_dim=hidden_channels + 1 + 1,
             hidden_dim=mlp_hidden,
             out_dim=hidden_channels,
             depth=depth, dropout=dropout, activation=nn.ReLU(),
@@ -102,6 +97,7 @@ class ODEFunc(nn.Module):
             z:       (N, H)
             t_scalar: scalar or (N, 1) — current time
             static:  (N, Cs)
+            covariates : (N, cov_dim)
         Returns:
             dz/dt:   (N, H)
         """
@@ -111,8 +107,9 @@ class ODEFunc(nn.Module):
             t_expanded = t_scalar.unsqueeze(-1)
         else:
             t_expanded = t_scalar
-        # inp = torch.cat([z, t_expanded, static], dim=-1)
-        inp = torch.cat([z, t_expanded, bmi_t, static], dim=-1)
+
+        # inp = torch.cat([z, t_expanded, bmi_t, static], dim=-1)
+        inp = torch.cat([z, t_expanded, bmi_t], dim=-1)
         return torch.tanh(self.net(inp))
 
 
@@ -293,12 +290,11 @@ class Decoder(nn.Module):
             return torch.cat(skip_parts, dim=-1)                         # (N, T, skip_dim)
         return None
 
-    def forward(self, z_t, t_pad, x_pad, static, y_pad=None, obs_mask=None,
+    def forward(self, z_t, x_pad, static, obs_mask=None,
                 return_components=True):
         """
         Args:
             z_t:      (N, T, H)  latent states from ODE
-            t_pad:    (N, T)     padded observation times
             x_pad:    (N, T, Cx) padded covariates (BMI_t at col 0, rs1/rs2 for RE)
             static:   (N, Cs)    static covariates
             obs_mask: (N, T)     binary mask (1=observed, 0=padded)
@@ -434,7 +430,7 @@ class Decoder(nn.Module):
 
         sig2 = torch.exp(self.log_residual_var).to(device=device, dtype=dtype)
         eye = torch.eye(T, device=device, dtype=dtype).unsqueeze(0).expand(N, T, T)
-        V = V_re + (sig2 + self.jitter) * eye
+        V = V_re + (sig2 + self.jitter) * eye #TODO: really need self.jitter here?
 
         if return_components:
             return mu, V, Z, D, sig2, reg_dict
@@ -598,7 +594,6 @@ class NeuralODEModel(nn.Module):
         static_covariates=None,  
         bmi_t = None,                 # (N, Cs)
         obs_mask=None,                            # (N, T) outcome observation mask
-        y_pad=None,                               # (N, T)
         return_hidden=False,
         interp=None,                              # ignored (no spline interpolation needed)
     ):
@@ -612,19 +607,13 @@ class NeuralODEModel(nn.Module):
         encoder_in = torch.cat([t0, bmi0, static_covariates], dim=-1)
         z0 = self.encoder(encoder_in)                        # (N, H)
 
-        # # Standardize bmi_t for ODE dynamics
-        # if bmi_t is not None:
-        #     bmi_t_std = (bmi_t - self.decoder.bmi_mean) / self.decoder.bmi_std
-        # else:
-        #     bmi_t_std = None
-
         # --- ODE integration ---
         zt = self._euler_integrate(z0, t_pad, static_covariates, bmi_t)  # (N, T, H)
         zt = self.z_norm(zt)
 
         # --- Decoder (with BMI skip) ---
-        result = self.decoder(zt, t_pad, x_pad, static_covariates,
-                              y_pad=y_pad, obs_mask=obs_mask)
+        result = self.decoder(zt, x_pad, static_covariates,
+                              obs_mask=obs_mask)
 
         if return_hidden:
             if isinstance(result, tuple):

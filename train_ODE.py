@@ -25,12 +25,20 @@ import pandas as pd
 from dataset import LongitudinalDataset, collate_pad
 from model_ODE import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
+import argparse
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
 if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Neural ODE-LMM training")
+    parser.add_argument("--checkpoint", type=str,
+                        default="checkpoints/simulation_baseline")
+    parser.add_argument("--data", type=str,
+                        default="simu_datasets/S2a_sims")
+    args = parser.parse_args()
 
     # ---- Config ----
     LR = 1e-3
@@ -52,8 +60,8 @@ if __name__ == "__main__":
     x_cols = ["BMI_t", "rs1", "rs2"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
-    for i in range(5):
-        path = "simu_datasets/S5_sims/sim_00"+str(i+1)+".rds"
+    for i in range(5, 99):
+        path = args.data + f"/sim_{i+1:03d}.rds"
         df = next(iter(pyreadr.read_r(path).values()))
         df["SEX"] = df["SEX"].astype("category")
         df["SEX_code"] = df["SEX"].cat.codes.astype("float64")
@@ -120,26 +128,25 @@ if __name__ == "__main__":
             n_tv=n_tv,
             use_rho_net=True,
             use_neural_re=True,
-            re_spline_cols=[1, 2],
+            re_spline_cols=None,
             g_hidden=16,
             fullD=True,
             bmi_mean=bmi_mean,
             bmi_std=bmi_std,
             use_bmi_skip=True,
             static_skip_dims=[1],         # AGEc skip to decoder
-            reg_mode="l1_skip"
+            reg_mode='l1_skip'
         ).to(device)
 
-        LAMBDA_ORTHO = 1  # typically larger since cov^2 is small
-        LAMBDA_L1 = 0.1 
+        LAMBDA_REG = 0.1
 
         total_params = sum(p.numel() for p in model.parameters())
         print(f"\nTotal parameters: {total_params}")
         print(f"Architecture:")
         print(f"  Encoder:  z(0) = Enc(t0, BMI0, static)")
-        print(f"  ODE:      dz/dt = f(z, t, static, x(t))")
+        print(f"  ODE:      dz/dt = f(z, t, x(t))")
         print(f"  Decoder:  mu = rho(z(t), BMI_std, AGEc) @ beta_neural")
-        print(f"  RE:       Z = [1, rs1(t), rs2(t)]")
+        print(f"  RE:       g(z(t))")
         print(f"  Euler sub-steps: {cfg.euler_steps_per_interval}")
 
         # ---- Optimizer ----
@@ -149,14 +156,19 @@ if __name__ == "__main__":
         )
 
         # ---- Checkpoint dir ----
-        os.makedirs("checkpoints", exist_ok=True)
-        ckpt_path = "checkpoints/best_model_ode_full_S5_skip_ortho_"+str(i)+".pt"
+        os.makedirs(args.checkpoint, exist_ok=True)
+        ckpt_path = args.checkpoint+"/best_model_ode_"+str(i)+".pt"
 
         # ---- Train ----
         best_test_loss = float("inf")
         best_state = None
+        patience = 300
 
         for epoch in range(1, EPOCHS + 1):
+
+            if patience == 0:
+                break
+
             # ---- Training ----
             model.train()
             total_nll = 0.0
@@ -172,12 +184,11 @@ if __name__ == "__main__":
                 # c_mask is NOT passed to the model (ODE ignores it)
 
                 mu, V, _, _, _ , reg_dict = model(t_pad, x_pad, masks=None,
-                                    static_covariates=s, bmi_t=x_pad[:, :, 0:1], obs_mask=mask,
-                                    y_pad=None)
+                                    static_covariates=s, bmi_t=x_pad[:, :, 0:1], obs_mask=mask)
                 loss = masked_NLL(mu, y_pad, V, mask)
 
                 if reg_dict and "reg_term" in reg_dict:
-                    loss = loss + LAMBDA_ORTHO * reg_dict["reg_term"]
+                    loss = loss + LAMBDA_REG * reg_dict["reg_term"]
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -203,8 +214,7 @@ if __name__ == "__main__":
                     s = s.to(device)
 
                     mu, V, _, _, _, reg_term = model(t_pad, x_pad, masks=None,
-                                        static_covariates=s, bmi_t=x_pad[:, :, 0:1], obs_mask=mask,
-                                        y_pad=None)
+                                        static_covariates=s, bmi_t=x_pad[:, :, 0:1], obs_mask=mask)
                     test_loss = masked_NLL(mu, y_pad, V, mask)
                     test_nll += test_loss.item()
                     test_count += 1
@@ -214,6 +224,7 @@ if __name__ == "__main__":
 
             if avg_test < best_test_loss:
                 best_test_loss = avg_test
+                patience = 300
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
                 torch.save({
                     'model_state_dict': best_state,
@@ -232,6 +243,8 @@ if __name__ == "__main__":
                         'approach': 'ode_bmi_skip',
                     },
                 }, ckpt_path)
+            else:
+                patience = patience - 1
 
             if epoch % PRINT_EVERY == 0 or epoch == 1:
                 beta_neural = model.decoder.beta_neural.detach().cpu()

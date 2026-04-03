@@ -111,8 +111,7 @@ def compute_pdp(model, loader, device, bmi_values, n_tv=1,
 
                 # Forward pass — masks=None (ODE ignores c_mask)
                 mu, V, _, _, _, _ = model(t_pad, x_cf, masks=None,
-                                       static_covariates=s, bmi_t=x_cf[:, :, bmi_col:bmi_col+1], obs_mask=mask,
-                                       y_pad=None)
+                                       static_covariates=s, bmi_t=x_cf[:, :, bmi_col:bmi_col+1], obs_mask=mask)
                 batch_mus.append(mu.cpu())
 
                 # Collect metadata on first BMI value only
@@ -213,7 +212,7 @@ def compute_pdp_with_blup(model, loader, device, bmi_values, bmi_col=0,
             # Forward on OBSERVED data (real BMI)
             mu_obs, V_obs, Z_obs, D_obs, sig2_obs = model(
                 t_pad, x_pad, masks=None,
-                static_covariates=s, obs_mask=mask, y_pad=None
+                static_covariates=s, obs_mask=mask
             )
 
             # BLUP: b_hat_i = D Z_i^T V_i^{-1} (y_i - mu_i)

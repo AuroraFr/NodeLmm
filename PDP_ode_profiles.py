@@ -16,7 +16,7 @@ import os
 
 from dataset import LongitudinalDataset, collate_pad
 from model_ODE import NeuralODEModel, NeuralODEConfig
-from PDP_profiles_ODE import (
+from PDP_analysis_profiles_ODE import (
     compute_pdp_profiles,
     compute_profile_diagnostic,
     compute_skip_ablation,
