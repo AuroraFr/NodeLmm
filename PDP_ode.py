@@ -28,9 +28,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PDP analysis for Neural ODE model")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_baseline/best_model_ode_3.pt")
+                        default="checkpoints/simulation_baseline_skipgate/best_model_ode_4.pt")
     parser.add_argument("--data", type=str,
-                        default="simu_datasets/S2a_sims/sim_004.rds")
+                        default="simu_datasets/S2a_sims/sim_005.rds")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--bmi_mode", type=str, default="constant",
                         choices=["constant", "linear", "shifted"])
@@ -65,7 +65,7 @@ if __name__ == "__main__":
     n_tv = 1
 
     # ---- Build model ----
-    from model_ODE import NeuralODEModel, NeuralODEConfig
+    from model_ODE_skipgate import NeuralODEModel, NeuralODEConfig
 
     cfg = NeuralODEConfig(
         hidden_channels=8,
@@ -86,12 +86,13 @@ if __name__ == "__main__":
         n_tv=n_tv,
         use_rho_net=True,
         use_neural_re=True,
-        re_spline_cols=[1, 2],
+        re_spline_cols=None,
         g_hidden=16,
         fullD=True,
         bmi_mean=0.0,   # placeholder — overwritten by checkpoint
         bmi_std=1.0,
         static_skip_dims=[1],
+        reg_mode='skip_gate'
     ).to(device)
 
     # ---- Load checkpoint ----

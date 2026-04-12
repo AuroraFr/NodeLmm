@@ -3,7 +3,7 @@ Neural ODE-LMM with BMI Skip Connection.
 
 Architecture:
   - Encoder:  z(0) = Enc(t0, static)
-  - Dynamics: dz/dt = f(z, t, static, BMI(t))          ← Neural ODE
+  - Dynamics: dz/dt = f(z, t, BMI(t))          ← Neural ODE
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural 
   - RE:       Z = g(z(t))
 
@@ -27,7 +27,7 @@ class MLP(nn.Module):
                  activation=None):
         super().__init__()
         if activation is None:
-            activation = nn.ReLU()
+            activation = nn.SiLU()
         if depth < 1:
             raise ValueError("depth must be >= 1")
         layers = []
@@ -76,17 +76,16 @@ class ODEFunc(nn.Module):
     dz/dt = f(z, t, static, bmi(t))
     """
     def __init__(self, hidden_channels, static_dim,
-                 mlp_hidden=64, depth=2, dropout=0.0, activation=None):
+                 mlp_hidden=64, depth=2, dropout=0.0):
         super().__init__()
         self.hidden_channels = hidden_channels
         
         self.net = MLP(
             # in_dim=hidden_channels + 1 + static_dim + 1,
             in_dim=hidden_channels + 1 + 1,
-            # in_dim=hidden_channels + 1,
             hidden_dim=mlp_hidden,
             out_dim=hidden_channels,
-            depth=depth, dropout=dropout, activation=activation,
+            depth=depth, dropout=dropout, activation=nn.SiLU(),
         )
 
     def forward(self, z, t_scalar, static, bmi_t):
@@ -94,8 +93,8 @@ class ODEFunc(nn.Module):
         Args:
             z:       (N, H)
             t_scalar: scalar or (N, 1) — current time
-            static:  (N, Cs)
-            covariates : (N, cov_dim)
+            static:  (N, Cs)  — currently unused (commented out in inp)
+            bmi_t:   (N, 1) — current BMI value
         Returns:
             dz/dt:   (N, H)
         """
@@ -108,7 +107,6 @@ class ODEFunc(nn.Module):
 
         # inp = torch.cat([z, t_expanded, bmi_t, static], dim=-1)
         inp = torch.cat([z, t_expanded, bmi_t], dim=-1)
-        # inp = torch.cat([z, t_expanded], dim=-1)
         return torch.tanh(self.net(inp))
 
 
@@ -140,13 +138,16 @@ class Decoder(nn.Module):
             re_spline_cols: column indices in x_pad for RE spline basis
             use_bmi_skip: if False, decoder sees only z(t) — no direct BMI input.
                           Use False for path-dependent scenarios (S5, S6).
-            reg_mode: None, "l1_skip", or "ortho".
-                None:      standard decoder, single rho network.
-                "l1_skip": single rho network, penalty on |mu_full - mu_no_skip|.
-                           Penalizes marginal skip contribution → parsimony.
-                "gradient_penality":   two separate networks (PHO-style decomposition):
-                             mu = mu_ode(z(t)) + mu_skip(BMI, AGEc)
-            p_skip: basis dimension for the skip pathway in ortho mode.
+            reg_mode: None, "l1_skip", or "grad_penalty".
+                None:           standard decoder, single rho network.
+                "l1_skip":      single rho network, penalty on |mu_full - mu_no_skip|.
+                                Penalizes marginal skip contribution → parsimony.
+                "grad_penalty": two separate networks (ODE + skip pathways):
+                                  mu = mu_ode(z(t)) + mu_skip(BMI, AGEc)
+                                Gradient penalty ∂mu_ode/∂BMI(t) is computed at the
+                                NeuralODEModel level to penalize BMI signal leaking
+                                into the ODE pathway.
+            p_skip: basis dimension for the skip pathway in grad_penalty mode.
                     Defaults to p if not specified.
 
         Theory:
@@ -156,9 +157,12 @@ class Decoder(nn.Module):
                 the skip genuinely improves fit. The L1 penalty induces sparsity
                 in the skip's functional contribution.
 
-            reg_mode="gradient penality":
+            reg_mode="grad_penalty":
                 mu(t) = mu_ode(z(t)) + mu_skip(BMI(t), AGEc)
-                L = NLL + lambda * |Cov(mu_ode, mu_skip)|^2
+                L = NLL + lambda * E[(∂mu_ode/∂BMI(t))²]
+                Penalizes instantaneous sensitivity of the ODE pathway to BMI,
+                pushing BMI effects into the skip pathway where they belong
+                for instantaneous-effect scenarios.
         """
         super().__init__()
         self.p, self.q = p, q
@@ -182,8 +186,8 @@ class Decoder(nn.Module):
         skip_dim = n_bmi_skip + n_static_skip
         self.skip_dim = skip_dim
 
-        if reg_mode == "ortho" and skip_dim == 0:
-            raise ValueError("reg_mode='ortho' requires use_bmi_skip=True or static_skip_dims")
+        if reg_mode == "grad_penalty" and skip_dim == 0:
+            raise ValueError("reg_mode='grad_penalty' requires use_bmi_skip=True or static_skip_dims")
 
         if p_skip is None:
             p_skip = p
@@ -192,8 +196,9 @@ class Decoder(nn.Module):
         # --- Neural fixed effects ---
         self.use_rho_net = use_rho_net
 
-        if reg_mode == "gradient":
-            
+        if reg_mode == "grad_penalty":
+            # Two separate pathways: mu = mu_ode(z(t)) + mu_skip(BMI, AGEc)
+            # Gradient penalty on ∂mu_ode/∂BMI is computed at NeuralODEModel level.
             # ODE pathway: z(t) → R^p → scalar
             self.rho_ode_net = MLP(latent_dim, rho_hidden, p, depth=2, dropout=0.0)
             self.rho_ode_norm = nn.LayerNorm(p)
@@ -204,10 +209,10 @@ class Decoder(nn.Module):
             self.rho_skip_norm = nn.LayerNorm(p_skip)
             self.beta_skip = nn.Parameter(0.1 * torch.randn(p_skip))
 
-            # For backward compat: expose beta_neural as sum-like reference
+            # For backward compat: expose beta_neural as reference
             self.beta_neural = self.beta_ode
 
-            self.rho_net = None  # not used in ortho mode
+            self.rho_net = None  # not used in grad_penalty mode
 
         elif use_rho_net:
             # Standard single network: [z(t), skip] → R^p → scalar
@@ -215,7 +220,7 @@ class Decoder(nn.Module):
             self.rho_norm = nn.LayerNorm(p)
             self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
 
-            # Not used in non-ortho mode
+            # Not used in standard mode
             self.rho_ode_net = None
             self.rho_skip_net = None
         else:
@@ -426,6 +431,7 @@ class NeuralODEConfig:
     depth: int = 2
     dropout: float = 0.0
     euler_steps_per_interval: int = 4   # sub-steps between observation times
+    ode_solver: str = "euler"            # "euler"/"midpoint"/"rk4" (manual), or "dopri5"/"adams" (torchdiffeq)
 
 
 # ─────────────────────────────────────────────
@@ -438,8 +444,8 @@ class NeuralODEModel(nn.Module):
 
     Architecture:
       Encoder:  z(0) = Enc(t0, BMI0, static)
-      ODE:      dz/dt = f(z, t, static)       — no BMI in dynamics
-      Decoder:  mu = rho(z(t), BMI_std(t)) @ beta_neural — BMI only here
+      ODE:      dz/dt = f(z, t, BMI(t))            — BMI in dynamics
+      Decoder:  mu = rho(z(t), BMI_std(t)) @ beta   — BMI also in skip
 
     Forward signature is kept compatible with the CDE model's dataloader.
     The c_mask (cumulative mask) argument is accepted but ignored.
@@ -466,8 +472,8 @@ class NeuralODEModel(nn.Module):
                               e.g. [1] to pass AGEc directly. None = no static skip.
             use_bmi_skip: if False, decoder sees only z(t) — no direct BMI input.
                           Use False for path-dependent scenarios (S5, S6).
-            reg_mode: None, "l1_skip", or "ortho". See Decoder docstring.
-            p_skip: basis dimension for skip pathway in ortho mode.
+            reg_mode: None, "l1_skip", or "grad_penalty". See Decoder docstring.
+            p_skip: basis dimension for skip pathway in grad_penalty mode.
         """
         super().__init__()
         if cfg is None:
@@ -490,14 +496,13 @@ class NeuralODEModel(nn.Module):
             dropout=cfg.dropout,
         )
 
-        # ODE dynamics: f(z, t, static) → dz/dt
+        # ODE dynamics: f(z, t, bmi(t)) → dz/dt
         self.func = ODEFunc(
             hidden_channels=cfg.hidden_channels,
             static_dim=static_dim,
             mlp_hidden=cfg.func_mlp_hidden,
             depth=cfg.depth,
             dropout=cfg.dropout,
-            activation=nn.ReLU()
         )
 
         self.z_norm = nn.LayerNorm(cfg.hidden_channels)
@@ -522,45 +527,165 @@ class NeuralODEModel(nn.Module):
             p_skip=p_skip,
         )
 
-    def _euler_integrate(self, z0, times, static, bmi_t=None):
-        """
-        Euler integration of dz/dt = f(z, t, static) on the padded time grid.
+    def _interpolate_bmi(self, bmi_t, k, alpha):
+        """Linearly interpolate BMI between observation times k and k+1."""
+        if bmi_t is None:
+            return None
+        return (1 - alpha) * bmi_t[:, k] + alpha * bmi_t[:, k + 1]
 
-        Args:
-            z0:     (N, H) initial state
-            times:  (N, T) observation times
-            static: (N, Cs) static covariates
-        Returns:
-            zt:     (N, T, H) latent states at each time
+    def _integrate_manual(self, z0, times, static, bmi_t=None):
+        """
+        Manual fixed-step integration: euler, midpoint, or rk4.
+        Handles per-subject time grids natively.
         """
         N, T = times.shape
         H = z0.shape[1]
         device, dtype = z0.device, z0.dtype
         n_sub = self.cfg.euler_steps_per_interval
+        solver = self.cfg.ode_solver
 
         zt = torch.zeros(N, T, H, device=device, dtype=dtype)
         z = z0
         zt[:, 0] = z
 
         for k in range(T - 1):
-            t_start = times[:, k]       # (N,)
-            t_end = times[:, k + 1]     # (N,)
-            dt_total = t_end - t_start  # (N,)
-            dt_sub = dt_total / n_sub   # (N,)
+            t_start = times[:, k]
+            dt_total = times[:, k + 1] - t_start
+            dt_sub = dt_total / n_sub
 
             for s in range(n_sub):
-                t_current = t_start + s * dt_sub   # (N,)
                 alpha = s / n_sub
-                if bmi_t is not None:
-                    bmi_current = (1 - alpha) * bmi_t[:, k] + alpha * bmi_t[:, k + 1]  # (N, 1)
-                    dzdt = self.func(z, t_current, static, bmi_current)  # (N, H)
-                else:
-                    dzdt = self.func(z, t_current, static)  # (N, H)
-                z = z + dzdt * dt_sub.unsqueeze(-1)      # (N, H)
+                t_s = t_start + s * dt_sub
+                dt = dt_sub.unsqueeze(-1)
+
+                if solver == "euler":
+                    bmi_s = self._interpolate_bmi(bmi_t, k, alpha)
+                    k1 = self.func(z, t_s, static, bmi_s)
+                    z = z + k1 * dt
+
+                elif solver == "midpoint":
+                    bmi_s = self._interpolate_bmi(bmi_t, k, alpha)
+                    k1 = self.func(z, t_s, static, bmi_s)
+                    alpha_mid = alpha + 0.5 / n_sub
+                    bmi_mid = self._interpolate_bmi(bmi_t, k, min(alpha_mid, 1.0))
+                    k2 = self.func(z + k1 * (0.5 * dt), t_s + 0.5 * dt_sub, static, bmi_mid)
+                    z = z + k2 * dt
+
+                elif solver == "rk4":
+                    bmi_s = self._interpolate_bmi(bmi_t, k, alpha)
+                    k1 = self.func(z, t_s, static, bmi_s)
+                    alpha_mid = alpha + 0.5 / n_sub
+                    bmi_mid = self._interpolate_bmi(bmi_t, k, min(alpha_mid, 1.0))
+                    t_mid = t_s + 0.5 * dt_sub
+                    k2 = self.func(z + k1 * (0.5 * dt), t_mid, static, bmi_mid)
+                    k3 = self.func(z + k2 * (0.5 * dt), t_mid, static, bmi_mid)
+                    alpha_end = alpha + 1.0 / n_sub
+                    bmi_end = self._interpolate_bmi(bmi_t, k, min(alpha_end, 1.0))
+                    k4 = self.func(z + k3 * dt, t_s + dt_sub, static, bmi_end)
+                    z = z + (k1 + 2*k2 + 2*k3 + k4) * (dt / 6)
 
             zt[:, k + 1] = z
 
         return zt
+
+    def _integrate_torchdiffeq(self, z0, times, static, bmi_t=None):
+        """
+        Integration via torchdiffeq. Supports adaptive solvers (dopri5, etc.)
+        and fixed-step solvers (euler, rk4, midpoint, etc.).
+
+        Integrates interval-by-interval, reparameterized to τ ∈ [0, 1],
+        to handle per-subject time grids.
+        """
+        from torchdiffeq import odeint
+
+        N, T = times.shape
+        H = z0.shape[1]
+        device, dtype = z0.device, z0.dtype
+        solver = self.cfg.ode_solver
+
+        # Build odeint options
+        odeint_kwargs = {"method": solver}
+        if self.cfg.euler_steps_per_interval is not None:
+            # For fixed-step methods, set step_size in normalized [0,1] coords
+            odeint_kwargs["options"] = {
+                "step_size": 1.0 / self.cfg.euler_steps_per_interval
+            }
+
+        zt = torch.zeros(N, T, H, device=device, dtype=dtype)
+        z = z0
+        zt[:, 0] = z
+
+        # Evaluation points in normalized time
+        tau_eval = torch.tensor([0.0, 1.0], device=device, dtype=dtype)
+
+        for k in range(T - 1):
+            t_start = times[:, k]                  # (N,)
+            dt_total = times[:, k + 1] - t_start   # (N,)
+
+            # Store interval context for the wrapper
+            self._interval_ctx = {
+                "static": static,
+                "bmi_k": bmi_t[:, k] if bmi_t is not None else None,
+                "bmi_k1": bmi_t[:, k + 1] if bmi_t is not None else None,
+                "t_start": t_start,
+                "dt_total": dt_total,
+            }
+
+            # Integrate in normalized time τ ∈ [0, 1]
+            # dz/dτ = f(z, t(τ), static, bmi(τ)) * dt_total
+            z_out = odeint(self._odefunc_normalized, z, tau_eval,
+                           **odeint_kwargs)
+            # z_out: (2, N, H) — [z(τ=0), z(τ=1)]
+            z = z_out[-1]
+            zt[:, k + 1] = z
+
+        # Clean up
+        self._interval_ctx = None
+        return zt
+
+    def _odefunc_normalized(self, tau, z):
+        """
+        ODE function in normalized time τ ∈ [0, 1].
+        dz/dτ = f(z, t(τ), static, bmi(τ)) * dt_total
+
+        Called by torchdiffeq.odeint.
+        """
+        ctx = self._interval_ctx
+        static = ctx["static"]
+        t_start = ctx["t_start"]
+        dt_total = ctx["dt_total"]
+
+        # Map τ → absolute time
+        t_abs = t_start + tau * dt_total   # (N,)
+
+        # Interpolate BMI
+        if ctx["bmi_k"] is not None:
+            bmi_current = (1 - tau) * ctx["bmi_k"] + tau * ctx["bmi_k1"]
+        else:
+            bmi_current = None
+
+        # Evaluate vector field and scale by dt
+        dzdt = self.func(z, t_abs, static, bmi_current)   # (N, H)
+        return dzdt * dt_total.unsqueeze(-1)               # dz/dτ = f * dt
+
+    def _integrate(self, z0, times, static, bmi_t=None):
+        """
+        Dispatch to manual or torchdiffeq integration based on cfg.ode_solver.
+
+        Manual solvers:     "euler", "midpoint", "rk4"
+        torchdiffeq solvers: "dopri5", "adams", "adaptive_heun",
+                             "scipy_solver", or any method supported
+                             by torchdiffeq.odeint.
+
+        Set cfg.ode_solver to the desired method name.
+        For torchdiffeq fixed-step methods, cfg.euler_steps_per_interval
+        controls the step size (step_size = 1/n_sub in normalized coords).
+        """
+        manual_solvers = {"euler", "midpoint", "rk4"}
+        if self.cfg.ode_solver in manual_solvers:
+            return self._integrate_manual(z0, times, static, bmi_t)
+        else:
+            return self._integrate_torchdiffeq(z0, times, static, bmi_t)
 
     def forward(
         self,
@@ -584,14 +709,14 @@ class NeuralODEModel(nn.Module):
         z0 = self.encoder(encoder_in)                        # (N, H)
 
         # --- Gradient penalty: make bmi_t a differentiable leaf ---
-        # We need autograd to track ∂mu_ode/∂bmi_t through Euler integration
+        # We need autograd to track ∂mu_ode/∂bmi_t through ODE integration
         if self.reg_mode == "grad_penalty" and bmi_t is not None:
             bmi_t_leaf = bmi_t.detach().requires_grad_(True)
         else:
             bmi_t_leaf = bmi_t
 
         # --- ODE integration ---
-        zt = self._euler_integrate(z0, t_pad, static_covariates, bmi_t_leaf)  # (N, T, H)
+        zt = self._integrate(z0, t_pad, static_covariates, bmi_t_leaf)  # (N, T, H)
         zt = self.z_norm(zt)
 
         # --- Decoder (with BMI skip) ---
