@@ -1,7 +1,7 @@
 *.ipynb
 .vscode
 figures/
-results/
+results_simu/
 3C_dataset/
 __pycache__/
 checkpoints/
