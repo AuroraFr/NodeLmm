@@ -1,28 +1,22 @@
 """
 Full-parameter delta method for ∆PDP variance — Neural ODE-LMM.
+Adapted for CUMULATIVE EFFECT scenario (S5).
 
-Generalises the LMM delta method (paper §4.4.1, eq. 36–39) to all model
-parameters θ = {encoder, ODE, ρ_net, β, g_net, D, σ²}:
+Key differences from baseline version:
+  - Oracle ∆PDP is TIME-DEPENDENT: ∆PDP(t) = coeff × (bmi_hi − bmi_lo) × t̄
+    where t̄ is the mean actual observation time of subjects in the time bin.
+  - Time-windowed matching: subjects contribute to a target time only if
+    their closest observation is within max_dist years.
 
-    Var(∆PDP_ℓ) = g_ℓᵀ  Cov(θ̂)  g_ℓ
+Architecture and inference are unchanged:
+  - skip_gate / group_lasso regularisation (data-independent penalty)
+  - M-estimator inference (Commenges et al., 2014)
 
-Two variance estimators (selected via --sandwich):
+Three variance estimators (selected via --sandwich):
 
-  Default (well-specified):
-    Cov(θ̂) = F⁻¹         where F = Σ_i s_i s_iᵀ  (empirical Fisher)
-
-  Sandwich (robust to misspecification):
-    Var(∆PDP_ℓ) = wᵀ F w   where w = J⁻¹ g_ℓ  solved via CG
-                            J = −∇²ℓ(θ̂)  accessed only through HVPs
-                            (matrix-free: J is never formed or stored)
-
-Steps:
-  1. Empirical Fisher  F ∈ R^{P×P}  via batch_size=1 forward+backward
-  2. ∆PDP gradient  g_ℓ  via differentiable counterfactual forward passes
-  3a. (default) Var = g_ℓᵀ F⁻¹ g_ℓ
-  3b. (sandwich) Solve J w = g via CG + HVP;  Var = wᵀ F w
-      Each CG iteration = one dataset pass (~3× Fisher cost).
-      Preconditioned with F⁻¹ for fast convergence.
+  Default:  Cov(θ̂) = F⁻¹                 (F = Σ φ_i φ_iᵀ, penalised scores)
+  Bayesian: Cov(θ̂) = J⁻¹                 (O'Sullivan 1988)
+  Sandwich: Cov(θ̂) = J⁻¹ F J⁻¹           (robust, Commenges et al. 2014)
 """
 from __future__ import annotations
 import math, os, csv, time
@@ -94,68 +88,93 @@ def _per_subject_nll(mu, V, y_pad, mask, jitter=1e-4):
 # 2. Empirical Fisher  F = Σ_i  s_i  s_iᵀ
 # ─────────────────────────────────────────────────────────
 
+def _compute_penalty_gradient(model, lambda_reg, weight_decay):
+    """
+    Compute the data-independent penalty gradient:
+
+        c = λ_reg · ∇_θ reg_term  +  λ_wd · θ
+
+    This constant is added to each NLL score to form the penalized score
+    φ_i = ∇nll_i + c  (Commenges et al., 2014, eq. 8).
+
+    Returns:
+        c: (P,) tensor on CPU, or None if no penalty
+    """
+    params = _param_list(model)
+    P = sum(p.numel() for p in params)
+    c = torch.zeros(P)
+
+    has_penalty = False
+
+    # --- reg_term gradient (skip_gate or group_lasso) ---
+    if lambda_reg > 0:
+        reg_mode = getattr(model, 'reg_mode', None)
+        if reg_mode is not None:
+            reg_dict = model.decoder._compute_reg(None)
+            reg_term = reg_dict["reg_term"]
+            if reg_term.requires_grad:
+                grads = torch.autograd.grad(reg_term, params,
+                                            allow_unused=True)
+                grads = [g if g is not None else torch.zeros_like(p)
+                         for g, p in zip(grads, params)]
+                c += lambda_reg * _cat_grads(grads).cpu()
+                has_penalty = True
+
+    # --- Weight decay gradient: λ_wd · θ ---
+    if weight_decay > 0:
+        theta_flat = torch.cat([p.detach().reshape(-1)
+                                for p in params]).cpu()
+        c += weight_decay * theta_flat
+        has_penalty = True
+
+    return c if has_penalty else None
+
+
 def compute_empirical_fisher(model, dataset, device, collate_fn,
-                              lambda_skip=0.0, weight_decay=0.0,
-                              static_skip_dims=None,
-                              eps_smooth=1e-6,
+                              lambda_reg=0.0, weight_decay=0.0,
                               verbose=True):
     """
-    Compute F = Σ_i  φ_i  φ_iᵀ   where  φ_i is the penalised score:
+    Compute F = Σ_i  φ_i  φ_iᵀ   where  φ_i = ∇_θ nll_i + c  (penalised score).
 
-        φ_i = ∇_θ nll_i  +  N·λ_skip·∇_θ r_i^ε  +  λ_wd·θ
+    c = λ_reg · ∇_θ reg_term + λ_wd · θ  is a data-independent constant
+    computed once and added to each NLL score (Commenges et al., 2014, eq. 8-9).
 
-    r_i^ε uses smooth L1: sqrt((μ - μ^{s=0})² + ε) instead of |μ - μ^{s=0}|,
-    ensuring differentiability everywhere (Commenges et al., 2014).
-
-    When lambda_skip=0 and weight_decay=0, reduces to pure NLL scores.
+    At the penalised MLE: Σ φ_i = 0, so mean(φ_i) ≈ 0 (stationarity check).
 
     Uses batch_size=1 so each forward/backward is one subject.
 
-    NOTE: Computing μ^{s=0} requires a second forward pass with skip inputs
-    zeroed (bmi_t=0, static_skip_dims=0). This assumes the model's encoder
-    sees the full static_covariates regardless — if your model architecture
-    routes static_skip_dims through the encoder too, you'll need a
-    model-level `skip_scale` flag to separate them.
-
     Returns:
         F: (P, P) tensor on CPU
-        scores: (N, P) tensor on CPU
+        scores: (N, P) tensor on CPU  (penalised scores φ_i)
     """
     from torch.utils.data import DataLoader
 
     model.eval()
     params = _param_list(model)
     P = sum(p.numel() for p in params)
+    N = len(dataset)
+
+    # --- Compute penalty gradient (data-independent constant) ---
+    c = _compute_penalty_gradient(model, lambda_reg, weight_decay)
+
+    if verbose:
+        if c is not None:
+            parts = ["∇nll_i"]
+            if lambda_reg > 0:
+                reg_mode = getattr(model, 'reg_mode', 'unknown')
+                parts.append(f"λ_reg·∇reg ({reg_mode})")
+            if weight_decay > 0:
+                parts.append(f"λ_wd·θ")
+            print(f"    Score: φ_i = {' + '.join(parts)}")
+            print(f"    Penalty gradient ||c|| = {c.norm().item():.4f}")
+        else:
+            print(f"    Score: φ_i = ∇nll_i  (no penalty)")
 
     fisher = torch.zeros(P, P)
     score_list = []
 
     loader = DataLoader(dataset, batch_size=1, shuffle=False,
                         collate_fn=collate_fn)
-    N = len(dataset)
-
-    # --- Pre-compute N_obs (total observations) for skip penalty ---
-    N_obs = 0
-    if lambda_skip > 0:
-        for batch in loader:
-            N_obs += batch[5].sum().item()
-        N_obs = int(N_obs)
-        if verbose:
-            print(f"    N_obs = {N_obs} (for skip penalty normalisation)")
-
-    # --- Pre-compute θ_flat for weight decay (data-independent) ---
-    theta_flat = None
-    # if weight_decay > 0:
-    #     theta_flat = torch.cat([p.detach().reshape(-1)
-    #                             for p in params]).cpu()
-
-    if verbose:
-        parts = ["∇nll_i"]
-        if lambda_skip > 0:
-            parts.append(f"N·λ_skip·∇r_i^ε (ε={eps_smooth:.0e})")
-        # if weight_decay > 0:
-        #     parts.append(f"λ_wd·θ ({weight_decay:.0e})")
-        print(f"    Score composition: φ_i = {' + '.join(parts)}")
 
     t0 = time.time()
     for i, batch in enumerate(loader):
@@ -167,66 +186,26 @@ def compute_empirical_fisher(model, dataset, device, collate_fn,
         s = s.to(device)
         bmi_t = x_pad[:, :, 0:1]
 
-        # Skip subjects with no observations
         if mask.sum() == 0:
             continue
 
-        # Forward (with grad) — get z(t) for decoder-only no-skip call
-        result = model(
+        mu, V, Z, D, sig2, _ = model(
             t_pad, x_pad, masks=None,
-            static_covariates=s, bmi_t=bmi_t, obs_mask=mask,
-            return_hidden=(lambda_skip > 0),
+            static_covariates=s, bmi_t=bmi_t, obs_mask=mask
         )
-        if lambda_skip > 0:
-            mu, V, Z, D, sig2, _, zt = result
-        else:
-            mu, V, Z, D, sig2, _ = result
 
-        # Per-subject NLL
         nll_i = _per_subject_nll(mu, V, y_pad, mask)
 
-        # --- Per-subject smooth skip penalty ---
-        if lambda_skip > 0:
-            # Decoder-only call with zeroed skip inputs, SAME z(t).
-            # This matches the model's internal l1_skip computation
-            # (lines 348-354 of model_ODE.py) which only zeros the
-            # decoder skip_input while keeping z(t) unchanged.
-            x_pad_noskip = x_pad.clone()
-            x_pad_noskip[:, :, 0] = model.decoder.bmi_mean  # → bmi_std = 0
-            s_noskip = s.clone()
-            if static_skip_dims is not None:
-                for dim in static_skip_dims:
-                    s_noskip[:, dim] = 0.0
-
-            mu_ns, _, _, _, _, _ = model.decoder(
-                zt, x_pad_noskip, s_noskip, obs_mask=mask
-            )
-
-            # Smooth L1: sqrt((μ - μ^{s=0})² + ε)
-            idx = mask.squeeze(0).bool()
-            diff = mu.squeeze(0)[idx] - mu_ns.squeeze(0)[idx]
-            r_i_smooth = torch.sum(
-                torch.sqrt(diff ** 2 + eps_smooth)
-            ) / N_obs
-
-            # Combined differentiable loss
-            # Stationarity: Σ ∇nll_i + N·λ_skip·Σ ∇r_i + N·λ_wd·θ = 0
-            loss_i = nll_i + N * lambda_skip * r_i_smooth
-        else:
-            loss_i = nll_i
-
-        # Score vector (differentiable part)
-        grads = torch.autograd.grad(loss_i, params, retain_graph=False,
+        grads = torch.autograd.grad(nll_i, params, retain_graph=False,
                                     allow_unused=True)
         grads = [g if g is not None else torch.zeros_like(p)
                  for g, p in zip(grads, params)]
-        phi_i = _cat_grads(grads).cpu()    # (P,)
+        phi_i = _cat_grads(grads).cpu()
 
-        # # Add weight decay: φ_i += λ_wd · θ  (same for all subjects)
-        # if weight_decay > 0:
-        #     phi_i = phi_i + weight_decay * theta_flat
+        # Add data-independent penalty gradient
+        if c is not None:
+            phi_i = phi_i + c
 
-        # Accumulate outer product
         fisher += torch.outer(phi_i, phi_i)
         score_list.append(phi_i)
 
@@ -237,17 +216,76 @@ def compute_empirical_fisher(model, dataset, device, collate_fn,
             print(f"    Fisher: {i+1}/{N} subjects "
                   f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
 
-    scores = torch.stack(score_list)     # (N_eff, P)
+    scores = torch.stack(score_list)
     if verbose:
         print(f"    Fisher: done ({time.time()-t0:.1f}s), "
               f"cond = {torch.linalg.cond(fisher).item():.2e}")
- 
+
     return fisher, scores
 
 import torch.func as TF
 
+
+def _compute_penalty_hessian(model, device, lambda_reg, verbose=True):
+    """
+    Compute ∇²(reg_term) for skip_gate or group_lasso via autograd.
+
+    The reg_term is data-independent (depends only on model params),
+    so this is a single forward+backward, no data loop.
+
+    Returns:
+        H_pen: (P, P) tensor on CPU, or None if no penalty
+    """
+    reg_mode = getattr(model, 'reg_mode', None)
+    if reg_mode is None or lambda_reg <= 0:
+        return None
+
+    params = _param_list(model)
+    P = sum(p.numel() for p in params)
+
+    # Compute reg_term with create_graph
+    reg_dict = model.decoder._compute_reg(None)
+    reg_term = reg_dict["reg_term"]
+
+    if not reg_term.requires_grad:
+        if verbose:
+            print(f"    Penalty Hessian: reg_term has no grad (penalty=0)")
+        return None
+
+    # First derivatives
+    grad1 = torch.autograd.grad(reg_term, params, create_graph=True,
+                                 allow_unused=True)
+    grad1 = [g if g is not None else torch.zeros_like(p)
+             for g, p in zip(grad1, params)]
+    grad_flat = torch.cat([g.reshape(-1) for g in grad1])
+
+    # Second derivatives: row by row
+    H_pen = torch.zeros(P, P)
+    for j in range(P):
+        if grad_flat[j].requires_grad:
+            row = torch.autograd.grad(
+                grad_flat[j], params,
+                retain_graph=(j < P - 1),
+                allow_unused=True,
+            )
+            row = [g if g is not None else torch.zeros_like(p)
+                   for g, p in zip(row, params)]
+            H_pen[j, :] = _cat_grads(row).cpu()
+
+    H_pen = 0.5 * (H_pen + H_pen.T)  # symmetrise
+
+    if verbose:
+        nnz = (H_pen.abs() > 1e-12).sum().item()
+        print(f"    Penalty Hessian ({reg_mode}): "
+              f"{nnz}/{P*P} nonzero entries, "
+              f"||H_pen|| = {H_pen.norm().item():.4e}")
+
+    return H_pen
+
+
 def compute_hessian_explicit(model, dataset, device, collate_fn,
                              n_subsample=None, weight_decay=0.0,
+                             lambda_reg=0.0,
                              verbose=True):
     from torch.utils.data import DataLoader, Subset
 
@@ -335,14 +373,26 @@ def compute_hessian_explicit(model, dataset, device, collate_fn,
     hessian *= scale
     hessian = 0.5 * (hessian + hessian.T)
 
-    # Penalty Hessian: weight decay contributes N·λ_wd·I
-    # (training loss = (1/N)Σ nll_i + (λ_wd/2)||θ||²  →  J_total = Σ∇²nll_i + N·λ_wd·I)
-    # Skip L1 penalty has zero Hessian a.e. (piecewise linear).
+    # --- Penalty Hessians ---
+    # Training loss: (1/N)Σ nll_i + λ_reg·reg_term + (λ_wd/2)||θ||²
+    # Stationarity: Σ ∇nll_i + N·λ_reg·∇reg_term + N·λ_wd·θ = 0
+    # So: J = Σ ∇²nll_i + N·λ_reg·∇²reg_term + N·λ_wd·I
     N_full = len(dataset)
+
+    # Weight decay: +N·λ_wd·I
     if weight_decay > 0:
         hessian += N_full * weight_decay * torch.eye(P)
         if verbose:
             print(f"    Added weight decay to J: +{N_full * weight_decay:.2e} on diag")
+
+    # Skip gate / group lasso: +N·λ_reg·∇²reg_term
+    if lambda_reg > 0:
+        H_pen = _compute_penalty_hessian(model, device, lambda_reg, verbose)
+        if H_pen is not None:
+            hessian += N_full * lambda_reg * H_pen
+            if verbose:
+                print(f"    Added penalty Hessian to J: "
+                      f"N·λ_reg = {N_full * lambda_reg:.2e}")
 
     if verbose:
         eigvals = torch.linalg.eigvalsh(hessian)
@@ -355,125 +405,15 @@ def compute_hessian_explicit(model, dataset, device, collate_fn,
         print(f"    J cond = {torch.linalg.cond(hessian).item():.2e}")
     return hessian
 
-# # ─────────────────────────────────────────────────────────
-# # 2b. Sandwich: explicit Hessian (for moderate P)
-# # ─────────────────────────────────────────────────────────
-
-# def compute_hessian_explicit(model, dataset, device, collate_fn,
-#                              n_subsample=None, verbose=True):
-#     """
-#     Compute J = ∇²(NLL) explicitly, one subject at a time.
-
-#     For each subject: compute score with create_graph, then
-#     differentiate each score component → one row of ∇²nll_i.
-#     Graph is released after each subject (constant memory).
-
-#     J = ∇²(NLL) is the observed information (PSD at the MLE).
-
-#     With P ≈ 1155 and n_subsample = 100:
-#       ~10-20 min (each per-subject graph is tiny).
-
-#     Returns:
-#         J: (P, P) tensor on CPU
-#     """
-#     from torch.utils.data import DataLoader, Subset
-
-#     model.eval()
-#     params = _param_list(model)
-#     P = sum(p.numel() for p in params)
-#     N = len(dataset)
-
-#     if n_subsample is not None and n_subsample < N:
-#         indices = torch.randperm(N)[:n_subsample].tolist()
-#         subset = Subset(dataset, indices)
-#         scale = N / n_subsample
-#         M = n_subsample
-#         if verbose:
-#             print(f"    Hessian: subsampling {M}/{N} subjects "
-#                   f"(scale={scale:.2f})")
-#     else:
-#         subset = dataset
-#         scale = 1.0
-#         M = N
-
-#     loader = DataLoader(subset, batch_size=1, shuffle=False,
-#                         collate_fn=collate_fn)
-
-#     hessian = torch.zeros(P, P)
-#     t0 = time.time()
-#     n_done = 0
-
-#     for i, batch in enumerate(loader):
-#         _, t_pad, x_pad, y_pad, c_mask, mask, s = batch
-#         t_pad = t_pad.to(device)
-#         x_pad = x_pad.to(device)
-#         y_pad = y_pad.to(device)
-#         mask = mask.to(device)
-#         s = s.to(device)
-#         bmi_t = x_pad[:, :, 0:1]
-
-#         if mask.sum() == 0:
-#             continue
-
-#         mu, V, Z, D_mat, sig2, _ = model(
-#             t_pad, x_pad, masks=None,
-#             static_covariates=s, bmi_t=bmi_t, obs_mask=mask
-#         )
-#         nll_i = _per_subject_nll(mu, V, y_pad, mask)
-
-#         # Score with create_graph
-#         score_tuple = torch.autograd.grad(nll_i, params,
-#                                            create_graph=True,
-#                                            allow_unused=True)
-#         score_tuple = [g if g is not None else torch.zeros_like(p)
-#                        for g, p in zip(score_tuple, params)]
-#         score_flat = torch.cat([g.reshape(-1) for g in score_tuple])
-
-#         # Row j of ∇²nll_i = ∂(score_j)/∂θ
-#         for j in range(P):
-#             if score_flat[j].requires_grad:
-#                 row = torch.autograd.grad(
-#                     score_flat[j], params,
-#                     retain_graph=(j < P - 1),
-#                     allow_unused=True,
-#                 )
-#                 row = [g if g is not None else torch.zeros_like(p)
-#                        for g, p in zip(row, params)]
-#                 hessian[j, :] += _cat_grads(row).cpu()
-
-#         n_done += 1
-#         if verbose and n_done % 10 == 0:
-#             elapsed = time.time() - t0
-#             rate = n_done / elapsed
-#             eta = (M - n_done) / rate
-#             print(f"    Hessian: {n_done}/{M} subjects "
-#                   f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
-
-#     hessian *= scale
-
-#     # Symmetrise (numerical)
-#     hessian = 0.5 * (hessian + hessian.T)
-
-#     if verbose:
-#         eigvals = torch.linalg.eigvalsh(hessian)
-#         print(f"    Hessian done ({time.time()-t0:.1f}s), "
-#               f"used {n_done} subjects")
-#         print(f"    J eigenvalue range: [{eigvals.min().item():.2e}, "
-#               f"{eigvals.max().item():.2e}]")
-#         n_neg = (eigvals < 0).sum().item()
-#         print(f"    J negative eigenvalues: {n_neg}/{P}")
-#         print(f"    J cond = {torch.linalg.cond(hessian).item():.2e}")
-
-#     return hessian
 
 
 # ─────────────────────────────────────────────────────────
-# 2c. Sandwich via HVP + MINRES (matrix-free, for large P)
+# 2b. Sandwich via HVP + MINRES (matrix-free, for large P)
 # ─────────────────────────────────────────────────────────
 
 def _hvp_dataset(model, dataset, device, collate_fn, v,
                  n_subsample=None, fixed_loader=None, scale=1.0,
-                 weight_decay=0.0):
+                 weight_decay=0.0, lambda_reg=0.0, penalty_hessian=None):
     """
     Hessian-vector product:  Jv = ∇²(NLL) · v  in one dataset pass.
 
@@ -570,10 +510,13 @@ def _hvp_dataset(model, dataset, device, collate_fn, v,
     # J = ∇²(NLL) = observed information (PSD at the MLE)
     # The accumulator already contains Σ ∇²(nll_i) · v = J · v
     Jv = Jv * scale
-    # Weight decay: J_total·v = J_nll·v + N·λ_wd·v
+    N_full = len(dataset)
+    # Weight decay: +N·λ_wd·v
     if weight_decay > 0:
-        N_full = len(dataset)
         Jv += N_full * weight_decay * v.cpu()
+    # Skip gate / group lasso: +N·λ_reg·H_pen·v
+    if lambda_reg > 0 and penalty_hessian is not None:
+        Jv += N_full * lambda_reg * (penalty_hessian @ v.cpu())
     return Jv
 
 
@@ -672,6 +615,8 @@ def compute_sandwich_variance_cg(
     fisher_inv=None,
     n_subsample=None,
     weight_decay=0.0,
+    lambda_reg=0.0,
+    penalty_hessian=None,
     cg_maxiter=100, cg_tol=1e-6,
     verbose=True,
 ):
@@ -711,7 +656,9 @@ def compute_sandwich_variance_cg(
     def hvp_raw(v):
         return _hvp_dataset(model, dataset, device, collate_fn, v,
                             fixed_loader=fixed_loader, scale=scale,
-                            weight_decay=weight_decay)
+                            weight_decay=weight_decay,
+                            lambda_reg=lambda_reg,
+                            penalty_hessian=penalty_hessian)
 
     # Preconditioner: F⁻¹  (already computed, cheap matmul)
     precond_fn = None
@@ -771,24 +718,26 @@ def compute_sandwich_variance_cg(
 def compute_delta_pdp_gradients(model, loader, device,
                                  bmi_lo, bmi_hi,
                                  visit_times,
+                                 max_dist=1.5,
                                  verbose=True):
     """
-    Compute g_ℓ = ∇_θ ∆PDP_ℓ for each visit time.
+    Compute g_ℓ = ∇_θ ∆PDP_ℓ for each visit time, with time windowing.
 
     ∆PDP_ℓ = (1/n_ℓ) Σ_i [μ^{hi}_{i,c(i,ℓ)} − μ^{lo}_{i,c(i,ℓ)}]
+
+    where i contributes only if |t_{i,c(i,ℓ)} − t_ℓ| ≤ max_dist.
 
     The gradient is accumulated across batches by linearity:
         g_ℓ = (1/n_ℓ) Σ_batch  ∇_θ  Σ_{i∈batch} δ_{i,ℓ}
 
-    The computation graph spans both forward passes (hi and lo)
-    because they share the same model parameters.
-
-    Also returns the ∆PDP point estimates for each visit time.
+    Also tracks the mean actual observation time per bin (needed for
+    time-dependent oracle in cumulative scenarios).
 
     Returns:
-        gradients: dict {vt: g_ℓ ∈ R^P}  (CPU)
-        estimates: dict {vt: float}        ∆PDP estimates
-        counts:    dict {vt: int}          subjects per visit time
+        gradients:    dict {vt: g_ℓ ∈ R^P}  (CPU)
+        estimates:    dict {vt: float}        ∆PDP estimates
+        counts:       dict {vt: int}          subjects per visit time
+        mean_times:   dict {vt: float}        mean actual obs time in bin
     """
     model.eval()
     params = _param_list(model)
@@ -797,6 +746,7 @@ def compute_delta_pdp_gradients(model, loader, device,
     g_accum = {vt: torch.zeros(P) for vt in visit_times}
     est_accum = {vt: 0.0 for vt in visit_times}
     n_accum = {vt: 0 for vt in visit_times}
+    time_accum = {vt: 0.0 for vt in visit_times}  # sum of actual obs times
 
     for batch in loader:
         _, t_pad, x_pad, y_pad, c_mask, mask, s = batch
@@ -832,19 +782,24 @@ def compute_delta_pdp_gradients(model, loader, device,
                 if len(obs_idx) == 0:
                     continue
                 obs_times = t_pad[i, obs_idx]
-                closest = obs_idx[torch.argmin(torch.abs(obs_times - vt))]
+                dists = torch.abs(obs_times - vt)
+                best = torch.argmin(dists)
+
+                # Time windowing: only include if within max_dist
+                if dists[best].item() > max_dist:
+                    continue
+
+                closest = obs_idx[best]
                 delta_sum = delta_sum + (mu_hi[i, closest] - mu_lo[i, closest])
                 n_vt += 1
+                time_accum[vt] += obs_times[best].item()
 
             if n_vt > 0:
                 # Backward — keep graph for remaining visit times
-                # allow_unused: g_net, L_unconstrained, log_residual_var
-                # are not in the mu computation graph
                 retain = (vt_idx < len(visit_times) - 1)
                 grads = torch.autograd.grad(delta_sum, params,
                                             retain_graph=retain,
                                             allow_unused=True)
-                # Replace None grads (unused params) with zeros
                 grads = [g if g is not None else torch.zeros_like(p)
                          for g, p in zip(grads, params)]
                 g_batch = _cat_grads(grads).cpu()
@@ -856,21 +811,25 @@ def compute_delta_pdp_gradients(model, loader, device,
     # Normalise
     gradients = {}
     estimates = {}
+    mean_times = {}
     for vt in visit_times:
         n = n_accum[vt]
         if n > 0:
             gradients[vt] = g_accum[vt] / n
             estimates[vt] = est_accum[vt] / n
+            mean_times[vt] = time_accum[vt] / n
         else:
             gradients[vt] = torch.zeros(P)
             estimates[vt] = 0.0
+            mean_times[vt] = float(vt)
 
     if verbose:
         for vt in visit_times:
             print(f"    g_{int(vt)}: ||g|| = {gradients[vt].norm().item():.4f}, "
-                  f"n = {n_accum[vt]}, ∆PDP = {estimates[vt]:.4f}")
+                  f"n = {n_accum[vt]}, ∆PDP = {estimates[vt]:.4f}, "
+                  f"mean_t = {mean_times[vt]:.2f}")
 
-    return gradients, estimates, n_accum
+    return gradients, estimates, n_accum, mean_times
 
 
 # ─────────────────────────────────────────────────────────
@@ -898,26 +857,28 @@ def _regularise_and_invert(M, label, LAMBDA=1e-4, verbose=True):
 def compute_full_delta_variance(
     model, dataset, loader, device, collate_fn,
     bmi_lo=20.0, bmi_hi=35.0,
-    visit_times=np.array([0, 5, 10, 15]),
-    true_beta_bmi=-0.175,
-    true_beta_int=-0.015,
+    visit_times=np.array([0, 5, 10, 14]),
+    true_coeff=-0.05,
     sandwich=False,
     n_hessian_subsample=None,
     weight_decay=0.0,
-    lambda_skip=0.0,
-    static_skip_dims=None,
-    eps_smooth=1e-6,
+    lambda_reg=0.0,
+    max_dist=1.5,
 ):
     """
-    Full-parameter delta method for ∆PDP variance.
+    Full-parameter delta method for ∆PDP variance — cumulative scenario.
+
+    Oracle ∆PDP is time-dependent:
+        ∆PDP(t) = true_coeff × (bmi_hi − bmi_lo) × t̄
+    where t̄ is the mean actual observation time in the time bin.
 
     If sandwich=False (default):
-        Var(∆PDP_ℓ) = g_ℓᵀ  F⁻¹  g_ℓ           (MLE / well-specified)
+        Var(∆PDP_ℓ) = g_ℓᵀ  F⁻¹  g_ℓ
 
-    If sandwich=True:
-        Var(∆PDP_ℓ) = g_ℓᵀ  J⁻¹ F J⁻¹  g_ℓ     (robust / misspecified)
-
-    where F = Σ_i s_i s_iᵀ  and  J = ∇²(NLL).
+    If sandwich=True, reports three estimators:
+        SE_F⁻¹:    g_ℓᵀ  F⁻¹  g_ℓ                  (penalised Fisher)
+        SE_bayes:  g_ℓᵀ  J⁻¹  g_ℓ                  (Bayesian, O'Sullivan 1988)
+        SE_sand:   g_ℓᵀ  J⁻¹ F J⁻¹  g_ℓ            (sandwich, Commenges)
 
     Returns dict with results per visit time + Fisher + gradients.
     """
@@ -927,24 +888,27 @@ def compute_full_delta_variance(
 
     print(f"\n{'='*60}")
     print(f"FULL-PARAMETER DELTA METHOD — {var_method}")
+    print(f"  (Cumulative scenario)")
     print(f"{'='*60}")
     print(f"  P = {P} parameters")
     print(f"  N = {len(dataset)} subjects")
     print(f"  BMI: lo={bmi_lo}, hi={bmi_hi}, Δv={delta_v}")
+    print(f"  true_coeff = {true_coeff}")
+    print(f"  max_dist = {max_dist} years")
     if weight_decay > 0:
         print(f"  Weight decay: {weight_decay:.2e}")
-    if lambda_skip > 0:
-        print(f"  λ_skip: {lambda_skip:.2e} (smooth L1, ε={eps_smooth:.0e})")
+    if lambda_reg > 0:
+        reg_mode = getattr(model, 'reg_mode', 'unknown')
+        print(f"  λ_reg: {lambda_reg:.2e} (mode: {reg_mode})")
 
-    # --- Step 1: Empirical Fisher ---
+    # --- Step 1: Empirical Fisher with penalised scores ---
     print(f"\nStep 1: Empirical Fisher F = Σ_i φ_i φ_iᵀ ...")
     fisher, scores = compute_empirical_fisher(
         model, dataset, device, collate_fn,
-        lambda_skip=lambda_skip, weight_decay=weight_decay,
-        static_skip_dims=static_skip_dims, eps_smooth=eps_smooth,
+        lambda_reg=lambda_reg, weight_decay=weight_decay,
     )
 
-    # Eigendecomposition of raw Fisher
+    # Eigendecomposition
     eigvals, eigvecs = torch.linalg.eigh(fisher)
     print(f"  Fisher rank (>1e-6): {(eigvals > 1e-6).sum().item()} / {P}")
     print(f"  Eigenvalue range: [{eigvals.min().item():.2e}, {eigvals.max().item():.2e}]")
@@ -953,40 +917,32 @@ def compute_full_delta_variance(
     mean_score = scores.mean(dim=0)
     mean_abs = scores.abs().mean(dim=0)
     ratio = mean_score.norm() / mean_abs.norm()
-    print(f"  Stationarity check: ||mean(φ)|| / ||mean(|φ|)|| = {ratio:.4f}")
+    print(f"  Stationarity: ||mean(φ)|| / ||mean(|φ|)|| = {ratio:.4f}")
     print(f"    ||mean(φ)|| = {mean_score.norm().item():.4f}")
-    print(f"    Should be ≈ 0 with penalised scores (Fix 1)")
-
-    # --- Centered Fisher (removes bias inflation) ---
-    scores_centered = scores - mean_score.unsqueeze(0)
-    fisher_centered = scores_centered.T @ scores_centered
+    print(f"    Should be ≈ 0 at penalised MLE (Commenges et al.)")
 
     # --- Regularise & invert Fisher ---
     LAMBDA = 1e-4
     fisher_reg, fisher_inv = _regularise_and_invert(
         fisher, "Fisher", LAMBDA)
-    fisher_c_reg, fisher_c_inv = _regularise_and_invert(
-        fisher_centered, "Centered Fisher", LAMBDA)
 
     # --- Step 1b (optional): Sandwich ---
     sandwich_vars = {}
     sandwich_cov = None
     if sandwich:
-        # --- Step 1b: Compute Hessian explicitly ---
-        print(f"\nStep 1b: Hessian J = ∇²(NLL) ...")
+        print(f"\nStep 1b: Hessian J = ∇²(penalised objective) ...")
         J = compute_hessian_explicit(model, dataset, device, collate_fn,
                                       n_subsample=n_hessian_subsample,
-                                      weight_decay=weight_decay)
+                                      weight_decay=weight_decay,
+                                      lambda_reg=lambda_reg)
 
         J_reg, J_inv = _regularise_and_invert(J, "Hessian J", LAMBDA)
 
-        # Commenges et al. (2014): penalized sandwich uses centered scores
-        # as meat. At θ̂_PL, mean(v_i) = (κ/N)∇J ≠ 0, so centering removes
-        # the penalty-induced bias in the outer product.
-        sandwich_cov = J_inv @ fisher_centered @ J_inv
-        # Bayesian estimator (O'Sullivan 1988): just J⁻¹
+        # Sandwich: J⁻¹ F J⁻¹  (Commenges et al., 2014, eq. 9)
+        sandwich_cov = J_inv @ fisher @ J_inv
+        # Bayesian: J⁻¹  (O'Sullivan, 1988)
         bayes_cov = J_inv
-        print(f"  Sandwich cov: J⁻¹ F_centered J⁻¹  (Commenges et al.)")
+        print(f"  Sandwich cov: J⁻¹ F J⁻¹  (Commenges)")
         print(f"  Bayesian cov: J⁻¹  (O'Sullivan)")
 
         # Diagnostic: J vs F agreement
@@ -995,43 +951,44 @@ def compute_full_delta_variance(
               f"mean={diag_ratio.mean().item():.3f}, "
               f"std={diag_ratio.std().item():.3f}")
 
-        # --- Step 2: ∆PDP gradients ---
-        print(f"\nStep 2: ∆PDP gradients g_ℓ = ∇_θ ∆PDP_ℓ ...")
-        gradients, estimates, counts = compute_delta_pdp_gradients(
-            model, loader, device, bmi_lo, bmi_hi, visit_times
+        # --- Step 2: ∆PDP gradients (windowed) ---
+        print(f"\nStep 2: ∆PDP gradients g_ℓ = ∇_θ ∆PDP_ℓ (windowed, max_dist={max_dist}) ...")
+        gradients, estimates, counts, mean_times = compute_delta_pdp_gradients(
+            model, loader, device, bmi_lo, bmi_hi, visit_times,
+            max_dist=max_dist,
         )
     else:
-        # --- Step 2: ∆PDP gradients ---
-        print(f"\nStep 2: ∆PDP gradients g_ℓ = ∇_θ ∆PDP_ℓ ...")
-        gradients, estimates, counts = compute_delta_pdp_gradients(
-            model, loader, device, bmi_lo, bmi_hi, visit_times
+        # --- Step 2: ∆PDP gradients (windowed) ---
+        print(f"\nStep 2: ∆PDP gradients g_ℓ = ∇_θ ∆PDP_ℓ (windowed, max_dist={max_dist}) ...")
+        gradients, estimates, counts, mean_times = compute_delta_pdp_gradients(
+            model, loader, device, bmi_lo, bmi_hi, visit_times,
+            max_dist=max_dist,
         )
 
     # --- Step 3: Var = gᵀ Cov g ---
-    all_ages = []
-    for batch in loader:
-        _, _, _, _, _, _, s = batch
-        all_ages.append(s[:, 1])
-    mean_age = torch.cat(all_ages).mean().item()
-    true_delta = delta_v * (true_beta_bmi + true_beta_int * mean_age)
-
+    # Oracle for cumulative scenario: ∆PDP(t) = true_coeff × Δv × t̄
+    # where t̄ is the mean actual observation time in the bin
     print(f"\nStep 3: Var(∆PDP_ℓ) = g_ℓᵀ Cov g_ℓ")
-    print(f"  mean AGEc = {mean_age:.4f}")
-    print(f"  true ∆PDP = {true_delta:.4f}")
+    print(f"  Oracle: ∆PDP(t) = {true_coeff} × {delta_v} × t̄")
 
     if sandwich:
-        print(f"\n  {'Time':>6s}  {'∆PDP':>10s}  {'SE_F⁻¹':>10s}  "
+        print(f"\n  {'Time':>6s}  {'t̄':>6s}  {'∆PDP':>10s}  {'SE_F⁻¹':>10s}  "
               f"{'SE_bayes':>10s}  {'SE_sand':>10s}  {'CI_lo':>10s}  "
-              f"{'CI_hi':>10s}  {'True':>10s}  {'Bias':>10s}")
+              f"{'CI_hi':>10s}  {'True':>10s}  {'Bias':>10s}  {'n':>5s}")
     else:
-        print(f"\n  {'Time':>6s}  {'∆PDP':>10s}  {'SE':>10s}  {'SE_Centered':>10s}"
-              f"{'CI_lo':>10s}  {'CI_hi':>10s}  {'True':>10s}  {'Bias':>10s}")
-    print(f"  {'-'*80}")
+        print(f"\n  {'Time':>6s}  {'t̄':>6s}  {'∆PDP':>10s}  {'SE_F⁻¹':>10s}  "
+              f"{'CI_lo':>10s}  {'CI_hi':>10s}  {'True':>10s}  {'Bias':>10s}  {'n':>5s}")
+    print(f"  {'-'*90}")
 
     results = {}
     for vt in visit_times:
         g = gradients[vt]
         est = estimates[vt]
+        n_vt = counts[vt]
+        mean_t = mean_times[vt]
+
+        # Time-dependent oracle
+        true_delta = true_coeff * delta_v * mean_t
 
         coeffs = eigvecs.T @ g
         null_mask = eigvals < 1e-6
@@ -1039,7 +996,6 @@ def compute_full_delta_variance(
         print(f"  t={int(vt)}: ||g_null||² / ||g||² = {frac_null.item():.4f}")
 
         var_fisher = (g @ fisher_inv @ g).item()
-        var_centered = (g @ fisher_c_inv @ g).item()
 
         if sandwich:
             var_sand = (g @ sandwich_cov @ g).item()
@@ -1050,7 +1006,7 @@ def compute_full_delta_variance(
         else:
             var_sand = float('nan')
             var_bayes = float('nan')
-            se_main = np.sqrt(max(var_centered, 0.0))
+            se_main = np.sqrt(max(var_fisher, 0.0))
             se_sand = float('nan')
             se_fisher = np.sqrt(max(var_fisher, 0.0))
 
@@ -1061,25 +1017,27 @@ def compute_full_delta_variance(
         results[vt] = {
             'estimate': est,
             'se': se_main,
-            'var': var_bayes if sandwich else var_centered,
+            'var': var_bayes if sandwich else var_fisher,
             'var_fisher': var_fisher,
-            'var_centered': var_centered,
             'var_sandwich': var_sand,
             'var_bayes': var_bayes,
             'ci_lo': ci_lo,
             'ci_hi': ci_hi,
             'true': true_delta,
             'bias': bias,
+            'mean_t': mean_t,
+            'n': n_vt,
         }
 
         if sandwich:
-            print(f"  {vt:6.0f}  {est:+10.4f}  {se_fisher:10.4f}  "
+            print(f"  {vt:6.0f}  {mean_t:6.2f}  {est:+10.4f}  {se_fisher:10.4f}  "
                   f"{se_main:10.4f}  {se_sand:10.4f}  "
                   f"{ci_lo:+10.4f}  {ci_hi:+10.4f}  "
-                  f"{true_delta:+10.4f}  {bias:+10.4f}")
+                  f"{true_delta:+10.4f}  {bias:+10.4f}  {n_vt:5d}")
         else:
-            print(f"  {vt:6.0f}  {est:+10.4f}  {se_fisher:10.4f}  {se_main:10.4f}  "
-                  f"{ci_lo:+10.4f}  {ci_hi:+10.4f}  {true_delta:+10.4f}  {bias:+10.4f}")
+            print(f"  {vt:6.0f}  {mean_t:6.2f}  {est:+10.4f}  {se_fisher:10.4f}  "
+                  f"{ci_lo:+10.4f}  {ci_hi:+10.4f}  "
+                  f"{true_delta:+10.4f}  {bias:+10.4f}  {n_vt:5d}")
 
     ret = {
         'results': results,
@@ -1088,8 +1046,8 @@ def compute_full_delta_variance(
         'gradients': {vt: g.numpy() for vt, g in gradients.items()},
         'estimates': estimates,
         'counts': counts,
+        'mean_times': mean_times,
         'P': P,
-        'mean_age': mean_age,
     }
     if sandwich:
         ret['hessian'] = J.numpy()
@@ -1107,7 +1065,10 @@ def compute_full_delta_variance(
 def aggregate_simulations(all_results, visit_times):
     """
     Aggregate across D simulations. Compute var_mc, var_est, coverage.
-    Output format matches LMM CSV.
+
+    For cumulative scenario, oracle varies per simulation (depends on
+    mean actual observation time in each bin), so coverage uses
+    per-simulation true values.
     """
     D = len(all_results)
     summary = {}
@@ -1116,23 +1077,24 @@ def aggregate_simulations(all_results, visit_times):
         ests = np.array([r['results'][vt]['estimate'] for r in all_results])
         ses = np.array([r['results'][vt]['se'] for r in all_results])
 
-        # true_vals = np.array([r['results'][vt]['true'] for r in all_results])
-        # coverage = np.mean((ci_los <= true_vals) & (true_vals <= ci_his))
-        true_val = all_results[0]['results'][vt]['true']
+        # Per-simulation oracle (time-dependent)
+        true_vals = np.array([r['results'][vt]['true'] for r in all_results])
         ci_los = np.array([r['results'][vt]['ci_lo'] for r in all_results])
         ci_his = np.array([r['results'][vt]['ci_hi'] for r in all_results])
 
+        mean_true = true_vals.mean()
         mean_hat = ests.mean()
-        bias = mean_hat - true_val
+        bias = mean_hat - mean_true
         var_mc = ests.var(ddof=1) if D > 1 else float('nan')
         mean_var_est = (ses ** 2).mean()
         mse = bias ** 2 + var_mc if D > 1 else float('nan')
         rmse = np.sqrt(mse) if D > 1 else float('nan')
-        coverage = np.mean((ci_los <= true_val) & (true_val <= ci_his)) if D > 1 else float('nan')
+        # Coverage: each simulation's CI vs its own oracle
+        coverage = np.mean((ci_los <= true_vals) & (true_vals <= ci_his)) if D > 1 else float('nan')
 
         summary[vt] = {
             'mean_hat': mean_hat,
-            'true': true_val,
+            'true': mean_true,
             'bias': bias,
             'var_mc': var_mc,
             'mean_var_est': mean_var_est,
@@ -1153,32 +1115,40 @@ if __name__ == "__main__":
     import pyreadr
     from torch.utils.data import DataLoader
     from dataset import LongitudinalDataset, collate_pad
-    from model_ODE_skipgate import NeuralODEModel, NeuralODEConfig
+    from model_ODE_torchdiff import NeuralODEModel, NeuralODEConfig
 
     parser = argparse.ArgumentParser(
-        description="Full-parameter delta method for ∆PDP variance")
+        description="Full-parameter delta method for ∆PDP variance — cumulative scenario")
     parser.add_argument("--n_sims", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--true_beta_bmi", type=float, default=-0.30)
-    parser.add_argument("--true_beta_int", type=float, default=-0.05)
+    parser.add_argument("--true_coeff", type=float, default=-0.05,
+                        help="True h5 coefficient: h5(t) = coeff * integral BMI(tau) dtau")
     parser.add_argument("--output_csv", type=str,
-                        default="results/simulation_baseline_summary.csv")
+                        default="results/simulation_cumulative_summary.csv")
+    parser.add_argument("--data_dir", type=str, default="simu_datasets/S5_sims")
+    parser.add_argument("--ckpt_dir", type=str,
+                        default="checkpoints/simulation_cumulative_effect_fullD")
     parser.add_argument("--bmi_pairs", type=str, default=None)
     parser.add_argument("--sandwich", action="store_true",
                         help="Use sandwich variance J⁻¹FJ⁻¹ instead of F⁻¹")
     parser.add_argument("--n_hessian_subsample", type=int, default=None,
-                        help="Subsample N subjects per HVP pass (e.g. 500). "
-                             "Reduces cost per CG iteration proportionally.")
-    parser.add_argument("--weight_decay", type=float, default=0.0,
-                        help="Weight decay used during training (added to J in sandwich)")
-    parser.add_argument("--lambda_skip", type=float, default=0.1,
-                        help="L1 skip penalty coefficient used during training")
-    parser.add_argument("--eps_smooth", type=float, default=1e-6,
-                        help="Smoothing parameter for L1 → smooth L1 in score computation")
+                        help="Subsample N subjects for Hessian (e.g. 500).")
+    parser.add_argument("--weight_decay", type=float, default=1e-5,
+                        help="Weight decay used during training (added to J)")
+    parser.add_argument("--lambda_reg", type=float, default=0.05,
+                        help="Skip penalty coefficient (skip_gate or group_lasso)")
+    parser.add_argument("--reg_mode", type=str, default=None,
+                        choices=[None, "skip_gate", "group_lasso"],
+                        help="Regularisation mode for skip connection")
+    parser.add_argument("--max_dist", type=float, default=1.5,
+                        help="Max distance (years) for time-windowed matching")
+    parser.add_argument("--hidden_channels", type=int, default=16)
+    parser.add_argument("--ode_solver", type=str, default="rk4")
+    parser.add_argument("--euler_steps", type=int, default=4)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    visit_times = np.array([0, 5, 10, 15])
+    visit_times = np.array([0, 4, 8, 10])
 
     # BMI pairs
     if args.bmi_pairs:
@@ -1187,7 +1157,7 @@ if __name__ == "__main__":
     else:
         grid = [20, 23, 26, 29, 32, 35]
         bmi_pairs = [(grid[i], grid[i+1]) for i in range(len(grid)-1)]
-        bmi_pairs.append((20, 35))
+        bmi_pairs.append((23, 32))
 
     time_col, y_col, id_col = "time", "ISA15_sim", "NUM_ID"
     x_cols = ["BMI_t", "rs1", "rs2"]
@@ -1197,7 +1167,7 @@ if __name__ == "__main__":
 
     # --- Checkpoint: resume from last completed simulation ---
     ckpt_dir = os.path.dirname(args.output_csv) or '.'
-    ckpt_file = os.path.join(ckpt_dir, "delta_method_checkpoint.pt")
+    ckpt_file = os.path.join(ckpt_dir, "delta_method_cumulative_checkpoint.pt")
     start_sim = 0
 
     if os.path.exists(ckpt_file):
@@ -1210,14 +1180,14 @@ if __name__ == "__main__":
 
     for sim_idx in range(start_sim, args.n_sims):
         if args.n_sims > 1:
-            data_path = f"simu_datasets/S2a_sims/sim_{sim_idx+1:03d}.rds"
-            ckpt_path = f"checkpoints/simulation_baseline_euler_4_ReLU_general/best_model_ode_{sim_idx}.pt"
+            data_path = f"{args.data_dir}/sim_{sim_idx+1:03d}.rds"
+            ckpt_path = f"{args.ckpt_dir}/best_model_ode_{sim_idx}.pt"
             print(f"\n{'#'*60}")
             print(f"# SIMULATION {sim_idx}")
             print(f"{'#'*60}")
         else:
-            data_path = "simu_datasets/S2a_sims/sim_004.rds"
-            ckpt_path = "checkpoints/simulation_baseline_euler_4_ReLU_general/best_model_ode_3.pt"
+            data_path = f"{args.data_dir}/sim_001.rds"
+            ckpt_path = f"{args.ckpt_dir}/best_model_ode_0.pt"
 
         # --- Data ---
         df = next(iter(pyreadr.read_r(data_path).values()))
@@ -1231,17 +1201,21 @@ if __name__ == "__main__":
         loader = DataLoader(dataset, batch_size=args.batch_size,
                             shuffle=False, collate_fn=collate_pad)
 
-        # --- Model ---
+        # --- Model (match training config) ---
         cfg = NeuralODEConfig(
-            hidden_channels=8, enc_mlp_hidden=32, func_mlp_hidden=32,
+            hidden_channels=args.hidden_channels,
+            enc_mlp_hidden=32, func_mlp_hidden=32,
             dec_rho_hidden=16, dec_p=4, dec_q=3, depth=2, dropout=0.0,
-            euler_steps_per_interval=4,
+            euler_steps_per_interval=args.euler_steps if args.ode_solver != 'dopri5' else None,
+            ode_solver=args.ode_solver,
         )
         model = NeuralODEModel(
             x_dim=len(x_cols), static_dim=len(static_cols), cfg=cfg,
             n_tv=1, use_rho_net=True, use_neural_re=True,
             re_spline_cols=None, g_hidden=16, fullD=True,
-            bmi_mean=0.0, bmi_std=1.0, static_skip_dims=[1],
+            bmi_mean=0.0, bmi_std=1.0,
+            use_bmi_skip=False, static_skip_dims=None,
+            reg_mode=args.reg_mode,
         ).to(device)
 
         checkpoint = torch.load(ckpt_path, map_location=device,
@@ -1258,14 +1232,12 @@ if __name__ == "__main__":
                 model, dataset, loader, device, collate_pad,
                 bmi_lo=bmi_lo, bmi_hi=bmi_hi,
                 visit_times=visit_times,
-                true_beta_bmi=args.true_beta_bmi,
-                true_beta_int=args.true_beta_int,
+                true_coeff=args.true_coeff,
                 sandwich=args.sandwich,
                 n_hessian_subsample=args.n_hessian_subsample,
                 weight_decay=args.weight_decay,
-                lambda_skip=args.lambda_skip,
-                static_skip_dims=[1],  # AGEc — match model config
-                eps_smooth=args.eps_smooth,
+                lambda_reg=args.lambda_reg,
+                max_dist=args.max_dist,
             )
             all_pair_results[(bmi_lo, bmi_hi)].append(result)
 
@@ -1285,7 +1257,7 @@ if __name__ == "__main__":
     csv_rows = []
 
     print(f"\n{'='*90}")
-    print(f"AGGREGATED — Full Delta Method (D={args.n_sims})")
+    print(f"AGGREGATED — Full Delta Method, Cumulative (D={args.n_sims})")
     print(f"{'='*90}")
     print(f"{'t':>4s} {'lo':>4s} {'hi':>4s} {'D':>3s}  {'mean_hat':>10s} "
           f"{'mean_true':>10s} {'bias':>8s}  {'var_mc':>10s} {'var_est':>10s} "
@@ -1330,8 +1302,3 @@ if __name__ == "__main__":
         writer.writeheader()
         writer.writerows(csv_rows)
     print(f"\nCSV saved to {args.output_csv}")
-
-    # Clean up checkpoint after successful completion
-    if os.path.exists(ckpt_file):
-        os.remove(ckpt_file)
-        print(f"Checkpoint removed (all simulations complete).")

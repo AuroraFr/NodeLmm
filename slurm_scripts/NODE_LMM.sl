@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH -J ODE_LMM
+#SBATCH -J ODE_LMM_q6
 # Asking for one node
-#SBATCH -w sirocco22 --time=2-10:00:00 --exclusive
+#SBATCH -w sirocco17 --time=2-10:00:00 --exclusive
 # Standard output
 #SBATCH -o slurm.sh%j.out
 # Standard error
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python train_ODE.py
+python train_ODE_cumulative.py

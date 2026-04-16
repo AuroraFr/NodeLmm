@@ -1,24 +1,28 @@
 """
 PDP analysis for the Neural ODE-LMM on the real 3C dataset.
 
-BMI enters the model in two places:
-  1. ODE dynamics:  dz/dt = f(z, t, [x_filled, cumask], static)
-  2. Decoder skip:  mu = rho(z(t), BMI_std(t), AGEc) @ beta
+The model receives x_aug = [time(1), x_interp(K), mask(K)].
+A covariate enters the model in two places:
+  1. ODE dynamics:  dz/dt = f(z, x_interp(t), mask(t), t)
+  2. Decoder skip:  skip(t) = gate ⊙ [x_interp_std(t), mask(t), static]
 
-A full PDP intervention (Profile A — total effect) must replace BMI
-consistently in BOTH pathways and re-integrate the ODE from scratch.
+A full PDP intervention replaces the target covariate consistently in BOTH
+x_interp and mask channels, then re-integrates the ODE from scratch.
 
-For the counterfactual ode_inject:
-  - BMI channel in x_filled → set to constant v
-  - BMI channel in cumask   → set to fully observed (incrementing 1,2,3,...)
-  - All other channels      → left at their observed values
+Convention for counterfactual mask:
+  - binary mask:      set to 1 at all slots (the intervention value is "known")
+  - cumulative mask:  set to 1, 2, 3, ..., T
 
 Includes:
-  - compute_pdp:               population-level PDP (mu only)
-  - compute_pdp_with_blup:     subject-level ICE with BLUP random effects
-  - compute_delta_pdp:         marginal ΔPDP at visit times
-  - compute_delta_pdp_stratified: ΔPDP by age tertiles
-  - plot_pdp, plot_pdp_marginal: visualization
+  - build_counterfactual_xaug:       build intervened x_aug (constant/linear/shifted)
+  - build_profile_xaug:             build intervened x_aug (trajectory profile)
+  - compute_pdp:                     population-level PDP (mu only)
+  - compute_pdp_with_blup:           subject-level ICE with BLUP random effects
+  - compute_delta_pdp:               marginal ΔPDP at visit times
+  - compute_delta_pdp_stratified:    ΔPDP by age tertiles
+  - make_profiles:                   define 6 counterfactual trajectory shapes
+  - compute_trajectory_profile_pdp:  profile PDP (path-dependence diagnostic)
+  - plot_pdp, plot_pdp_marginal, plot_delta_pdp, plot_trajectory_profile_pdp
 """
 
 import torch
@@ -27,297 +31,74 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+from Preprocess_3C import EXPECTED_TIMES
+
 
 # ── Canonical visit grid ─────────────────────────────────────────────────────
-VISIT_TIMES_3C = np.array([0, 2, 4, 7, 10, 12])
+VISIT_TIMES_3C = EXPECTED_TIMES
 
 
 # ─────────────────────────────────────────────
 # Counterfactual builder
 # ─────────────────────────────────────────────
 
-def build_counterfactual(x_filled, cumask, t_pad, mask, target_value,
-                         target_col=0, mode="constant", slope=None):
+def build_counterfactual_xaug(x_aug, target_col, target_value, n_tv,
+                               mask_type="binary", mode="constant",
+                               slope=None):
     """
-    Build counterfactual x_filled, cumask, and ode_inject for a covariate intervention.
+    Build counterfactual x_aug by intervening on a single covariate channel.
 
     Args:
-        x_filled:     (N, T, K) forward-filled covariates
-        cumask:       (N, T, K) cumulative observation mask
-        t_pad:        (N, T)    padded times
-        mask:         (N, T)    outcome observation mask
-        target_value: scalar    counterfactual value for the target covariate
-        target_col:   int       column index in x_filled of the target covariate
-        mode:         str       "constant", "linear", or "shifted"
-        slope:        float     slope for linear mode
+        x_aug:        (N, T, 1+2K) original augmented input
+        target_col:   int, index in [0, K-1] of the target covariate
+        target_value: scalar, counterfactual value
+        n_tv:         K, number of time-varying covariates
+        mask_type:    "binary" or "cumulative"
+        mode:         "constant", "linear", or "shifted"
+        slope:        float, for linear mode
 
     Returns:
-        x_cf:          (N, T, K)  counterfactual x_filled
-        ode_inject_cf: (N, T, 2K) counterfactual [x_filled, cumask] for ODE
+        x_aug_cf:     (N, T, 1+2K) counterfactual x_aug
     """
-    N, T, K = x_filled.shape
+    K = n_tv
+    N, T, _ = x_aug.shape
+    x_aug_cf = x_aug.clone()
 
-    x_cf = x_filled.clone()
+    # Column indices in x_aug
+    cov_col = 1 + target_col              # x_interp column
+    mask_col = 1 + K + target_col         # mask column
 
+    # ── Intervene on covariate value ────────────────────────────────────
     if mode == "constant":
-        x_cf[:, :, target_col] = target_value
+        x_aug_cf[:, :, cov_col] = target_value
 
     elif mode == "linear":
         if slope is None:
             raise ValueError("slope required for linear mode")
-        x_cf[:, :, target_col] = target_value + slope * t_pad
+        t_pad = x_aug[:, :, 0]                                 # (N, T)
+        x_aug_cf[:, :, cov_col] = target_value + slope * t_pad
 
     elif mode == "shifted":
-        real_vals = x_filled[:, :, target_col]
-        masked_vals = real_vals * mask
-        n_obs = mask.sum(dim=1, keepdim=True).clamp(min=1)
-        mean_subj = masked_vals.sum(dim=1, keepdim=True) / n_obs
-        x_cf[:, :, target_col] = real_vals - mean_subj + target_value
+        # Shift each subject's trajectory to have mean = target_value
+        # (preserves individual dynamics, changes level)
+        real_vals = x_aug[:, :, cov_col]                        # (N, T)
+        real_mask = x_aug[:, :, mask_col]                       # (N, T)
+        n_obs = real_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        mean_subj = (real_vals * real_mask).sum(dim=1, keepdim=True) / n_obs
+        x_aug_cf[:, :, cov_col] = real_vals - mean_subj + target_value
 
     else:
         raise ValueError(f"Unknown mode: '{mode}'")
 
-    # Build counterfactual cumask: target channel is "fully observed"
-    cumask_cf = cumask.clone()
-    cumask_cf[:, :, target_col] = torch.arange(
-        1, T + 1, device=cumask.device, dtype=cumask.dtype
-    ).unsqueeze(0).expand(N, -1)
+    # ── Set mask to fully observed (the intervention is "known") ────────
+    if mask_type == "binary":
+        x_aug_cf[:, :, mask_col] = 1.0
+    else:  # "cumulative"
+        x_aug_cf[:, :, mask_col] = torch.arange(
+            1, T + 1, device=x_aug.device, dtype=x_aug.dtype
+        ).unsqueeze(0).expand(N, -1)
 
-    ode_inject_cf = torch.cat([x_cf, cumask_cf], dim=-1)
-
-    return x_cf, ode_inject_cf
-
-
-# ─────────────────────────────────────────────
-# Core PDP computation (population mean only)
-# ─────────────────────────────────────────────
-
-def compute_pdp(model, loader, device, intervention_values, target_col=0,
-                mode="constant", slope=None, age_col=1, target_name="covariate"):
-    """
-    Compute PDP for a target covariate on the real 3C dataset.
-
-    For each intervention value v:
-      1. Replace target covariate in x_filled AND ode_inject with counterfactual
-      2. Set target's cumask to fully observed
-      3. Re-run full forward pass (encoder + ODE + decoder)
-      4. Collect population mean mu(t)
-
-    Args:
-        model:               NeuralODEModel
-        loader:              DataLoader (from RealDataset + collate_real)
-        device:              torch device
-        intervention_values: list of counterfactual values for the target covariate
-        target_col:          column index in x_filled of the target covariate
-        mode:                "constant", "linear", or "shifted"
-        slope:               slope for linear mode
-        age_col:             AGEc column index in static covariates
-        target_name:         name of target covariate (for printing)
-
-    Returns:
-        results: dict {value: (N, T) tensor of population mean predictions}
-        ages:    (N,) tensor of AGEc values
-        masks:   (N, T) observation mask
-        times:   (N, T) padded times
-    """
-    model.eval()
-
-    results = {v: [] for v in intervention_values}
-    all_ages = []
-    all_masks = []
-    all_times = []
-
-    print(f"  Computing PDP for {target_name} (col={target_col}, mode='{mode}')")
-
-    # Estimate slope if needed
-    if mode == "linear" and slope is None:
-        all_vals, all_t = [], []
-        with torch.no_grad():
-            for batch in loader:
-                _, t_pad_b, x_filled_b, _, _, mask_b, _ = batch
-                obs = mask_b > 0.5
-                all_vals.append(x_filled_b[:, :, target_col][obs].numpy())
-                all_t.append(t_pad_b[obs].numpy())
-        val_flat = np.concatenate(all_vals)
-        t_flat = np.concatenate(all_t)
-        from numpy.polynomial.polynomial import polyfit
-        c = polyfit(t_flat, val_flat, 1)
-        slope = c[1]
-        print(f"  Estimated population slope for {target_name}: {slope:.4f} per year")
-
-    with torch.no_grad():
-        for v in intervention_values:
-            batch_mus = []
-
-            for batch in loader:
-                _, t_pad, x_filled, cumask, y_pad, mask, s = batch
-                t_pad = t_pad.to(device)
-                x_filled = x_filled.to(device)
-                cumask = cumask.to(device)
-                mask = mask.to(device)
-                s = s.to(device)
-
-                x_cf, ode_inject_cf = build_counterfactual(
-                    x_filled, cumask, t_pad, mask,
-                    target_value=v, target_col=target_col,
-                    mode=mode, slope=slope,
-                )
-
-                mu, V, _, _, _, _ = model(
-                    t_pad, x_cf, masks=cumask,
-                    static_covariates=s,
-                    ode_inject=ode_inject_cf,
-                    obs_mask=mask,
-                    y_pad=None,
-                )
-                batch_mus.append(mu.cpu())
-
-                if v == intervention_values[0]:
-                    all_ages.append(s[:, age_col].cpu())
-                    all_masks.append(mask.cpu())
-                    all_times.append(t_pad.cpu())
-
-            results[v] = torch.cat(batch_mus, dim=0)
-
-    ages = torch.cat(all_ages, dim=0)
-    masks = torch.cat(all_masks, dim=0)
-    times = torch.cat(all_times, dim=0)
-
-    return results, ages, masks, times
-
-
-# ─────────────────────────────────────────────
-# ICE with BLUP random effects
-# ─────────────────────────────────────────────
-
-def compute_pdp_with_blup(model, loader, device, intervention_values, target_col=0,
-                          mode="constant", slope=None, age_col=1, target_name="covariate"):
-    """
-    Compute subject-level ICE curves INCLUDING random effects via BLUP.
-
-    Step 1: compute BLUP from OBSERVED data
-    Step 2: for each counterfactual value, re-run forward pass and add Z @ b_hat
-    """
-    model.eval()
-
-    results_pop = {v: [] for v in intervention_values}
-    results_subj = {v: [] for v in intervention_values}
-    all_blup = []
-    all_ages = []
-    all_masks = []
-    all_times = []
-
-    print(f"  Computing ICE with BLUP for {target_name} (col={target_col}, mode='{mode}')")
-
-    # Estimate slope if needed
-    if mode == "linear" and slope is None:
-        all_vals, all_t = [], []
-        with torch.no_grad():
-            for batch in loader:
-                _, t_pad_b, x_filled_b, _, _, mask_b, _ = batch
-                obs = mask_b > 0.5
-                all_vals.append(x_filled_b[:, :, target_col][obs].numpy())
-                all_t.append(t_pad_b[obs].numpy())
-        val_flat = np.concatenate(all_vals)
-        t_flat = np.concatenate(all_t)
-        from numpy.polynomial.polynomial import polyfit
-        c = polyfit(t_flat, val_flat, 1)
-        slope = c[1]
-
-    with torch.no_grad():
-        # --- Step 1: compute BLUP from observed data ---
-        print("    Step 1: computing BLUP from observed data...")
-        for batch in loader:
-            _, t_pad, x_filled, cumask, y_pad, mask, s = batch
-            t_pad = t_pad.to(device)
-            x_filled = x_filled.to(device)
-            cumask = cumask.to(device)
-            y_pad = y_pad.to(device)
-            mask = mask.to(device)
-            s = s.to(device)
-
-            # Forward on OBSERVED data (real BMI)
-            ode_inject_obs = torch.cat([x_filled, cumask], dim=-1)
-            mu_obs, V_obs, Z_obs, D_obs, sig2_obs, _ = model(
-                t_pad, x_filled, masks=cumask,
-                static_covariates=s, ode_inject=ode_inject_obs,
-                obs_mask=mask, y_pad=None,
-            )
-
-            # BLUP: b_hat_i = D Z_i^T V_i^{-1} (y_i - mu_i)
-            residual = (y_pad - mu_obs) * mask                      # (N, T)
-            Z_masked = Z_obs * mask.unsqueeze(-1)                   # (N, T, q)
-
-            # Masked V
-            mask_outer = mask.unsqueeze(-1) * mask.unsqueeze(-2)    # (N, T, T)
-            jitter = 1e-4
-            V_masked = V_obs * mask_outer + jitter * torch.eye(
-                t_pad.shape[1], device=device).unsqueeze(0)
-
-            # Solve V^{-1} r via Cholesky
-            L_V = torch.linalg.cholesky(V_masked)
-            Vinv_r = torch.cholesky_solve(
-                residual.unsqueeze(-1), L_V
-            ).squeeze(-1)                                            # (N, T)
-
-            # b_hat = D @ Z^T @ V^{-1} @ r
-            b_hat = D_obs @ (Z_masked.transpose(1, 2) @ Vinv_r.unsqueeze(-1))
-            b_hat = b_hat.squeeze(-1)                                # (N, q)
-            all_blup.append(b_hat.cpu())
-
-            all_ages.append(s[:, age_col].cpu())
-            all_masks.append(mask.cpu())
-            all_times.append(t_pad.cpu())
-
-        blup = torch.cat(all_blup, dim=0)
-
-        # --- Step 2: compute predictions under each intervention value ---
-        print("    Step 2: computing counterfactual predictions...")
-        for v in intervention_values:
-            batch_mus = []
-            batch_subj = []
-            blup_offset = 0
-
-            for batch in loader:
-                _, t_pad, x_filled, cumask, y_pad, mask, s = batch
-                t_pad = t_pad.to(device)
-                x_filled = x_filled.to(device)
-                cumask = cumask.to(device)
-                mask = mask.to(device)
-                s = s.to(device)
-
-                N_batch = t_pad.shape[0]
-
-                x_cf, ode_inject_cf = build_counterfactual(
-                    x_filled, cumask, t_pad, mask,
-                    target_value=v, target_col=target_col,
-                    mode=mode, slope=slope,
-                )
-
-                # Forward under counterfactual
-                mu_cf, V_cf, Z_cf, D_cf, sig2_cf, _ = model(
-                    t_pad, x_cf, masks=cumask,
-                    static_covariates=s, ode_inject=ode_inject_cf,
-                    obs_mask=mask, y_pad=None,
-                )
-
-                # Subject-level: mu + Z @ b_hat
-                b_batch = blup[blup_offset:blup_offset + N_batch].to(device)
-                Zb = (Z_cf * b_batch.unsqueeze(1)).sum(dim=-1)       # (N, T)
-                y_subj = mu_cf + Zb
-
-                batch_mus.append(mu_cf.cpu())
-                batch_subj.append(y_subj.cpu())
-                blup_offset += N_batch
-
-            results_pop[v] = torch.cat(batch_mus, dim=0)
-            results_subj[v] = torch.cat(batch_subj, dim=0)
-
-    ages = torch.cat(all_ages, dim=0)
-    masks = torch.cat(all_masks, dim=0)
-    times = torch.cat(all_times, dim=0)
-
-    return results_pop, results_subj, blup, ages, masks, times
+    return x_aug_cf
 
 
 # ─────────────────────────────────────────────
@@ -326,7 +107,8 @@ def compute_pdp_with_blup(model, loader, device, intervention_values, target_col
 
 def _closest_obs_per_subject(mu, masks_np, times_np, visit_times):
     """
-    For each target visit time, find the closest observed time point per subject.
+    For each target visit time, find the closest observed time point
+    per subject and return the prediction at that point.
     """
     N, T = mu.shape
     result = {}
@@ -344,31 +126,260 @@ def _closest_obs_per_subject(mu, masks_np, times_np, visit_times):
 
     return result
 
+def _closest_obs_per_subject_2(mu, masks_np, times_np, visit_times,
+                              max_dist=1.0):
+    N, T = mu.shape
+    result = {}
+    for vt in visit_times:
+        preds = []
+        for i in range(N):
+            obs_idx = np.where(masks_np[i] > 0.5)[0]
+            if len(obs_idx) == 0:
+                continue
+            obs_times = times_np[i, obs_idx]
+            best = np.argmin(np.abs(obs_times - vt))
+            if np.abs(obs_times[best] - vt) <= max_dist:
+                preds.append(mu[i, obs_idx[best]])
+        result[vt] = np.array(preds)
+    return result
+
 
 # ─────────────────────────────────────────────
-# ΔPDP computation (no oracle — real data)
+# Core PDP computation (population mean only)
+# ─────────────────────────────────────────────
+
+def compute_pdp(model, loader, device, intervention_values, target_col=0,
+                n_tv=5, mask_type="binary", mode="constant", slope=None,
+                age_col=1, target_name="covariate"):
+    """
+    Compute PDP for a target covariate.
+
+    For each intervention value v:
+      1. Build counterfactual x_aug with target set to v
+      2. Re-run full forward pass (encoder + ODE + decoder)
+      3. Collect population mean mu(t)
+
+    Args:
+        model:               NeuralODEModel
+        loader:              DataLoader (RealDataset + collate_real)
+        device:              torch device
+        intervention_values: list of counterfactual values
+        target_col:          column index in x_interp [0..K-1]
+        n_tv:                K, number of time-varying covariates
+        mask_type:           "binary" or "cumulative"
+        mode:                "constant", "linear", or "shifted"
+        slope:               float, for linear mode
+        age_col:             AGEc column index in static covariates
+        target_name:         name for printing
+
+    Returns:
+        results: dict {value: (N, T) numpy array of population means}
+        ages:    (N,) numpy array of AGEc
+        masks:   (N, T) numpy array of target_mask
+        times:   (N, T) numpy array of times
+    """
+    model.eval()
+
+    results = {v: [] for v in intervention_values}
+    all_ages = []
+    all_masks = []
+    all_times = []
+
+    print(f"  Computing PDP for {target_name} (col={target_col}, mode='{mode}')")
+
+    # Estimate population slope if needed
+    if mode == "linear" and slope is None:
+        all_vals, all_t = [], []
+        K = n_tv
+        with torch.no_grad():
+            for batch in loader:
+                _, x_aug, _, target_mask, static = batch
+                x_interp = x_aug[:, :, 1:1+K]
+                t_pad = x_aug[:, :, 0]
+                obs = target_mask > 0.5
+                all_vals.append(x_interp[:, :, target_col][obs].numpy())
+                all_t.append(t_pad[obs].numpy())
+        val_flat = np.concatenate(all_vals)
+        t_flat = np.concatenate(all_t)
+        from numpy.polynomial.polynomial import polyfit
+        c = polyfit(t_flat, val_flat, 1)
+        slope = c[1]
+        print(f"  Estimated population slope: {slope:.4f} per year")
+
+    with torch.no_grad():
+        for v in intervention_values:
+            batch_mus = []
+
+            for batch in loader:
+                pids, x_aug, y_pad, target_mask, static = batch
+                x_aug = x_aug.to(device)
+                target_mask = target_mask.to(device)
+                static = static.to(device)
+
+                # Build counterfactual
+                x_aug_cf = build_counterfactual_xaug(
+                    x_aug, target_col=target_col,
+                    target_value=v, n_tv=n_tv,
+                    mask_type=mask_type, mode=mode, slope=slope,
+                )
+
+                # Forward under counterfactual
+                mu, V, Z, D, sig2, reg_dict = model(
+                    x_aug_cf,
+                    static_covariates=static,
+                    obs_mask=target_mask,
+                )
+                batch_mus.append(mu.cpu())
+
+                # Collect metadata on first pass
+                if v == intervention_values[0]:
+                    all_ages.append(static[:, age_col].cpu())
+                    all_masks.append(target_mask.cpu())
+                    all_times.append(x_aug[:, :, 0].cpu())
+
+            results[v] = torch.cat(batch_mus, dim=0).numpy()
+
+    ages = torch.cat(all_ages, dim=0).numpy()
+    masks = torch.cat(all_masks, dim=0).numpy()
+    times = torch.cat(all_times, dim=0).numpy()
+
+    return results, ages, masks, times
+
+
+# ─────────────────────────────────────────────
+# ICE with BLUP random effects
+# ─────────────────────────────────────────────
+
+def compute_pdp_with_blup(model, loader, device, intervention_values,
+                           target_col=0, n_tv=5, mask_type="binary",
+                           mode="constant", slope=None,
+                           age_col=1, target_name="covariate"):
+    """
+    Compute subject-level ICE curves INCLUDING random effects via BLUP.
+
+    Step 1: compute BLUP from OBSERVED data (real covariates)
+    Step 2: for each counterfactual value, re-run forward and add Z @ b_hat
+    """
+    model.eval()
+
+    results_pop = {v: [] for v in intervention_values}
+    results_subj = {v: [] for v in intervention_values}
+    all_blup = []
+    all_ages = []
+    all_masks = []
+    all_times = []
+
+    print(f"  Computing ICE with BLUP for {target_name} "
+          f"(col={target_col}, mode='{mode}')")
+
+    with torch.no_grad():
+        # ── Step 1: BLUP from observed data ─────────────────────────────
+        print("    Step 1: computing BLUP from observed data...")
+        for batch in loader:
+            pids, x_aug, y_pad, target_mask, static = batch
+            x_aug = x_aug.to(device)
+            y_pad = y_pad.to(device)
+            target_mask = target_mask.to(device)
+            static = static.to(device)
+
+            mu_obs, V_obs, Z_obs, D_obs, sig2_obs, _ = model(
+                x_aug,
+                static_covariates=static,
+                obs_mask=target_mask,
+            )
+
+            # Per-subject BLUP: b_hat_i = D Z_i^T V_i^{-1} (y_i - mu_i)
+            N_batch, T = mu_obs.shape
+            q = Z_obs.shape[2]
+            b_hat_batch = torch.zeros(N_batch, q, device=device)
+
+            for i in range(N_batch):
+                idx = target_mask[i].bool()
+                n_i = idx.sum()
+                if n_i < 1:
+                    continue
+
+                r_i = y_pad[i, idx] - mu_obs[i, idx]
+                V_i = V_obs[i][idx][:, idx]
+                Z_i = Z_obs[i, idx]
+
+                L_i = torch.linalg.cholesky(V_i)
+                Vinv_r = torch.cholesky_solve(
+                    r_i.unsqueeze(-1), L_i).squeeze(-1)
+
+                b_hat_batch[i] = D_obs @ Z_i.t() @ Vinv_r
+
+            all_blup.append(b_hat_batch.cpu())
+            all_ages.append(static[:, age_col].cpu())
+            all_masks.append(target_mask.cpu())
+            all_times.append(x_aug[:, :, 0].cpu())
+
+        blup = torch.cat(all_blup, dim=0)
+
+        # ── Step 2: counterfactual predictions ──────────────────────────
+        print("    Step 2: computing counterfactual predictions...")
+        for v in intervention_values:
+            batch_mus = []
+            batch_subj = []
+            blup_offset = 0
+
+            for batch in loader:
+                pids, x_aug, y_pad, target_mask, static = batch
+                x_aug = x_aug.to(device)
+                target_mask = target_mask.to(device)
+                static = static.to(device)
+
+                N_batch = x_aug.shape[0]
+
+                x_aug_cf = build_counterfactual_xaug(
+                    x_aug, target_col=target_col,
+                    target_value=v, n_tv=n_tv,
+                    mask_type=mask_type, mode=mode, slope=slope,
+                )
+
+                mu_cf, V_cf, Z_cf, D_cf, sig2_cf, _ = model(
+                    x_aug_cf,
+                    static_covariates=static,
+                    obs_mask=target_mask,
+                )
+
+                # Subject-level: mu + Z @ b_hat
+                b_batch = blup[blup_offset:blup_offset + N_batch].to(device)
+                Zb = (Z_cf * b_batch.unsqueeze(1)).sum(dim=-1)
+                y_subj = mu_cf + Zb
+
+                batch_mus.append(mu_cf.cpu())
+                batch_subj.append(y_subj.cpu())
+                blup_offset += N_batch
+
+            results_pop[v] = torch.cat(batch_mus, dim=0).numpy()
+            results_subj[v] = torch.cat(batch_subj, dim=0).numpy()
+
+    ages = torch.cat(all_ages, dim=0).numpy()
+    masks = torch.cat(all_masks, dim=0).numpy()
+    times = torch.cat(all_times, dim=0).numpy()
+
+    return results_pop, results_subj, blup, ages, masks, times
+
+
+# ─────────────────────────────────────────────
+# ΔPDP computation
 # ─────────────────────────────────────────────
 
 def compute_delta_pdp(results, ages, masks, times, val_lo, val_hi,
                       visit_times=None, target_name="covariate"):
     """
     Compute marginal ΔPDP = PDP(val_hi) - PDP(val_lo) at each visit time.
-
-    Returns:
-        estimated: dict {visit_time: estimated_delta}
     """
-    mu_lo = results[val_lo].numpy()
-    mu_hi = results[val_hi].numpy()
-    masks_np = masks.numpy()
-    times_np = times.numpy()
-
+    mu_lo = results[val_lo]
+    mu_hi = results[val_hi]
     delta = mu_hi - mu_lo
     delta_v = val_hi - val_lo
 
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
 
-    closest = _closest_obs_per_subject(delta, masks_np, times_np, visit_times)
+    closest = _closest_obs_per_subject(delta, masks, times, visit_times)
 
     print(f"\nΔPDP for {target_name} ({val_lo} → {val_hi}, Δv = {delta_v}):")
     print(f"  {'Time':>6s}  {'ΔPDP':>10s}  {'SE':>10s}  {'n':>6s}")
@@ -383,11 +394,10 @@ def compute_delta_pdp(results, ages, masks, times, val_lo, val_hi,
             estimated[vt] = est
             print(f"  {vt:6.0f}  {est:+10.4f}  {se:10.4f}  {len(d):6d}")
 
-    # Per-unit effect (ΔPDP / Δv)
     if estimated:
         avg_delta = np.mean(list(estimated.values()))
         print(f"\n  Average ΔPDP = {avg_delta:+.4f}")
-        print(f"  Per-unit BMI effect = {avg_delta / delta_v:+.4f}")
+        print(f"  Per-unit effect = {avg_delta / delta_v:+.4f}")
 
     return estimated
 
@@ -398,23 +408,20 @@ def compute_delta_pdp_stratified(results, ages, masks, times,
     """
     Compute ΔPDP stratified by age tertiles.
     """
-    mu_lo = results[val_lo].numpy()
-    mu_hi = results[val_hi].numpy()
-    masks_np = masks.numpy()
-    ages_np = ages.numpy()
-    times_np = times.numpy()
-
+    mu_lo = results[val_lo]
+    mu_hi = results[val_hi]
     delta = mu_hi - mu_lo
     delta_v = val_hi - val_lo
 
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
 
-    q33, q67 = np.percentile(ages_np, [33, 67])
+    q33, q67 = np.percentile(ages, [33, 67])
     age_groups = {
-        f'Young (AGEc < {q33:.1f})': ages_np < q33,
-        f'Middle ({q33:.1f} ≤ AGEc < {q67:.1f})': (ages_np >= q33) & (ages_np < q67),
-        f'Old (AGEc ≥ {q67:.1f})': ages_np >= q67,
+        f'Young (AGEc < {q33:.1f})': ages < q33,
+        f'Middle ({q33:.1f} ≤ AGEc < {q67:.1f})':
+            (ages >= q33) & (ages < q67),
+        f'Old (AGEc ≥ {q67:.1f})': ages >= q67,
     }
 
     print(f"\n{'='*70}")
@@ -425,14 +432,14 @@ def compute_delta_pdp_stratified(results, ages, masks, times,
 
     for group_name, group_mask in age_groups.items():
         n_group = group_mask.sum()
-        mean_age = ages_np[group_mask].mean()
+        mean_age = ages[group_mask].mean()
 
         delta_group = delta[group_mask]
-        masks_group = masks_np[group_mask]
-        times_group = times_np[group_mask]
+        masks_group = masks[group_mask]
+        times_group = times[group_mask]
 
-        closest_delta = _closest_obs_per_subject(delta_group, masks_group,
-                                                  times_group, visit_times)
+        closest_delta = _closest_obs_per_subject(
+            delta_group, masks_group, times_group, visit_times)
 
         print(f"\n  {group_name} (n={n_group}, mean AGEc={mean_age:.2f})")
         print(f"  {'Time':>6s}  {'ΔPDP':>8s}  {'SE':>8s}  {'n':>6s}")
@@ -465,6 +472,253 @@ def compute_delta_pdp_stratified(results, ages, masks, times,
 
 
 # ─────────────────────────────────────────────
+# Trajectory-profile PDP
+# ─────────────────────────────────────────────
+
+def make_profiles(n_slots, v_lo, v_hi):
+    """
+    Define counterfactual trajectory profiles for a covariate.
+
+    Matches the R function make_profiles() for direct comparison with HLME.
+
+    Args:
+        n_slots: number of time slots (T=6 for canonical grid)
+        v_lo:    low value (e.g. Q25)
+        v_hi:    high value (e.g. Q75)
+
+    Returns:
+        dict of {profile_name: (T,) numpy array of covariate values}
+    """
+    half = (n_slots + 1) // 2
+    return {
+        "stable_low":      np.full(n_slots, v_lo),
+        "stable_high":     np.full(n_slots, v_hi),
+        "late_spike":      np.array([v_lo]*half + [v_hi]*(n_slots - half)),
+        "early_burden":    np.array([v_hi]*half + [v_lo]*(n_slots - half)),
+        "gradual_rise":    np.linspace(v_lo, v_hi, n_slots),
+        "gradual_decline": np.linspace(v_hi, v_lo, n_slots),
+    }
+
+
+def build_profile_xaug(x_aug, target_col, profile_values, n_tv,
+                        mask_type="binary"):
+    """
+    Build counterfactual x_aug with a trajectory profile.
+
+    Unlike build_counterfactual_xaug (which sets a constant value),
+    this sets the target covariate to profile_values[t] at each slot t.
+
+    Args:
+        x_aug:          (N, T, 1+2K) original
+        target_col:     int, index in [0, K-1]
+        profile_values: (T,) array of covariate values per slot
+        n_tv:           K
+        mask_type:      "binary" or "cumulative"
+
+    Returns:
+        x_aug_cf: (N, T, 1+2K) counterfactual
+    """
+    K = n_tv
+    N, T, _ = x_aug.shape
+    x_aug_cf = x_aug.clone()
+
+    cov_col = 1 + target_col
+    mask_col = 1 + K + target_col
+
+    # Set covariate to profile values at each slot
+    prof = torch.tensor(profile_values, device=x_aug.device,
+                        dtype=x_aug.dtype)
+    x_aug_cf[:, :, cov_col] = prof.unsqueeze(0).expand(N, -1)
+
+    # Set mask to fully observed
+    if mask_type == "binary":
+        x_aug_cf[:, :, mask_col] = 1.0
+    else:
+        x_aug_cf[:, :, mask_col] = torch.arange(
+            1, T + 1, device=x_aug.device, dtype=x_aug.dtype
+        ).unsqueeze(0).expand(N, -1)
+
+    return x_aug_cf
+
+
+def compute_trajectory_profile_pdp(model, loader, device, profiles,
+                                    target_col=0, n_tv=5,
+                                    mask_type="binary",
+                                    target_name="covariate"):
+    """
+    Compute trajectory-profile PDP.
+
+    For each profile, replace the target covariate path with the profile
+    values, re-integrate the ODE, and compute the population mean at
+    each visit.
+
+    This is the key diagnostic for path-dependence:
+      - If early_burden ≈ late_spike → model sees only current value
+        (instantaneous effect, same as HLME)
+      - If early_burden < late_spike → model learned cumulative burden
+        (the ODE accumulated the high-BMI history)
+
+    Args:
+        model:       NeuralODEModel
+        loader:      DataLoader
+        device:      torch device
+        profiles:    dict from make_profiles()
+        target_col:  column index in x_interp [0..K-1]
+        n_tv:        K
+        mask_type:   "binary" or "cumulative"
+        target_name: name for printing
+
+    Returns:
+        results: dict {profile_name: {time: mean_prediction}}
+        masks:   (N, T) numpy array
+        times:   (N, T) numpy array
+    """
+    model.eval()
+
+    results = {pname: [] for pname in profiles}
+    all_masks = []
+    all_times = []
+
+    print(f"  Computing trajectory-profile PDP for {target_name}")
+    print(f"    Profiles: {list(profiles.keys())}")
+
+    with torch.no_grad():
+        for pname, prof_values in profiles.items():
+            batch_mus = []
+
+            for batch in loader:
+                pids, x_aug, y_pad, target_mask, static = batch
+                x_aug = x_aug.to(device)
+                target_mask = target_mask.to(device)
+                static = static.to(device)
+
+                x_aug_cf = build_profile_xaug(
+                    x_aug, target_col=target_col,
+                    profile_values=prof_values, n_tv=n_tv,
+                    mask_type=mask_type,
+                )
+
+                mu, V, Z, D, sig2, reg_dict = model(
+                    x_aug_cf,
+                    static_covariates=static,
+                    obs_mask=target_mask,
+                )
+                batch_mus.append(mu.cpu())
+
+                if pname == list(profiles.keys())[0]:
+                    all_masks.append(target_mask.cpu())
+                    all_times.append(x_aug[:, :, 0].cpu())
+
+            results[pname] = torch.cat(batch_mus, dim=0).numpy()
+
+    masks = torch.cat(all_masks, dim=0).numpy()
+    times = torch.cat(all_times, dim=0).numpy()
+
+    # Print summary
+    visit_times = VISIT_TIMES_3C
+    print(f"\n    {'Profile':<20s}", end="")
+    for vt in visit_times:
+        print(f"  T={vt:<5.0f}", end="")
+    print()
+    print(f"    {'-'*80}")
+
+    for pname in profiles:
+        mu = results[pname]
+        closest = _closest_obs_per_subject(mu, masks, times, visit_times)
+        print(f"    {pname:<20s}", end="")
+        for vt in visit_times:
+            d = closest[vt]
+            if len(d) > 10:
+                print(f"  {d.mean():>7.2f}", end="")
+            else:
+                print(f"  {'N/A':>7s}", end="")
+        print()
+
+    # Diagnostic: early_burden vs late_spike
+    if "early_burden" in results and "late_spike" in results:
+        eb = results["early_burden"]
+        ls = results["late_spike"]
+        diff = eb - ls
+        closest_diff = _closest_obs_per_subject(diff, masks, times, visit_times)
+        print(f"\n    Diagnostic: early_burden − late_spike")
+        print(f"    {'Time':>8s}  {'Diff':>8s}  {'SE':>8s}  {'Interp':>20s}")
+        for vt in visit_times:
+            d = closest_diff[vt]
+            if len(d) > 10:
+                m = d.mean()
+                se = d.std() / np.sqrt(len(d))
+                interp = ("cumulative ✓" if m < -0.1
+                          else "instantaneous" if abs(m) < 0.1
+                          else "unexpected (+)")
+                print(f"    {vt:8.0f}  {m:+8.3f}  {se:8.3f}  {interp:>20s}")
+
+    return results, masks, times
+
+
+def plot_trajectory_profile_pdp(results, masks, times,
+                                 save_path="traj_profile_pdp.png",
+                                 visit_times=None,
+                                 target_name="covariate"):
+    """
+    Plot trajectory-profile PDP. Matches R's plot_trajectory_profile_pdp().
+    """
+    if visit_times is None:
+        visit_times = VISIT_TIMES_3C
+
+    profile_colours = {
+        "stable_low":      "#2166AC",
+        "stable_high":     "#B2182B",
+        "late_spike":      "#F4A582",
+        "early_burden":    "#D6604D",
+        "gradual_rise":    "#92C5DE",
+        "gradual_decline": "#4393C3",
+    }
+
+    profile_labels = {
+        "stable_low":      "Stable low (Q25)",
+        "stable_high":     "Stable high (Q75)",
+        "late_spike":      "Late spike (Q25→Q75)",
+        "early_burden":    "Early burden (Q75→Q25)",
+        "gradual_rise":    "Gradual rise",
+        "gradual_decline": "Gradual decline",
+    }
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for pname, mu in results.items():
+        closest = _closest_obs_per_subject(mu, masks, times, visit_times)
+
+        t_plot, mean_plot, lo_plot, hi_plot = [], [], [], []
+        for vt in visit_times:
+            d = closest[vt]
+            if len(d) > 10:
+                m = d.mean()
+                se = d.std() / np.sqrt(len(d))
+                t_plot.append(vt)
+                mean_plot.append(m)
+                lo_plot.append(m - 1.96 * se)
+                hi_plot.append(m + 1.96 * se)
+
+        color = profile_colours.get(pname, "grey")
+        label = profile_labels.get(pname, pname)
+
+        ax.fill_between(t_plot, lo_plot, hi_plot, color=color, alpha=0.12)
+        ax.plot(t_plot, mean_plot, 'o-', color=color,
+                linewidth=1.5, markersize=5, label=label)
+
+    ax.set_xlabel('Time (years)')
+    ax.set_ylabel('E[ISA15]')
+    ax.set_title(f'Trajectory-profile PDP of {target_name} (Neural ODE-LMM)')
+    ax.legend(loc='best', fontsize=9, ncol=2)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"  → {save_path}")
+    plt.close()
+
+
+# ─────────────────────────────────────────────
 # Plotting
 # ─────────────────────────────────────────────
 
@@ -472,17 +726,14 @@ def plot_pdp(results, ages, masks, times, intervention_values,
              save_path="pdp_by_age.png", visit_times=None,
              target_name="covariate"):
     """Plot PDP over time, stratified by age tertiles."""
-    age_np = ages.numpy()
-    q33, q67 = np.percentile(age_np, [33, 67])
+    q33, q67 = np.percentile(ages, [33, 67])
 
     age_groups = {
-        f'Young (AGEc < {q33:.1f})': age_np < q33,
-        f'Middle ({q33:.1f} ≤ AGEc < {q67:.1f})': (age_np >= q33) & (age_np < q67),
-        f'Old (AGEc ≥ {q67:.1f})': age_np >= q67,
+        f'Young (AGEc < {q33:.1f})': ages < q33,
+        f'Middle ({q33:.1f} ≤ AGEc < {q67:.1f})':
+            (ages >= q33) & (ages < q67),
+        f'Old (AGEc ≥ {q67:.1f})': ages >= q67,
     }
-
-    masks_np = masks.numpy()
-    times_np = times.numpy()
 
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
@@ -494,13 +745,12 @@ def plot_pdp(results, ages, masks, times, intervention_values,
         ax = axes[ax_idx]
 
         for v_idx, v in enumerate(intervention_values):
-            mu = results[v].numpy()
-            mu_group = mu[group_mask]
-            masks_group = masks_np[group_mask]
-            times_group = times_np[group_mask]
+            mu_group = results[v][group_mask]
+            masks_group = masks[group_mask]
+            times_group = times[group_mask]
 
-            closest = _closest_obs_per_subject(mu_group, masks_group,
-                                                times_group, visit_times)
+            closest = _closest_obs_per_subject(
+                mu_group, masks_group, times_group, visit_times)
             mean_pred, visit_t_plot = [], []
             for vt in visit_times:
                 if len(closest[vt]) > 10:
@@ -518,10 +768,11 @@ def plot_pdp(results, ages, masks, times, intervention_values,
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    plt.suptitle(f'PDP of {target_name} on ISA15, stratified by baseline age (3C cohort)', fontsize=13)
+    plt.suptitle(f'PDP of {target_name} on ISA15, stratified by age (3C)',
+                 fontsize=13)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"PDP saved to {save_path}")
+    print(f"  → {save_path}")
     plt.close()
 
 
@@ -535,32 +786,28 @@ def plot_pdp_marginal(results, masks, times, intervention_values,
     If ice_results is provided (from compute_pdp_with_blup), plots
     subject-level predictions WITH random effects.
     """
-    masks_np = masks.numpy()
-    times_np = times.numpy()
-
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
 
     fig, ax = plt.subplots(figsize=(10, 6))
     colors = plt.cm.RdYlBu_r(np.linspace(0.15, 0.85, len(intervention_values)))
 
-    N = masks_np.shape[0]
+    N = masks.shape[0]
     rng = np.random.RandomState(seed)
     ice_ids = rng.choice(N, min(ice_n, N), replace=False)
 
-    # Use subject-level predictions if available, else population mean
     ice_source = ice_results if ice_results is not None else results
 
-    # Plot ICE curves (grey)
+    # ICE curves (grey)
     for v in intervention_values:
-        mu = ice_source[v].numpy()
+        mu = ice_source[v]
         for i in ice_ids:
             ice_times, ice_preds = [], []
             for vt in visit_times:
-                obs_idx = np.where(masks_np[i] > 0.5)[0]
+                obs_idx = np.where(masks[i] > 0.5)[0]
                 if len(obs_idx) == 0:
                     continue
-                obs_times = times_np[i, obs_idx]
+                obs_times = times[i, obs_idx]
                 closest = obs_idx[np.argmin(np.abs(obs_times - vt))]
                 ice_times.append(vt)
                 ice_preds.append(mu[i, closest])
@@ -568,10 +815,10 @@ def plot_pdp_marginal(results, masks, times, intervention_values,
                 ax.plot(ice_times, ice_preds, '-', color='grey',
                         alpha=0.08, linewidth=0.5, zorder=1)
 
-    # Plot PDP curves (colored, on top)
+    # PDP curves (colored)
     for v_idx, v in enumerate(intervention_values):
-        mu = results[v].numpy()
-        closest = _closest_obs_per_subject(mu, masks_np, times_np, visit_times)
+        closest = _closest_obs_per_subject(
+            results[v], masks, times, visit_times)
 
         mean_pred, visit_t_plot = [], []
         for vt in visit_times:
@@ -580,42 +827,34 @@ def plot_pdp_marginal(results, masks, times, intervention_values,
                 visit_t_plot.append(vt)
 
         ax.plot(visit_t_plot, mean_pred, 'o-', color=colors[v_idx],
-                label=f'{target_name}={v}', linewidth=2.5, markersize=6, zorder=2)
+                label=f'{target_name}={v}', linewidth=2.5, markersize=6,
+                zorder=2)
 
     ax.set_xlabel('Time (years)')
     ax.set_ylabel('Predicted ISA15')
-    title = f'Marginal PDP of {target_name} on ISA15 (3C cohort)'
+    title = f'Marginal PDP of {target_name} on ISA15 (3C)'
     if ice_results is not None:
-        title += ' + ICE with BLUP (grey)'
-    else:
-        title += ' + ICE (grey)'
+        title += ' + ICE with BLUP'
     ax.set_title(title)
     ax.legend()
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"Marginal PDP saved to {save_path}")
+    print(f"  → {save_path}")
     plt.close()
 
 
 def plot_delta_pdp(results, masks, times, val_lo, val_hi,
                    save_path="delta_pdp.png", visit_times=None,
                    target_name="covariate"):
-    """
-    Plot ΔPDP over time with 95% pointwise confidence bands.
-    """
-    mu_lo = results[val_lo].numpy()
-    mu_hi = results[val_hi].numpy()
-    masks_np = masks.numpy()
-    times_np = times.numpy()
-
-    delta = mu_hi - mu_lo
+    """Plot ΔPDP over time with 95% pointwise confidence bands."""
+    delta = results[val_hi] - results[val_lo]
 
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
 
-    closest = _closest_obs_per_subject(delta, masks_np, times_np, visit_times)
+    closest = _closest_obs_per_subject(delta, masks, times, visit_times)
 
     t_plot, mean_plot, lo_plot, hi_plot = [], [], [], []
     for vt in visit_times:
@@ -629,15 +868,16 @@ def plot_delta_pdp(results, masks, times, val_lo, val_hi,
             hi_plot.append(m + 1.96 * se)
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(t_plot, mean_plot, 'o-', color='firebrick', linewidth=2, markersize=6)
+    ax.plot(t_plot, mean_plot, 'o-', color='firebrick',
+            linewidth=2, markersize=6)
     ax.fill_between(t_plot, lo_plot, hi_plot, color='firebrick', alpha=0.15)
     ax.axhline(0, color='grey', linestyle='--', alpha=0.5)
     ax.set_xlabel('Time (years)')
     ax.set_ylabel(f'ΔPDP ({target_name} {val_lo} → {val_hi})')
-    ax.set_title(f'ΔPDP of {target_name} on ISA15 (3C cohort)')
+    ax.set_title(f'ΔPDP of {target_name} on ISA15 (3C)')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"ΔPDP plot saved to {save_path}")
+    print(f"  → {save_path}")
     plt.close()

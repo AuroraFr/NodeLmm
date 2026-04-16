@@ -1095,12 +1095,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Full-parameter delta method for ∆PDP variance")
-    parser.add_argument("--n_sims", type=int, default=4)
+    parser.add_argument("--n_sims", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--true_beta_bmi", type=float, default=-0.30)
     parser.add_argument("--true_beta_int", type=float, default=-0.05)
     parser.add_argument("--output_csv", type=str,
-                        default="results/simulation_baseline_summary.csv")
+                        default="results/simulation_baseline_nonorm_diagD_summary_2328.csv")
     parser.add_argument("--bmi_pairs", type=str, default=None)
     parser.add_argument("--sandwich", action="store_true",
                         help="Use sandwich variance J⁻¹FJ⁻¹ instead of F⁻¹")
@@ -1108,9 +1108,9 @@ if __name__ == "__main__":
                         help="Subsample N subjects for Hessian (e.g. 500).")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                         help="Weight decay used during training (added to J)")
-    parser.add_argument("--lambda_reg", type=float, default=0.1,
+    parser.add_argument("--lambda_reg", type=float, default=0.0,
                         help="Skip penalty coefficient (skip_gate or group_lasso)")
-    parser.add_argument("--reg_mode", type=str, default="skip_gate",
+    parser.add_argument("--reg_mode", type=str, default=None,
                         choices=[None, "skip_gate", "group_lasso"],
                         help="Regularisation mode for skip connection")
     args = parser.parse_args()
@@ -1149,13 +1149,13 @@ if __name__ == "__main__":
     for sim_idx in range(start_sim, args.n_sims):
         if args.n_sims > 1:
             data_path = f"simu_datasets/S2a_sims/sim_{sim_idx+1:03d}.rds"
-            ckpt_path = f"checkpoints/simulation_baseline_skipgate/best_model_ode_{sim_idx}.pt"
+            ckpt_path = f"checkpoints/simulation_baseline_skipgate_norhonorm_diagoD/best_model_ode_{sim_idx}.pt"
             print(f"\n{'#'*60}")
             print(f"# SIMULATION {sim_idx}")
             print(f"{'#'*60}")
         else:
             data_path = "simu_datasets/S2a_sims/sim_001.rds"
-            ckpt_path = "checkpoints/simulation_baseline_skipgate/best_model_ode_0.pt"
+            ckpt_path = "checkpoints/simulation_baseline_skipgate_norhonorm_diagoD/best_model_ode_0.pt"
 
         # --- Data ---
         df = next(iter(pyreadr.read_r(data_path).values()))
@@ -1178,7 +1178,7 @@ if __name__ == "__main__":
         model = NeuralODEModel(
             x_dim=len(x_cols), static_dim=len(static_cols), cfg=cfg,
             n_tv=1, use_rho_net=True, use_neural_re=True,
-            re_spline_cols=None, g_hidden=16, fullD=True,
+            re_spline_cols=None, g_hidden=16, fullD=False,
             bmi_mean=0.0, bmi_std=1.0, static_skip_dims=[1],
             reg_mode=args.reg_mode,
         ).to(device)
@@ -1268,7 +1268,7 @@ if __name__ == "__main__":
         writer.writerows(csv_rows)
     print(f"\nCSV saved to {args.output_csv}")
 
-    # Clean up checkpoint after successful completion
-    if os.path.exists(ckpt_file):
-        os.remove(ckpt_file)
-        print(f"Checkpoint removed (all simulations complete).")
+    # # Clean up checkpoint after successful completion
+    # if os.path.exists(ckpt_file):
+    #     os.remove(ckpt_file)
+    #     print(f"Checkpoint removed (all simulations complete).")

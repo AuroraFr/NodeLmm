@@ -288,12 +288,25 @@ def compute_gamma_vectors(rho_hi: torch.Tensor,
 
 @torch.no_grad()
 def _accumulate_fisher_per_batch(rho_batch, Z_re_batch, D, sig2, mask_batch,
-                                  jitter=1e-4):
-    """Accumulate Fisher contribution for one batch (variable T per batch is OK)."""
+                                  jitter=1e-4,
+                                  y_batch=None, beta=None):
+    """
+    Accumulate Fisher contribution for one batch (variable T per batch is OK).
+
+    If y_batch and beta are provided, also accumulates the sandwich meat:
+        M = Σ_i s_i s_iᵀ   where  s_i = X̂_iᵀ V_i⁻¹ (Y_i − X̂_i β)
+
+    Returns:
+        I_acc:  (p, p) — Fisher contribution
+        M_acc:  (p, p) — Meat contribution (or None if y_batch/beta not given)
+    """
     N, T, p = rho_batch.shape
     device = rho_batch.device
     dtype = rho_batch.dtype
     I_acc = torch.zeros(p, p, device=device, dtype=dtype)
+
+    compute_meat = (y_batch is not None) and (beta is not None)
+    M_acc = torch.zeros(p, p, device=device, dtype=dtype) if compute_meat else None
 
     for i in range(N):
         idx = mask_batch[i].bool()
@@ -311,9 +324,22 @@ def _accumulate_fisher_per_batch(rho_batch, Z_re_batch, D, sig2, mask_batch,
         except torch.linalg.LinAlgError:
             V_inv_rho = torch.linalg.solve(V_i, rho_i)
 
+        # Fisher: X̂_iᵀ V_i⁻¹ X̂_i
         I_acc += rho_i.t() @ V_inv_rho
 
-    return I_acc
+        # Sandwich meat: s_i s_iᵀ  where s_i = X̂_iᵀ V_i⁻¹ r_i
+        if compute_meat:
+            y_i = y_batch[i, idx]                # (n_i,)
+            r_i = y_i - rho_i @ beta             # (n_i,)  residual
+            # V_i⁻¹ r_i
+            try:
+                V_inv_r = torch.cholesky_solve(r_i.unsqueeze(-1), L_i).squeeze(-1)
+            except Exception:
+                V_inv_r = torch.linalg.solve(V_i, r_i)
+            s_i = rho_i.t() @ V_inv_r            # (p,)  per-subject score
+            M_acc += s_i.unsqueeze(1) * s_i.unsqueeze(0)  # outer product
+
+    return I_acc, M_acc
 
 
 @torch.no_grad()
@@ -383,17 +409,20 @@ def compute_delta_pdp_variance(
     q = model.decoder.q
     dec = model.decoder
 
-    # --- Pass 1: accumulate Fisher I(β) and collect AGEc for true ∆PDP ---
+    # --- Pass 1: accumulate Fisher I(β) and sandwich meat M(β) ---
     I_beta = torch.zeros(p, p, device='cpu')
+    M_beta = torch.zeros(p, p, device='cpu')     # sandwich meat
     all_ages = []     # for computing mean(AGEc) later
     N_total = 0
     D_cpu = None
     sig2_cpu = None
 
+    beta_neural = model.decoder.beta_neural.detach().cpu()
+
     print(f"\n{'='*60}")
-    print(f"LAST-LAYER VARIANCE FOR ∆PDP")
+    print(f"LAST-LAYER VARIANCE FOR ∆PDP (Fisher + Sandwich)")
     print(f"{'='*60}")
-    print(f"Pass 1: Fisher information I(β)...")
+    print(f"Pass 1: Fisher I(β) and sandwich meat M(β)...")
 
     for batch in dataloader:
         _, t_pad, x_pad, y_pad, c_mask, mask, s = batch
@@ -403,16 +432,19 @@ def compute_delta_pdp_variance(
             model, t_pad, x_pad, s, mask, bmi_t=bmi_t
         )
 
-        # Accumulate Fisher on CPU
+        # Accumulate Fisher and meat on CPU
         rho_cpu = rho.cpu()
         Z_re_cpu = Z_re.cpu()
         D_cpu = D.cpu()
         sig2_cpu = sig2.cpu()
         mask_cpu = mask.cpu()
+        y_cpu = y_pad.cpu()
 
-        I_batch = _accumulate_fisher_per_batch(
-            rho_cpu, Z_re_cpu, D_cpu, sig2_cpu, mask_cpu)
+        I_batch, M_batch = _accumulate_fisher_per_batch(
+            rho_cpu, Z_re_cpu, D_cpu, sig2_cpu, mask_cpu,
+            y_batch=y_cpu, beta=beta_neural)
         I_beta += I_batch
+        M_beta += M_batch
 
         # Collect AGEc (column 1 of static)
         all_ages.append(s[:, 1].cpu())
@@ -426,16 +458,21 @@ def compute_delta_pdp_variance(
     print(f"  σ² = {sig2_cpu.item():.6f}")
     print(f"  I(β) condition number: {torch.linalg.cond(I_beta).item():.2e}")
 
-    # Var(β) = I(β)⁻¹
+    # Var_fisher(β) = I(β)⁻¹
     try:
-        var_beta = torch.linalg.inv(I_beta)
+        I_beta_inv = torch.linalg.inv(I_beta)
     except torch.linalg.LinAlgError:
         print("  WARNING: Fisher not invertible, using pseudo-inverse")
-        var_beta = torch.linalg.pinv(I_beta)
+        I_beta_inv = torch.linalg.pinv(I_beta)
 
-    beta_neural = model.decoder.beta_neural.detach().cpu()
+    var_beta_fisher = I_beta_inv
+
+    # Var_sandwich(β) = I(β)⁻¹ · M · I(β)⁻¹
+    var_beta_sandwich = I_beta_inv @ M_beta @ I_beta_inv
+
     print(f"  β_neural = {beta_neural.tolist()}")
-    print(f"  SE(β_neural) = {torch.sqrt(torch.diag(var_beta)).tolist()}")
+    print(f"  SE_fisher(β)   = {torch.sqrt(torch.diag(var_beta_fisher)).tolist()}")
+    print(f"  SE_sandwich(β) = {torch.sqrt(torch.diag(var_beta_sandwich)).tolist()}")
 
     # --- Pass 2: counterfactual ρ → accumulate γ vectors ---
     print(f"\nPass 2: counterfactual ρ and γ vectors...")
@@ -473,13 +510,13 @@ def compute_delta_pdp_variance(
             gammas[vt] = torch.zeros(p)
         print(f"  t={vt}: n_obs={n_vt}, ||γ||={gammas[vt].norm().item():.4f}")
 
-    # --- Step 3: Var(∆PDP) = γᵀ Var(β) γ ---
+    # --- Step 3: Var(∆PDP) = γᵀ Var(β) γ  [both Fisher and Sandwich] ---
     delta_v = bmi_hi - bmi_lo
     results = {}
 
-    print(f"\n  {'Time':>6s}  {'∆PDP_est':>10s}  {'SE':>10s}  "
+    print(f"\n  {'Time':>6s}  {'∆PDP_est':>10s}  {'SE_fish':>10s}  {'SE_sand':>10s}  "
           f"{'CI_lo':>10s}  {'CI_hi':>10s}  {'True':>10s}  {'Bias':>10s}")
-    print(f"  {'-'*72}")
+    print(f"  {'-'*84}")
 
     for vt in visit_times:
         gamma = gammas[vt]                              # (p,)
@@ -487,11 +524,16 @@ def compute_delta_pdp_variance(
         # ∆PDP estimate = γᵀ β
         delta_pdp_est = (gamma * beta_neural).sum().item()
 
-        # Variance = γᵀ Var(β) γ
-        var_delta = (gamma @ var_beta @ gamma).item()
-        se_delta = np.sqrt(max(var_delta, 0.0))
+        # Fisher variance = γᵀ I(β)⁻¹ γ
+        var_fisher = (gamma @ var_beta_fisher @ gamma).item()
+        se_fisher = np.sqrt(max(var_fisher, 0.0))
 
-        # 95% CI
+        # Sandwich variance = γᵀ I(β)⁻¹ M I(β)⁻¹ γ
+        var_sandwich = (gamma @ var_beta_sandwich @ gamma).item()
+        se_sandwich = np.sqrt(max(var_sandwich, 0.0))
+
+        # Use SANDWICH as the primary SE for CI
+        se_delta = se_sandwich
         ci_lo = delta_pdp_est - 1.96 * se_delta
         ci_hi = delta_pdp_est + 1.96 * se_delta
 
@@ -502,7 +544,9 @@ def compute_delta_pdp_variance(
 
         results[vt] = {
             'estimate': delta_pdp_est,
-            'se': se_delta,
+            'se': se_delta,               # sandwich SE (primary)
+            'se_fisher': se_fisher,
+            'se_sandwich': se_sandwich,
             'ci_lo': ci_lo,
             'ci_hi': ci_hi,
             'true': true_delta,
@@ -510,17 +554,21 @@ def compute_delta_pdp_variance(
             'gamma': gamma.numpy(),
         }
 
-        print(f"  {vt:6.0f}  {delta_pdp_est:+10.4f}  {se_delta:10.4f}  "
+        print(f"  {vt:6.0f}  {delta_pdp_est:+10.4f}  {se_fisher:10.4f}  {se_sandwich:10.4f}  "
               f"{ci_lo:+10.4f}  {ci_hi:+10.4f}  {true_delta:+10.4f}  {bias:+10.4f}")
 
     print(f"\n  Mean AGEc = {mean_age:.4f}")
     print(f"  True formula: ∆PDP = Δv × (β_BMI + β_int × mean_AGEc)")
     print(f"               = {delta_v} × ({true_beta_bmi} + {true_beta_int} × {mean_age:.4f})")
     print(f"               = {true_delta:.4f}")
+    print(f"\n  Note: CIs use sandwich SE (accounts for upstream misspecification).")
+    print(f"  Fisher SE is reported for comparison.")
 
     return {
-        'var_beta': var_beta.numpy(),
+        'var_beta_fisher': var_beta_fisher.numpy(),
+        'var_beta_sandwich': var_beta_sandwich.numpy(),
         'fisher': I_beta.numpy(),
+        'meat': M_beta.numpy(),
         'results': results,
         'beta_neural': beta_neural.numpy(),
         'gammas': {vt: g.numpy() for vt, g in gammas.items()},
@@ -721,44 +769,57 @@ if __name__ == "__main__":
 
     csv_rows = []
     header = ['time', 'BMI_lo', 'BMI_hi', 'D', 'mean_hat', 'mean_true',
-              'bias', 'var_mc', 'mean_var_est', 'mse', 'rmse', 'coverage95']
+              'bias', 'var_mc', 'var_fisher', 'var_sandwich', 'mse', 'rmse',
+              'coverage95_fisher', 'coverage95_sandwich']
 
-    print(f"\n{'='*90}")
+    print(f"\n{'='*110}")
     print(f"AGGREGATED RESULTS — Last-Layer Variance (D={args.n_sims} simulations)")
-    print(f"{'='*90}")
+    print(f"{'='*110}")
     print(f"{'time':>4s} {'lo':>4s} {'hi':>4s} {'D':>3s}  {'mean_hat':>10s} {'mean_true':>10s} "
-          f"{'bias':>8s}  {'var_mc':>10s} {'var_est':>10s} {'mse':>10s} {'cov95':>6s}")
-    print(f"{'-'*85}")
+          f"{'bias':>8s}  {'var_mc':>10s} {'var_fish':>10s} {'var_sand':>10s} "
+          f"{'cov_fish':>8s} {'cov_sand':>8s}")
+    print(f"{'-'*105}")
 
     for (bmi_lo, bmi_hi), results_list in all_pair_results.items():
         D = len(results_list)
 
         for vt in visit_times:
             estimates = [r['results'][vt]['estimate'] for r in results_list]
-            ses = [r['results'][vt]['se'] for r in results_list]
+            ses_fish = [r['results'][vt]['se_fisher'] for r in results_list]
+            ses_sand = [r['results'][vt]['se_sandwich'] for r in results_list]
             trues = [r['results'][vt]['true'] for r in results_list]
             ci_los = [r['results'][vt]['ci_lo'] for r in results_list]
             ci_his = [r['results'][vt]['ci_hi'] for r in results_list]
 
             est_arr = np.array(estimates)
-            se_arr = np.array(ses)
+            se_fish_arr = np.array(ses_fish)
+            se_sand_arr = np.array(ses_sand)
             true_val = np.mean(trues)
 
             mean_hat = est_arr.mean()
             bias = mean_hat - true_val
             var_mc = est_arr.var(ddof=1) if D > 1 else float('nan')
-            mean_var_est = (se_arr ** 2).mean()
+            var_fisher = (se_fish_arr ** 2).mean()
+            var_sandwich = (se_sand_arr ** 2).mean()
             mse = (bias ** 2 + var_mc) if D > 1 else float('nan')
             rmse = np.sqrt(mse) if D > 1 else float('nan')
 
-            # Coverage
+            # Coverage (Fisher-based CIs)
             if D > 1:
-                coverage = np.mean([
+                ci_fish_los = [e - 1.96 * s for e, s in zip(estimates, ses_fish)]
+                ci_fish_his = [e + 1.96 * s for e, s in zip(estimates, ses_fish)]
+                coverage_fisher = np.mean([
+                    lo <= true_val <= hi
+                    for lo, hi in zip(ci_fish_los, ci_fish_his)
+                ])
+                # Coverage (Sandwich-based CIs) — these are the ci_lo/ci_hi stored
+                coverage_sandwich = np.mean([
                     lo <= true_val <= hi
                     for lo, hi in zip(ci_los, ci_his)
                 ])
             else:
-                coverage = float('nan')
+                coverage_fisher = float('nan')
+                coverage_sandwich = float('nan')
 
             row = {
                 'time': int(vt),
@@ -769,21 +830,23 @@ if __name__ == "__main__":
                 'mean_true': true_val,
                 'bias': bias,
                 'var_mc': var_mc,
-                'mean_var_est': mean_var_est,
+                'var_fisher': var_fisher,
+                'var_sandwich': var_sandwich,
                 'mse': mse,
                 'rmse': rmse,
-                'coverage95': coverage,
+                'coverage95_fisher': coverage_fisher,
+                'coverage95_sandwich': coverage_sandwich,
             }
             csv_rows.append(row)
 
             # Print
             vm_str = f"{var_mc:.6f}" if not np.isnan(var_mc) else "NA"
-            mse_str = f"{mse:.6f}" if not np.isnan(mse) else "NA"
-            cov_str = f"{coverage:.2f}" if not np.isnan(coverage) else "NA"
+            cov_f_str = f"{coverage_fisher:.2f}" if not np.isnan(coverage_fisher) else "NA"
+            cov_s_str = f"{coverage_sandwich:.2f}" if not np.isnan(coverage_sandwich) else "NA"
             print(f"{int(vt):4d} {int(bmi_lo):4d} {int(bmi_hi):4d} {D:3d}  "
                   f"{mean_hat:+10.4f} {true_val:+10.4f} {bias:+8.4f}  "
-                  f"{vm_str:>10s} {mean_var_est:10.6f} "
-                  f"{mse_str:>10s} {cov_str:>6s}")
+                  f"{vm_str:>10s} {var_fisher:10.6f} {var_sandwich:10.6f} "
+                  f"{cov_f_str:>8s} {cov_s_str:>8s}")
 
     # Write CSV
     with open(args.output_csv, 'w', newline='') as f:
@@ -792,5 +855,4 @@ if __name__ == "__main__":
         writer.writerows(csv_rows)
 
     print(f"\nCSV saved to {args.output_csv}")
-    print(f"Format matches LMM output: time,BMI_lo,BMI_hi,D,mean_hat,mean_true,"
-          f"bias,var_mc,mean_var_est,mse,rmse,coverage95")
+    print(f"Columns: {','.join(header)}")

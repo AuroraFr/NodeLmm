@@ -88,8 +88,8 @@ class ODEFunc(nn.Module):
         
         self.net = MLP(
             # in_dim=hidden_channels + 1 + static_dim + 1,
-            in_dim=hidden_channels + 1 + 1,
-            # in_dim=hidden_channels + 1,
+            # in_dim=hidden_channels + 1 + 1,
+            in_dim=hidden_channels + 1,
             hidden_dim=mlp_hidden,
             out_dim=hidden_channels,
             depth=depth, dropout=dropout, activation=activation,
@@ -112,7 +112,9 @@ class ODEFunc(nn.Module):
         else:
             t_expanded = t_scalar
 
-        inp = torch.cat([z, t_expanded, bmi_t], dim=-1)
+        # inp = torch.cat([z, t_expanded, bmi_t, static], dim=-1)
+        # inp = torch.cat([z, t_expanded, bmi_t], dim=-1)
+        inp = torch.cat([z, t_expanded], dim=-1)
         return torch.tanh(self.net(inp))
 
 
@@ -199,7 +201,7 @@ class Decoder(nn.Module):
             # Single network: [z(t), skip (possibly gated)] → R^p → scalar
             self.rho_net = MLP(latent_dim + skip_dim, rho_hidden, p,
                                depth=2, dropout=0.0)
-            self.rho_norm = nn.LayerNorm(p)
+            # self.rho_norm = nn.LayerNorm(p)
             self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
         else:
             self.rho_net = None
@@ -334,7 +336,7 @@ class Decoder(nn.Module):
 
         if self.use_rho_net:
             rho = self.rho_net(rho_input)
-            rho = self.rho_norm(rho)
+            # rho = self.rho_norm(rho)
             mu = (rho * self.beta_neural).sum(dim=-1)
         else:
             mu = (rho_input * self.w_neural).sum(dim=-1)

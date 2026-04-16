@@ -2,23 +2,40 @@
 Preprocessing for the 3C cohort real dataset.
 
 Produces per-patient dictionaries with:
-  - x_aug:  (T, 1 + K + K)  = [time, forward-filled covariates, cumulative mask]
-  - t:      (T,)             padded observation times (forward-filled)
-  - y:      (T,)             target values (0 at unobserved slots)
-  - s_i:    (S,)             static covariates
-  - target_mask: (T,)        1 where outcome is observed, 0 otherwise
+  - x_aug:  (T, d_aug) augmented covariate tensor
+  - t:      (T,)       padded observation times
+  - y:      (T,)       target values (0 at unobserved slots)
+  - s_i:    (S,)       static covariates
+  - target_mask: (T,)  1 where outcome is observed, 0 otherwise
   - patient_id:  scalar
+
+The augmented layout:
+  Column 0:            time
+  Columns 1..K:        interpolated/filled dynamic covariates
+  Columns K+1..2K:     observation mask (binary or cumulative, see mask_type)
+
+Interpolation methods:
+  - "ffill":   forward-fill then backward-fill (piecewise constant)
+  - "linear":  per-channel linear interpolation between observed values,
+               with ffill/bfill for extrapolation beyond observed range
+  - "cubic":   per-channel cubic spline interpolation (falls back to linear
+               for channels with < 4 observations)
 
 Key design choices:
   1. Observation indicators are tracked explicitly (not inferred from value == 0).
-  2. Cumulative mask is computed from true observation indicators, BEFORE any filling.
-  3. Forward-fill is applied column-wise; leading NaNs are backward-filled.
+  2. Masks are computed from true observation indicators, BEFORE any filling.
+  3. Interpolation is performed per-channel to handle heterogeneous observation
+     patterns (e.g., BMI at every visit, glucose at 2-3 visits).
+  4. For the ODE encoder, linear interpolation gives continuous x̄_i(t) with
+     piecewise-constant derivative — compatible with future CDE extension.
 """
 
 import numpy as np
 import pandas as pd
 import torch
-from typing import List, Dict, Optional
+import warnings
+from typing import List, Dict, Optional, Literal
+from scipy.interpolate import CubicSpline
 
 
 # ── Canonical visit grid ──────────────────────────────────────────────────────
@@ -65,9 +82,9 @@ def assign_time_slots(times: np.ndarray) -> np.ndarray:
     return slot_indices
 
 
-# ── Forward-fill + backward-fill ─────────────────────────────────────────────
+# ── Interpolation methods ────────────────────────────────────────────────────
 
-def fill_missing(arr: np.ndarray) -> np.ndarray:
+def fill_ffill(arr: np.ndarray) -> np.ndarray:
     """
     Forward-fill then backward-fill a 2D array column-wise.
 
@@ -85,6 +102,124 @@ def fill_missing(arr: np.ndarray) -> np.ndarray:
     return df.values.astype(np.float32)
 
 
+def fill_linear(arr: np.ndarray, grid_times: np.ndarray) -> np.ndarray:
+    """
+    Per-channel linear interpolation between observed values.
+
+    For each feature column k:
+      - Identify slots where the value is truly observed (not NaN).
+      - Linearly interpolate at all grid times between the first and last
+        observed slot.
+      - Extrapolate outside the observed range using the nearest observed
+        value (i.e., constant extrapolation = ffill/bfill at boundaries).
+
+    This gives a continuous x̄_i(t) whose derivative dx/dt is piecewise
+    constant — well-suited as input to an ODE vector field and compatible
+    with future CDE extensions where dz = f(z, x^s) dX.
+
+    Args:
+        arr:        (T, K) array with NaN for missing entries.
+        grid_times: (T,) canonical time values for each slot.
+    Returns:
+        filled: (T, K) with no NaNs remaining.
+    """
+    T, K = arr.shape
+    filled = np.copy(arr)
+
+    for k in range(K):
+        col = arr[:, k]
+        obs_mask = ~np.isnan(col)
+        n_obs = obs_mask.sum()
+
+        if n_obs == 0:
+            # No observations at all — fill with 0 (should not happen in practice)
+            warnings.warn(f"Feature column {k} has no observations; filling with 0.")
+            filled[:, k] = 0.0
+        elif n_obs == 1:
+            # Single observation — constant everywhere
+            filled[:, k] = col[obs_mask][0]
+        else:
+            # Linear interpolation between observed values
+            obs_times = grid_times[obs_mask]
+            obs_vals = col[obs_mask]
+            # np.interp extrapolates with boundary values by default
+            filled[:, k] = np.interp(grid_times, obs_times, obs_vals)
+
+    return filled.astype(np.float32)
+
+
+def fill_cubic(arr: np.ndarray, grid_times: np.ndarray) -> np.ndarray:
+    """
+    Per-channel cubic spline interpolation between observed values.
+
+    For each feature column k:
+      - If >= 4 observations: fit a natural cubic spline (bc_type='natural'),
+        clamped to the observed range to prevent extrapolation oscillation.
+      - If 2-3 observations: fall back to linear interpolation.
+      - If 1 observation: constant everywhere.
+
+    Boundary handling: outside the range [t_first_obs, t_last_obs], the
+    spline is NOT extrapolated (boundary values are held constant) to avoid
+    the wild oscillations that cubic splines produce with sparse data.
+
+    WARNING: For channels with only 2-3 observations across 14 years
+    (e.g., glucose, HDL), this automatically falls back to linear.
+    The cubic option is most useful for densely observed channels (BMI, BP).
+
+    Args:
+        arr:        (T, K) array with NaN for missing entries.
+        grid_times: (T,) canonical time values for each slot.
+    Returns:
+        filled: (T, K) with no NaNs remaining.
+    """
+    T, K = arr.shape
+    filled = np.copy(arr)
+
+    for k in range(K):
+        col = arr[:, k]
+        obs_mask = ~np.isnan(col)
+        n_obs = obs_mask.sum()
+
+        if n_obs == 0:
+            warnings.warn(f"Feature column {k} has no observations; filling with 0.")
+            filled[:, k] = 0.0
+        elif n_obs == 1:
+            filled[:, k] = col[obs_mask][0]
+        elif n_obs < 4:
+            # Too few points for cubic — fall back to linear
+            obs_times = grid_times[obs_mask]
+            obs_vals = col[obs_mask]
+            filled[:, k] = np.interp(grid_times, obs_times, obs_vals)
+        else:
+            # Cubic spline with natural boundary conditions
+            obs_times = grid_times[obs_mask]
+            obs_vals = col[obs_mask]
+            cs = CubicSpline(obs_times, obs_vals, bc_type='natural')
+
+            # Evaluate, but clamp to observed time range to avoid
+            # extrapolation artifacts
+            t_min, t_max = obs_times[0], obs_times[-1]
+
+            for t_idx in range(T):
+                t_val = grid_times[t_idx]
+                if t_val < t_min:
+                    filled[t_idx, k] = obs_vals[0]       # constant left extrap
+                elif t_val > t_max:
+                    filled[t_idx, k] = obs_vals[-1]       # constant right extrap
+                else:
+                    filled[t_idx, k] = cs(t_val)
+
+    return filled.astype(np.float32)
+
+
+# Dispatcher
+INTERP_METHODS = {
+    "ffill": lambda arr, grid_times: fill_ffill(arr),
+    "linear": fill_linear,
+    "cubic": fill_cubic,
+}
+
+
 # ── Main preprocessing function ──────────────────────────────────────────────
 
 def process_data(
@@ -94,6 +229,8 @@ def process_data(
     static_features: List[str],
     target_col: str,
     metabolic_baseline_features: Optional[List[str]] = None,
+    interp_method: Literal["ffill", "linear", "cubic"] = "ffill",
+    mask_type: Literal["cumulative", "binary"] = "cumulative",
 ) -> List[Dict]:
     """
     Preprocess 3C cohort data into padded tensors for the Neural ODE/CDE model.
@@ -108,10 +245,37 @@ def process_data(
         target_col: Column name for the outcome (e.g., "ISA15").
         metabolic_baseline_features: Optional list of baseline metabolic features
                                      to include (e.g., ["HDL0", "GLUC0", "BMI0", "CHOL0"]).
+        interp_method: Interpolation method for time-varying covariates.
+            - "ffill":  forward-fill / backward-fill (piecewise constant)
+            - "linear": per-channel linear interpolation
+            - "cubic":  per-channel cubic spline (falls back to linear if < 4 obs)
+        mask_type: Type of observation mask appended to x_aug.
+            - "cumulative": cumulative_mask[t, k] = number of times feature k
+              has been observed up to and including slot t. Tells the ODE vector
+              field about observation density over history.
+            - "binary": obs_indicator[t, k] = 1 iff feature k was truly measured
+              at slot t. Lets the vector field distinguish measured vs. imputed
+              values at each time step.
 
     Returns:
         all_patient_data: List of per-patient dicts.
+            Each dict contains:
+              x_aug:  (T, 1 + 2K)   augmented covariates
+              t:      (T,)          observation times
+              y:      (T,)          target values
+              s_i:    (S,)          static covariates
+              target_mask: (T,)     observation indicator for target
+              patient_id:  scalar
+              interp_method: str    method used (for provenance)
+              mask_type: str        mask type used (for provenance)
     """
+    if interp_method not in INTERP_METHODS:
+        raise ValueError(
+            f"Unknown interp_method '{interp_method}'. "
+            f"Choose from: {list(INTERP_METHODS.keys())}"
+        )
+
+    interpolate_fn = INTERP_METHODS[interp_method]
     n_slots = len(EXPECTED_TIMES)
     K = len(time_varying_features)
 
@@ -123,15 +287,12 @@ def process_data(
         if df["SEX"].dtype.name == "category":
             df["SEX_code"] = df["SEX"].cat.codes.astype(float)
         else:
-            # Works for int, float, or string — maps unique values to 0/1
             vals = sorted(df["SEX"].dropna().unique())
             df["SEX_code"] = df["SEX"].map({v: float(i) for i, v in enumerate(vals)})
 
     # DIPNIV → DIPNIV_2, DIPNIV_3 (dummy encoding, reference = 1)
     if "DIPNIV" in df.columns:
-        # Normalize level labels to clean integers (handles float like 2.0 → "2")
         dipniv_clean = df["DIPNIV"].astype(float).astype("Int64").astype(str)
-        # Int64 (nullable) keeps NaN as <NA>, str gives "<NA>"
         levels = sorted([l for l in dipniv_clean.unique() if l not in ("<NA>", "nan")])
         for level in levels:
             col_name = f"DIPNIV_{level}"
@@ -209,19 +370,23 @@ def process_data(
             # Note: some features may be NaN even at observed visits
             # (e.g., glucose not measured at T2). This is correctly preserved.
 
-        # ── Cumulative observation mask (computed BEFORE any filling) ─────
+        # ── Observation mask (computed BEFORE any filling/interpolation) ────
         # obs_indicator[t, k] = 1 if feature k was truly observed at slot t
         obs_indicator = (~np.isnan(x_raw)).astype(np.float32)
-        # cumulative_mask[t, k] = number of times feature k observed up to slot t
-        cumulative_mask = np.cumsum(obs_indicator, axis=0).astype(np.float32)
 
-        # ── Forward-fill + backward-fill dynamic features ─────────────────
-        x_filled = fill_missing(x_raw)
+        if mask_type == "binary":
+            mask = obs_indicator
+        else:  # "cumulative"
+            mask = np.cumsum(obs_indicator, axis=0).astype(np.float32)
 
-        # ── Augmented input: [time, x_filled, cumulative_mask] ────────────
+        # ── Interpolate dynamic features ──────────────────────────────────
+        x_interp = interpolate_fn(x_raw, padded_time_filled)
+
+        # ── Augmented input ───────────────────────────────────────────────
+        # Layout: [time | x_interp | mask]
         time_col = padded_time_filled.reshape(-1, 1)     # (T, 1)
-        x_aug = np.concatenate([time_col, x_filled, cumulative_mask], axis=1)
-        # Shape: (T, 1 + K + K)
+        x_aug = np.concatenate([time_col, x_interp, mask], axis=1)
+        # Shape: (T, 1 + K + K) = (T, 1 + 2K)
 
         # ── Static features ──────────────────────────────────────────────
         s_i = patient_df[static_features].iloc[0].values.astype(np.float32)
@@ -234,6 +399,8 @@ def process_data(
             "s_i": torch.tensor(s_i, dtype=torch.float32),
             "target_mask": torch.tensor(target_mask, dtype=torch.float32),
             "patient_id": pid,
+            "interp_method": interp_method,
+            "mask_type": mask_type,
         }
 
         if metabolic_baseline_features is not None:
@@ -245,20 +412,78 @@ def process_data(
     return all_patient_data
 
 
+# ── Utility: describe x_aug layout ───────────────────────────────────────────
+
+def describe_layout(K: int, mask_type: str = "cumulative") -> str:
+    """Return a human-readable description of the x_aug column layout."""
+    mask_label = "cumulative observation mask" if mask_type == "cumulative" \
+        else "binary observation mask"
+    lines = [
+        f"  Column 0:              time",
+        f"  Columns 1..{K}:          interpolated dynamic covariates",
+        f"  Columns {K+1}..{2*K}:        {mask_label}",
+        f"  Total dimension:       {1 + 2 * K}",
+    ]
+    return "\n".join(lines)
+
+
 # ── Usage example ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Example usage (adapt paths and column names to your data)
     print("3C Preprocessing Pipeline")
     print("=" * 50)
     print(f"Canonical time grid: {EXPECTED_TIMES}")
     print()
-    print("Expected x_aug layout for K dynamic features:")
-    print("  Column 0:        time")
-    print("  Columns 1..K:    forward-filled dynamic covariates")
-    print("  Columns K+1..2K: cumulative observation mask")
+
+    K_example = 5  # BMI, PAS, PAD, GLUC, HDL
+    print("Available interpolation methods:")
+    print("  ffill  — forward-fill / backward-fill (piecewise constant)")
+    print("  linear — per-channel linear interpolation (continuous, dX/dt piecewise constant)")
+    print("  cubic  — per-channel cubic spline (smooth, falls back to linear if < 4 obs)")
     print()
-    print("The cumulative mask tells the ODE vector field how many times")
-    print("each covariate channel has been truly observed up to that time.")
-    print("This is especially important for channels like glucose/HDL/LDL")
-    print("that are only measured at 2-3 visits across 14 years.")
+
+    for mt in ["cumulative", "binary"]:
+        print(f"x_aug layout (mask_type='{mt}'):")
+        print(describe_layout(K_example, mask_type=mt))
+        print()
+
+    # ── Quick test with synthetic data ────────────────────────────────────
+    print("Running interpolation sanity check...")
+    print("-" * 40)
+
+    # Simulate a patient with glucose observed at T0 and T7 only
+    grid = EXPECTED_TIMES.copy()
+    x_test = np.full((6, 2), np.nan, dtype=np.float32)
+    # Feature 0 (BMI): observed at T0, T2, T4, T7, T10
+    x_test[0, 0] = 25.0   # T=0
+    x_test[1, 0] = 25.5   # T=2
+    x_test[2, 0] = 26.0   # T=4
+    x_test[3, 0] = 26.5   # T=7
+    x_test[4, 0] = 27.0   # T=10
+    # Feature 1 (GLUC): observed at T0 and T7 only
+    x_test[0, 1] = 5.0    # T=0
+    x_test[3, 1] = 6.5    # T=7
+
+    print(f"  Raw data (NaN = missing):")
+    for s in range(6):
+        print(f"    T={grid[s]:5.1f}  BMI={x_test[s,0]:>6}  GLUC={x_test[s,1]:>6}")
+    print()
+
+    for method in ["ffill", "linear", "cubic"]:
+        fn = INTERP_METHODS[method]
+        result = fn(x_test.copy(), grid)
+        print(f"  {method}:")
+        for s in range(6):
+            print(f"    T={grid[s]:5.1f}  BMI={result[s,0]:6.2f}  GLUC={result[s,1]:6.2f}")
+        print()
+
+    print('Binary observation mask:')
+    obs = (~np.isnan(x_test)).astype(int)
+    for s in range(6):
+        print(f'    T={grid[s]:5.1f}  BMI={obs[s,0]}  GLUC={obs[s,1]}')
+    print()
+
+    print('Cumulative observation mask:')
+    cum = np.cumsum(obs, axis=0)
+    for s in range(6):
+        print(f'    T={grid[s]:5.1f}  BMI={cum[s,0]}  GLUC={cum[s,1]}')

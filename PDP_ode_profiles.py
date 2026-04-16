@@ -15,11 +15,12 @@ import argparse
 import os
 
 from dataset import LongitudinalDataset, collate_pad
-from model_ODE import NeuralODEModel, NeuralODEConfig
+from model_ODE_torchdiff import NeuralODEModel, NeuralODEConfig
 from PDP_analysis_profiles_ODE import (
     compute_pdp_profiles,
     compute_profile_diagnostic,
     compute_skip_ablation,
+    _get_closest_preds_windowed,
     plot_profiles,
     plot_pdp_profiles,
     plot_skip_ablation,
@@ -32,15 +33,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="S5 profile PDP diagnostic")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_full_S5_0.pt")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder/best_model_ode_0.pt")
     parser.add_argument("--data", type=str,
                         default="simu_datasets/S5_sims/sim_001.rds")
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--bmi_lo", type=float, default=22.0)
-    parser.add_argument("--bmi_hi", type=float, default=30.0)
+    parser.add_argument("--bmi_lo", type=float, default=20.0)
+    parser.add_argument("--bmi_hi", type=float, default=28.0)
     parser.add_argument("--true_coeff", type=float, default=-0.05,
                         help="True h5 coefficient: h5(t) = coeff * integral BMI(tau) dtau")
-    parser.add_argument("--prefix", type=str, default="figures/s5_profiles_oracle")
+    parser.add_argument("--prefix", type=str, default="figures/s5_profiles_noskip")
     parser.add_argument("--ablation", action="store_true",
                         help="Run skip ablation test")
     args = parser.parse_args()
@@ -78,6 +79,7 @@ if __name__ == "__main__":
         depth=2,
         dropout=0.0,
         euler_steps_per_interval=4,
+        ode_solver='rk4'
     )
 
     model = NeuralODEModel(
@@ -87,13 +89,14 @@ if __name__ == "__main__":
         n_tv=1,
         use_rho_net=True,
         use_neural_re=True,
-        re_spline_cols=[1, 2],
+        re_spline_cols=None,
         g_hidden=16,
-        fullD=True,
+        fullD=False,
         bmi_mean=0.0,
         bmi_std=1.0,
         use_bmi_skip=False,
         static_skip_dims=None,
+        reg_mode=None
     ).to(device)
 
     # ---- Load checkpoint ----
@@ -124,7 +127,7 @@ if __name__ == "__main__":
                              shuffle=False, collate_fn=collate_pad)
 
     # ---- Visit times (adapt to your simulation) ----
-    visit_times = np.array([0, 5, 10, 15])
+    visit_times = np.array([0, 4, 8, 10])
 
     # ================================================================
     # 1. Compute PDP for all profiles
@@ -234,30 +237,23 @@ if __name__ == "__main__":
         masks_np = masks.numpy()
         times_np = times.numpy()
         for vt in visit_times:
-            # Model predictions
-            for prof_name in ["stable_high", "stable_low"]:
-                mu_np = results[prof_name].numpy()
-                preds = []
-                for i in range(mu_np.shape[0]):
-                    obs_idx = np.where(masks_np[i] > 0.5)[0]
-                    if len(obs_idx) == 0:
-                        continue
-                    obs_times = times_np[i, obs_idx]
-                    closest = obs_idx[np.argmin(np.abs(obs_times - vt))]
-                    preds.append(mu_np[i, closest])
-                if prof_name == "stable_high":
-                    mean_hi = np.mean(preds)
-                else:
-                    mean_lo = np.mean(preds)
+            preds_hi, times_hi = _get_closest_preds_windowed(
+                results["stable_high"].numpy(), masks_np, times_np, vt)
+            preds_lo, times_lo = _get_closest_preds_windowed(
+                results["stable_low"].numpy(), masks_np, times_np, vt)
 
-            model_delta = mean_hi - mean_lo
+            if len(preds_hi) > 10:
+                model_delta = preds_hi.mean() - preds_lo.mean()
 
-            # True ΔPDP from oracle integrals
-            obs_any = masks.sum(dim=1) > 1
-            true_delta = args.true_coeff * (args.bmi_hi - args.bmi_lo) * vt
+                # Oracle at each subject's ACTUAL observation time
+                oracle_hi = args.true_coeff * args.bmi_hi * times_hi
+                oracle_lo = args.true_coeff * args.bmi_lo * times_lo
+                true_delta = oracle_hi.mean() - oracle_lo.mean()
 
-            bias = model_delta - true_delta
-            print(f"  {vt:4.0f}  {model_delta:+12.3f}  {true_delta:+12.3f}  {bias:+10.3f}")
+                bias = model_delta - true_delta
+                print(f"  t={vt:5.1f}  n={len(preds_hi):4d}  "
+                    f"Model={model_delta:+.3f}  Oracle={true_delta:+.3f}  "
+                    f"Bias={bias:+.3f}")
 
         # Final interpretation
         latest = max(diagnostic.keys())

@@ -233,8 +233,7 @@ def compute_pdp_profiles(model, loader, device, bmi_lo=22.0, bmi_hi=30.0,
                     t_b, x_cf, masks=None,
                     static_covariates=s_b,
                     bmi_t=bmi_t_cf,
-                    obs_mask=m_b,
-                    y_pad=None,
+                    obs_mask=m_b
                 )
                 all_mu.append(mu.cpu())
 
@@ -298,7 +297,7 @@ def compute_profile_diagnostic(results, integrals, masks, times, ages,
         n_obs = 0
         for name in profiles_to_compare:
             mu_np = results[name].numpy()
-            preds = _get_closest_preds(mu_np, masks_np, times_np, vt)
+            preds, _  = _get_closest_preds_windowed(mu_np, masks_np, times_np, vt)
             profile_means[name][vt] = preds
             if len(preds) > 0:
                 print(f"  {preds.mean():16.3f}", end="")
@@ -667,6 +666,30 @@ def plot_skip_ablation(results_full, results_ablated, masks, times,
 # Helpers
 # ─────────────────────────────────────────────
 
+def _get_closest_preds_windowed(mu_np, masks_np, times_np, vt, 
+                                 max_dist=1.5):
+    """
+    Get predictions for subjects with an observation within 
+    max_dist years of target time vt.
+    
+    Returns:
+        preds:      array of predictions
+        actual_times: array of actual observation times (for oracle correction)
+    """
+    N = mu_np.shape[0]
+    preds, actual_times = [], []
+    for i in range(N):
+        obs_idx = np.where(masks_np[i] > 0.5)[0]
+        if len(obs_idx) == 0:
+            continue
+        obs_times = times_np[i, obs_idx]
+        dists = np.abs(obs_times - vt)
+        best = np.argmin(dists)
+        if dists[best] <= max_dist:
+            preds.append(mu_np[i, obs_idx[best]])
+            actual_times.append(obs_times[best])
+    return np.array(preds), np.array(actual_times)
+
 def _get_closest_preds(mu_np, masks_np, times_np, vt):
     """Get closest prediction to visit time vt for all subjects."""
     N = mu_np.shape[0]
@@ -685,7 +708,7 @@ def _closest_obs_per_subject_arr(mu_np, masks_np, times_np, visit_times):
     """For each visit time, collect closest prediction per subject."""
     result = {}
     for vt in visit_times:
-        result[vt] = _get_closest_preds(mu_np, masks_np, times_np, vt)
+        result[vt], _ = _get_closest_preds_windowed(mu_np, masks_np, times_np, vt)
     return result
 
 

@@ -28,9 +28,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PDP analysis for Neural ODE model")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_baseline_skipgate/best_model_ode_4.pt")
+                        default="checkpoints/simulation_baseline_skipgate/best_model_ode_8.pt")
     parser.add_argument("--data", type=str,
-                        default="simu_datasets/S2a_sims/sim_005.rds")
+                        default="simu_datasets/S2a_sims/sim_009.rds")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--bmi_mode", type=str, default="constant",
                         choices=["constant", "linear", "shifted"])
@@ -92,7 +92,7 @@ if __name__ == "__main__":
         bmi_mean=0.0,   # placeholder — overwritten by checkpoint
         bmi_std=1.0,
         static_skip_dims=[1],
-        reg_mode='skip_gate'
+        reg_mode=None
     ).to(device)
 
     # ---- Load checkpoint ----
@@ -112,6 +112,7 @@ if __name__ == "__main__":
     # Verify BMI stats loaded correctly
     print(f"  bmi_mean = {model.decoder.bmi_mean.item():.4f}")
     print(f"  bmi_std  = {model.decoder.bmi_std.item():.4f}")
+    print(model.decoder.skip_gate_logit)
 
     # ---- Print model parameters ----
     model.eval()

@@ -23,7 +23,7 @@ import numpy as np
 import pyreadr
 import pandas as pd
 from dataset import LongitudinalDataset, collate_pad
-from model_ODE_skipgate import NeuralODEModel, NeuralODEConfig
+from model_ODE_torchdiff import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
 import argparse
 
@@ -35,9 +35,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Neural ODE-LMM training")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_baseline_skipgate_norhonorm_diagoD_q6")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder")
     parser.add_argument("--data", type=str,
-                        default="simu_datasets/S2a_sims")
+                        default="simu_datasets/S5_sims")
     args = parser.parse_args()
 
     # ---- Config ----
@@ -112,11 +112,12 @@ if __name__ == "__main__":
             enc_mlp_hidden=32,
             func_mlp_hidden=32,
             dec_rho_hidden=16,
-            dec_p=6,
+            dec_p=4,
             dec_q=3,                      # q=3: intercept + rs1 + rs2
             depth=2,
             dropout=0.0,
             euler_steps_per_interval=4,
+            ode_solver='rk4'
         )
 
         # static_skip_dims=[1] passes AGEc directly to decoder
@@ -133,12 +134,12 @@ if __name__ == "__main__":
             fullD=False,
             bmi_mean=bmi_mean,
             bmi_std=bmi_std,
-            use_bmi_skip=True,
-            static_skip_dims=[1],         # AGEc skip to decoder
+            use_bmi_skip=False,
+            static_skip_dims=None,         # AGEc skip to decoder
             reg_mode=None
         ).to(device)
 
-        LAMBDA_REG = 0.05
+        LAMBDA_REG = 0.5
 
         total_params = sum(p.numel() for p in model.parameters())
         print(f"\nTotal parameters: {total_params}")

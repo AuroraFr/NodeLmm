@@ -12,14 +12,17 @@ from torch.utils.data import DataLoader
 import numpy as np
 import pandas as pd
 import argparse
+import os
 
-from Preprocess_3C import process_data
+from Preprocess_3C import process_data, EXPECTED_TIMES
 from train_ODE_real import RealDataset, collate_real
 from model_ODE_real import NeuralODEModel, NeuralODEConfig
 from PDP_analysis_ODE_real import (
     compute_pdp, compute_pdp_with_blup,
     plot_pdp, plot_pdp_marginal, plot_delta_pdp,
     compute_delta_pdp, compute_delta_pdp_stratified,
+    make_profiles, compute_trajectory_profile_pdp,
+    plot_trajectory_profile_pdp,
     VISIT_TIMES_3C,
 )
 
@@ -30,9 +33,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PDP analysis — real 3C dataset")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C.pt")
+                        default="checkpoints/best_model_ode_real_3C_skipgate.pt")
     parser.add_argument("--data", type=str,
-                        default="3C_dataset/train_3C_data.csv")
+                        default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--mode", type=str, default="constant",
                         choices=["constant", "linear", "shifted"],
@@ -46,21 +49,43 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---- Feature definitions (must match training) ----
+    # ── Load checkpoint ─────────────────────────────────────────────────
+    checkpoint = torch.load(args.checkpoint, map_location=device,
+                            weights_only=False)
+    ckpt_cfg = checkpoint['config']
+
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"  epoch     = {checkpoint.get('epoch', '?')}")
+    print(f"  test loss = {checkpoint.get('best_test_loss', '?'):.4f}")
+
+    # ── Feature definitions from checkpoint ─────────────────────────────
     id_col = "NUM_ID"
     target_col = "ISA15"
-    time_varying_features = ["BMI", "PAS", "PAD", "GLUC", "HDL"]
-    static_features = ["SEX_code", "AGEc", "DIPNIV_2", "DIPNIV_3"]
+    time_varying_features = ckpt_cfg['time_varying_features']
+    static_features = ckpt_cfg['static_features']
     K = len(time_varying_features)
-    S = len(static_features)
+    Ks = len(static_features)
+    interp_method = ckpt_cfg.get('interp_method', 'ffill')
+    mask_type = ckpt_cfg.get('mask_type', 'cumulative')
 
-    # ---- Load and preprocess ----
-    print("Loading 3C dataset...")
+    cov_means = checkpoint['cov_means']
+    cov_stds = checkpoint['cov_stds']
+
+    print(f"  Covariates: {time_varying_features}")
+    print(f"  Statics:    {static_features}")
+    print(f"  Interp:     {interp_method}, mask: {mask_type}")
+    for k, feat in enumerate(time_varying_features):
+        print(f"    {feat:>6s}: mean={cov_means[k]:.4f}, std={cov_stds[k]:.4f}")
+
+    # ── Load and preprocess ─────────────────────────────────────────────
+    print(f"\nLoading 3C dataset...")
     df = pd.read_csv(args.data)
 
     if "AGEc" not in df.columns:
-        baseline_age = df.groupby(id_col)["AGE0"].transform("first")
-        df["AGEc"] = baseline_age - baseline_age.mean()
+        all_df = pd.read_csv("3C_dataset/data_3C.csv")
+        baseline_age = all_df.groupby(id_col)["AGE0"].transform("first")
+        baseline_age_mean = baseline_age.mean()
+        df["AGEc"] = df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
 
     patient_data = process_data(
         df=df,
@@ -68,91 +93,82 @@ if __name__ == "__main__":
         time_varying_features=time_varying_features,
         static_features=static_features,
         target_col=target_col,
+        interp_method=interp_method,
+        mask_type=mask_type,
     )
-    print(f"Preprocessed {len(patient_data)} patients")
+    print(f"  Preprocessed {len(patient_data)} patients")
 
-    # ---- Build dataset and loader ----
-    dataset = RealDataset(patient_data, n_tv=K)
+    # ── Dataset and loader ──────────────────────────────────────────────
+    dataset = RealDataset(patient_data)
     eval_loader = DataLoader(dataset, batch_size=args.batch_size,
                              shuffle=False, collate_fn=collate_real)
 
-    # ---- Load checkpoint ----
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-
-    ckpt_config = checkpoint.get('config', {})
-    ckpt_config = checkpoint.get('config', {})
-    x_mean_list = checkpoint.get('x_mean', None)
-    x_std_list = checkpoint.get('x_std', None)
-    x_mean = torch.tensor(x_mean_list, dtype=torch.float32) if x_mean_list else None
-    x_std = torch.tensor(x_std_list, dtype=torch.float32) if x_std_list else None
-
-    print(f"\nCheckpoint: {args.checkpoint}")
-    print(f"  epoch     = {checkpoint.get('epoch', '?')}")
-    print(f"  test loss = {checkpoint.get('best_test_loss', '?'):.4f}")
-    if x_mean is not None:
-        feat_names = checkpoint.get('time_varying_features', time_varying_features)
-        for k, feat in enumerate(feat_names):
-            print(f"  {feat:>6s}: mean={x_mean[k]:.4f}, std={x_std[k]:.4f}")
-    print(f"  config    = {ckpt_config}")
-
-    # ---- Build model (must match training config) ----
-    n_ode_inject = 2 * K
-
+    # ── Rebuild model from checkpoint ───────────────────────────────────
     cfg = NeuralODEConfig(
-        hidden_channels=ckpt_config.get('hidden_channels', 8),
-        enc_mlp_hidden=32,
-        func_mlp_hidden=32,
-        dec_rho_hidden=16,
-        dec_p=4,
-        dec_q=3,
-        depth=2,
+        hidden_channels=ckpt_cfg['hidden_channels'],
+        enc_mlp_hidden=ckpt_cfg.get('enc_mlp_hidden', 32),
+        func_mlp_hidden=ckpt_cfg.get('func_mlp_hidden', 32),
+        dec_rho_hidden=ckpt_cfg.get('dec_rho_hidden', 16),
+        dec_p=ckpt_cfg.get('dec_p', 4),
+        dec_q=ckpt_cfg.get('dec_q', 3),
+        depth=ckpt_cfg.get('depth', 2),
         dropout=0.0,
-        euler_steps_per_interval=ckpt_config.get('euler_steps', 4),
+        euler_steps_per_interval=ckpt_cfg['euler_steps'],
+        ode_solver=ckpt_cfg.get('ode_solver', 'euler'),
     )
 
     model = NeuralODEModel(
-        x_dim=K,
-        static_dim=S,
-        cfg=cfg,
         n_tv=K,
-        n_ode_inject=n_ode_inject,
-        use_rho_net=ckpt_config.get('use_rho_net', True),
-        use_neural_re=ckpt_config.get('use_neural_re', True),
-        re_spline_cols=None,
+        static_dim=Ks,
+        cfg=cfg,
+        use_rho_net=True,
+        use_neural_re=True,
         g_hidden=16,
-        fullD=True,
-        x_mean=x_mean,
-        x_std=x_std,
-        skip_covariate_cols=ckpt_config.get('skip_covariate_cols', list(range(K))),
-        static_skip_dims=ckpt_config.get('static_skip_dims', list(range(S))),
-        reg_mode=None,   # no regularization at inference
+        fullD=False,
+        cov_means=cov_means,
+        cov_stds=cov_stds,
+        use_dynamic_skip=ckpt_cfg.get('use_dynamic_skip', True),
+        static_skip_dims=ckpt_cfg.get('static_skip_dims', list(range(Ks))),
+        reg_mode=ckpt_cfg.get('reg_mode', None),
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
 
-    # ---- Print model parameters ----
+    # ── Print model info ────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"MODEL PARAMETERS")
     print(f"{'='*60}")
 
     sig2 = torch.exp(model.decoder.log_residual_var).item()
-    print(f"  sigma2 = {sig2:.6f}")
+    D = model.decoder._build_D(device, torch.float32).detach().cpu()
+    beta = model.decoder.beta_neural.detach().cpu()
 
-    bn = model.decoder.beta_neural.detach()
-    print(f"  beta_neural = {bn.cpu().tolist()}")
+    print(f"  σ² = {sig2:.6f}")
+    print(f"  β  = {beta.tolist()}")
+    print(f"  D diag = {D.diag().tolist()}")
 
-    if model.decoder.L_unconstrained is not None:
-        D = model.decoder._build_D(device=torch.device('cpu'), dtype=torch.float32)
-        print(f"  D matrix ({D.shape[0]}x{D.shape[1]}):")
-        for i in range(D.shape[0]):
-            print(f"    [{', '.join(f'{D[i,j]:+.4f}' for j in range(D.shape[1]))}]")
+    if model.decoder.skip_gate_logit is not None:
+        gates = torch.sigmoid(model.decoder.skip_gate_logit).detach().cpu()
+        names = time_varying_features + static_features
+        print(f"  Skip gates:")
+        for g, name in enumerate(names):
+            print(f"    {name:>10s}: {gates[g]:.4f}")
 
-    # ---- PDP Analysis: loop over all covariates ----
+    if hasattr(model.decoder, '_group_col_indices') and \
+       model.decoder.reg_mode == "group_lasso":
+        W = model.decoder.rho_net.net[0].weight.detach().cpu()
+        offset = model.decoder.latent_dim
+        names = time_varying_features + static_features
+        print(f"  Group lasso norms:")
+        for g, cols in enumerate(model.decoder._group_col_indices):
+            W_cols = W[:, [offset + c for c in cols]]
+            print(f"    {names[g]:>10s}: {W_cols.norm(p='fro').item():.4f}")
+
+    # ── PDP Analysis ────────────────────────────────────────────────────
     visit_times = VISIT_TIMES_3C
 
-    # Define intervention grid for each covariate (approximate clinical ranges)
-    # These will be refined once you see the actual data distributions
+    # Intervention grids (approximate clinical ranges)
     INTERVENTION_GRIDS = {
         "BMI":  [20, 23, 26, 29, 32, 35],
         "PAS":  [110, 120, 130, 140, 150, 160],
@@ -161,7 +177,6 @@ if __name__ == "__main__":
         "HDL":  [0.8, 1.0, 1.2, 1.5, 1.8, 2.2],
     }
 
-    # ΔPDP lo/hi for each covariate
     DELTA_RANGES = {
         "BMI":  (20, 35),
         "PAS":  (110, 160),
@@ -170,7 +185,6 @@ if __name__ == "__main__":
         "HDL":  (0.8, 2.2),
     }
 
-    import os
     os.makedirs(os.path.dirname(args.prefix) or ".", exist_ok=True)
     suffix = f"_{args.mode}" if args.mode != "constant" else ""
 
@@ -191,31 +205,40 @@ if __name__ == "__main__":
         print(f"  ΔPDP range: {val_lo} → {val_hi}")
 
         if args.with_blup:
-            results_pop, results_subj, blup, ages, masks, times = compute_pdp_with_blup(
-                model, eval_loader, device, values,
-                target_col=col_idx, mode=args.mode,
-                slope=args.slope, target_name=feat_name,
-            )
+            results_pop, results_subj, blup, ages, masks, times = \
+                compute_pdp_with_blup(
+                    model, eval_loader, device, values,
+                    target_col=col_idx, n_tv=K,
+                    mask_type=mask_type,
+                    mode=args.mode, slope=args.slope,
+                    target_name=feat_name,
+                )
             results = results_pop
 
-            plot_pdp_marginal(results, masks, times, values,
-                              save_path=f"{args.prefix}_{feat_name}_marginal_blup{suffix}.png",
-                              visit_times=visit_times,
-                              ice_results=results_subj, ice_n=100,
-                              target_name=feat_name)
+            plot_pdp_marginal(
+                results, masks, times, values,
+                save_path=f"{args.prefix}_{feat_name}_marginal_blup{suffix}.png",
+                visit_times=visit_times,
+                ice_results=results_subj, ice_n=100,
+                target_name=feat_name,
+            )
         else:
             results, ages, masks, times = compute_pdp(
                 model, eval_loader, device, values,
-                target_col=col_idx, mode=args.mode,
-                slope=args.slope, target_name=feat_name,
+                target_col=col_idx, n_tv=K,
+                mask_type=mask_type,
+                mode=args.mode, slope=args.slope,
+                target_name=feat_name,
             )
 
-            plot_pdp_marginal(results, masks, times, values,
-                              save_path=f"{args.prefix}_{feat_name}_marginal{suffix}.png",
-                              visit_times=visit_times,
-                              target_name=feat_name)
+            plot_pdp_marginal(
+                results, masks, times, values,
+                save_path=f"{args.prefix}_{feat_name}_marginal{suffix}.png",
+                visit_times=visit_times,
+                target_name=feat_name,
+            )
 
-        # Stratified PDP by age
+        # Age-stratified PDP
         plot_pdp(results, ages, masks, times, values,
                  save_path=f"{args.prefix}_{feat_name}_by_age{suffix}.png",
                  visit_times=visit_times, target_name=feat_name)
@@ -227,7 +250,7 @@ if __name__ == "__main__":
             visit_times=visit_times, target_name=feat_name,
         )
 
-        # Stratified ΔPDP
+        # ΔPDP stratified by age
         summary = compute_delta_pdp_stratified(
             results, ages, masks, times,
             val_lo=val_lo, val_hi=val_hi,
@@ -237,8 +260,24 @@ if __name__ == "__main__":
         # ΔPDP plot
         plot_delta_pdp(results, masks, times,
                        val_lo=val_lo, val_hi=val_hi,
-                       save_path=f"{args.prefix}_{feat_name}_delta_pdp{suffix}.png",
+                       save_path=f"{args.prefix}_{feat_name}_delta{suffix}.png",
                        visit_times=visit_times, target_name=feat_name)
+
+        # Trajectory-profile PDP (path-dependence diagnostic)
+        T_grid = len(VISIT_TIMES_3C)
+        profiles = make_profiles(T_grid, v_lo=val_lo, v_hi=val_hi)
+        traj_results, traj_masks, traj_times = compute_trajectory_profile_pdp(
+            model, eval_loader, device, profiles,
+            target_col=col_idx, n_tv=K,
+            mask_type=mask_type,
+            target_name=feat_name,
+        )
+
+        plot_trajectory_profile_pdp(
+            traj_results, traj_masks, traj_times,
+            save_path=f"{args.prefix}_{feat_name}_traj_profile{suffix}.png",
+            visit_times=visit_times, target_name=feat_name,
+        )
 
         all_summaries[feat_name] = {
             "delta_pdp": estimated,
@@ -246,12 +285,13 @@ if __name__ == "__main__":
             "val_lo": val_lo, "val_hi": val_hi,
         }
 
-    # ---- Global summary ----
+    # ── Global summary ──────────────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"SUMMARY — ALL COVARIATES")
     print(f"{'='*60}")
-    print(f"  Model: Neural ODE-LMM (real 3C)")
-    print(f"  Mode: {args.mode}")
+    print(f"  Model: Neural ODE-LMM (3C cohort)")
+    print(f"  Mode:  {args.mode}")
+    print(f"  Reg:   {ckpt_cfg.get('reg_mode', 'None')}")
 
     print(f"\n  {'Covariate':<10s} {'Range':<15s} {'avg ΔPDP':>10s} {'per-unit':>10s}")
     print(f"  {'-'*50}")

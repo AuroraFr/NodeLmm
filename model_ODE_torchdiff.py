@@ -1,5 +1,5 @@
 """
-Neural ODE-LMM with BMI Skip Connection.
+Neural ODE-LMM with BMI Skip Connection (torchdiffeq version).
 
 Architecture:
   - Encoder:  z(0) = Enc(t0, static)
@@ -7,6 +7,12 @@ Architecture:
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural 
   - RE:       Z = g(z(t))
 
+Regularisation modes for skip connections:
+  - None:          standard single rho network, no penalty.
+  - "skip_gate":   learnable sigmoid gate on skip inputs.
+                   Penalty: λ · Σ sigmoid(α_k)  (data-independent, smooth).
+  - "group_lasso": group lasso on first-layer weights connecting to skip inputs.
+                   Penalty: λ · Σ_k ||W_skip_k||_F  (data-independent, smooth when >0).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -16,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 # ─────────────────────────────────────────────
@@ -125,44 +133,43 @@ class Decoder(nn.Module):
                  bmi_mean=0.0, bmi_std=1.0,
                  static_skip_dims=None,
                  use_bmi_skip=True,
-                 reg_mode=None,
-                 p_skip=None):
+                 reg_mode=None):
         """
         Args:
             latent_dim: dimension of z(t)
-            p: fixed-effect basis dimension (rho output for ODE pathway)
+            p: fixed-effect basis dimension (rho output)
             q: random-effect basis dimension
             bmi_mean, bmi_std: for standardizing BMI skip input
             static_skip_dims: list of static covariate dimensions to skip-connect
                               to decoder (e.g., [1] for AGEc). None = no static skip.
             re_spline_cols: column indices in x_pad for RE spline basis
             use_bmi_skip: if False, decoder sees only z(t) — no direct BMI input.
-                          Use False for path-dependent scenarios (S5, S6).
-            reg_mode: None, "l1_skip", or "grad_penalty".
-                None:           standard decoder, single rho network.
-                "l1_skip":      single rho network, penalty on |mu_full - mu_no_skip|.
-                                Penalizes marginal skip contribution → parsimony.
-                "grad_penalty": two separate networks (ODE + skip pathways):
-                                  mu = mu_ode(z(t)) + mu_skip(BMI, AGEc)
-                                Gradient penalty ∂mu_ode/∂BMI(t) is computed at the
-                                NeuralODEModel level to penalize BMI signal leaking
-                                into the ODE pathway.
-            p_skip: basis dimension for the skip pathway in grad_penalty mode.
-                    Defaults to p if not specified.
+            reg_mode: None, "skip_gate", or "group_lasso".
 
-        Theory:
-            reg_mode="l1_skip":
-                L = NLL + lambda * E[|mu(z,s) - mu(z,0)|]
-                Encourages the optimizer to route signal through z(t) unless
-                the skip genuinely improves fit. The L1 penalty induces sparsity
-                in the skip's functional contribution.
+                None:
+                    Standard decoder, single rho network, no regularisation.
 
-            reg_mode="grad_penalty":
-                mu(t) = mu_ode(z(t)) + mu_skip(BMI(t), AGEc)
-                L = NLL + lambda * E[(∂mu_ode/∂BMI(t))²]
-                Penalizes instantaneous sensitivity of the ODE pathway to BMI,
-                pushing BMI effects into the skip pathway where they belong
-                for instantaneous-effect scenarios.
+                "skip_gate":
+                    Learnable sigmoid gate on skip inputs:
+                        gate_k = sigmoid(alpha_k)
+                        skip_gated = [gate_1 * BMI_std, gate_2 * AGEc, ...]
+                    Penalty: lambda * sum(gate_k)
+                    Properties:
+                        - Smooth everywhere (sigmoid), M-estimator theory applies.
+                        - Data-independent penalty → Commenges framework directly.
+                        - gate → 0 ≡ no skip; gate → 1 ≡ full skip.
+                        - Interactions between z(t) and skip preserved when gate open.
+
+                "group_lasso":
+                    Group L2 penalty on first-layer rho_net weights for skip columns:
+                        W = rho_net.net[0].weight  (h × (d + skip_dim))
+                        W_skip_k = W[:, latent_dim + k]  (column for skip input k)
+                    Penalty: lambda * sum_k ||W_skip_k||_2
+                    Properties:
+                        - Smooth when ||W_k|| > 0 (generic), M-estimator applies.
+                        - Data-independent → Commenges framework directly.
+                        - ||W_k|| → 0 means input k cannot enter the network.
+                        - Well-established theory (Yuan & Lin, 2006).
         """
         super().__init__()
         self.p, self.q = p, q
@@ -171,6 +178,7 @@ class Decoder(nn.Module):
         self.D_diag_min = D_diag_min
         self.n_static = n_static
         self.reg_mode = reg_mode
+        self.latent_dim = latent_dim
 
         # BMI standardization buffers
         self.register_buffer('bmi_mean', torch.tensor(float(bmi_mean)))
@@ -186,49 +194,26 @@ class Decoder(nn.Module):
         skip_dim = n_bmi_skip + n_static_skip
         self.skip_dim = skip_dim
 
-        if reg_mode == "grad_penalty" and skip_dim == 0:
-            raise ValueError("reg_mode='grad_penalty' requires use_bmi_skip=True or static_skip_dims")
-
-        if p_skip is None:
-            p_skip = p
-        self.p_skip = p_skip
-
         # --- Neural fixed effects ---
         self.use_rho_net = use_rho_net
 
-        if reg_mode == "grad_penalty":
-            # Two separate pathways: mu = mu_ode(z(t)) + mu_skip(BMI, AGEc)
-            # Gradient penalty on ∂mu_ode/∂BMI is computed at NeuralODEModel level.
-            # ODE pathway: z(t) → R^p → scalar
-            self.rho_ode_net = MLP(latent_dim, rho_hidden, p, depth=2, dropout=0.0)
-            self.rho_ode_norm = nn.LayerNorm(p)
-            self.beta_ode = nn.Parameter(0.1 * torch.randn(p))
-
-            # Skip pathway: [BMI_std, AGEc, ...] → R^p_skip → scalar
-            self.rho_skip_net = MLP(skip_dim, rho_hidden, p_skip, depth=2, dropout=0.0)
-            self.rho_skip_norm = nn.LayerNorm(p_skip)
-            self.beta_skip = nn.Parameter(0.1 * torch.randn(p_skip))
-
-            # For backward compat: expose beta_neural as reference
-            self.beta_neural = self.beta_ode
-
-            self.rho_net = None  # not used in grad_penalty mode
-
-        elif use_rho_net:
-            # Standard single network: [z(t), skip] → R^p → scalar
-            self.rho_net = MLP(latent_dim + skip_dim, rho_hidden, p, depth=2, dropout=0.0)
+        if use_rho_net:
+            # Single network: [z(t), skip (possibly gated)] → R^p → scalar
+            self.rho_net = MLP(latent_dim + skip_dim, rho_hidden, p,
+                               depth=2, dropout=0.0)
             self.rho_norm = nn.LayerNorm(p)
             self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
-
-            # Not used in standard mode
-            self.rho_ode_net = None
-            self.rho_skip_net = None
         else:
             self.rho_net = None
-            self.rho_ode_net = None
-            self.rho_skip_net = None
             self.w_neural = nn.Parameter(0.01 * torch.randn(latent_dim + skip_dim))
             self.beta_neural = None
+
+        # --- Skip gate parameters (only for skip_gate mode) ---
+        if reg_mode == "skip_gate" and skip_dim > 0:
+            # alpha_k initialised at 2.0 → sigmoid(2) ≈ 0.88 (gate starts open)
+            self.skip_gate_logit = nn.Parameter(2.0 * torch.ones(skip_dim))
+        else:
+            self.skip_gate_logit = None
 
         # --- Random effects ---
         self.use_neural_re = use_neural_re
@@ -286,12 +271,36 @@ class Decoder(nn.Module):
             return torch.cat(skip_parts, dim=-1)                         # (N, T, skip_dim)
         return None
 
+    def _compute_reg(self, skip_input):
+        """
+        Compute the regularisation term and return it in reg_dict.
+        Data-independent for both modes → clean M-estimator inference.
+        """
+        reg_dict = {}
+
+        if self.reg_mode == "skip_gate":
+            gate = torch.sigmoid(self.skip_gate_logit)
+            reg_dict["reg_term"] = gate.sum()
+            reg_dict["gate_values"] = gate.detach()
+
+        elif self.reg_mode == "group_lasso":
+            W = self.rho_net.net[0].weight
+            W_skip = W[:, self.latent_dim:]
+            channel_norms = W_skip.norm(p=2, dim=0)
+            reg_dict["reg_term"] = channel_norms.sum()
+            reg_dict["channel_norms"] = channel_norms.detach()
+
+        else:
+            reg_dict["reg_term"] = torch.tensor(0.0)
+
+        return reg_dict
+
     def forward(self, z_t, x_pad, static, obs_mask=None,
                 return_components=True):
         """
         Args:
             z_t:      (N, T, H)  latent states from ODE
-            x_pad:    (N, T, Cx) padded covariates (BMI_t at col 0, rs1/rs2 for RE)
+            x_pad:    (N, T, Cx) padded covariates (BMI_t at col 0)
             static:   (N, Cs)    static covariates
             obs_mask: (N, T)     binary mask (1=observed, 0=padded)
 
@@ -301,8 +310,7 @@ class Decoder(nn.Module):
             Z:        (N, T, q)  RE design matrix
             D:        (q, q)     RE covariance
             sig2:     scalar     residual variance
-            reg_dict: dict with regularization info (only when reg_mode is set)
-                      Keys: "reg_term" (scalar loss), "mu_ode" (N,T), "mu_skip" (N,T)
+            reg_dict: dict with regularization info
         """
         N, T, H = z_t.shape
         device, dtype = z_t.device, z_t.dtype
@@ -310,84 +318,26 @@ class Decoder(nn.Module):
         # --- Build skip input ---
         skip_input = self._build_skip_input(x_pad, static, N, T)
 
-        # --- Fixed effects (depends on reg_mode) ---
-        reg_dict = {}
+        # --- Apply skip gate if enabled ---
+        if self.reg_mode == "skip_gate" and skip_input is not None:
+            gate = torch.sigmoid(self.skip_gate_logit)
+            skip_input = skip_input * gate
 
-        if self.reg_mode == "grad_penalty":
-            # ============================================
-            # Gradient penalty: mu = mu_ode + mu_skip
-            # Penalty is computed at the NeuralODEModel level
-            # (requires differentiating through Euler integration)
-            # ============================================
-            # ODE pathway
-            rho_ode = self.rho_ode_net(z_t)                              # (N, T, p)
-            rho_ode = self.rho_ode_norm(rho_ode)
-            mu_ode = (rho_ode * self.beta_ode).sum(dim=-1)               # (N, T)
- 
-            # Skip pathway
-            rho_skip = self.rho_skip_net(skip_input)                     # (N, T, p_skip)
-            rho_skip = self.rho_skip_norm(rho_skip)
-            mu_skip = (rho_skip * self.beta_skip).sum(dim=-1)            # (N, T)
- 
-            mu = mu_ode + mu_skip
- 
-            # No penalty here — grad penalty computed at model level
-            # Return mu_ode so model can differentiate it w.r.t. BMI
-            reg_dict["mu_ode"] = mu_ode                                  # keep graph!
-            reg_dict["mu_skip"] = mu_skip.detach()
+        # --- Fixed effects ---
+        if skip_input is not None:
+            rho_input = torch.cat([z_t, skip_input], dim=-1)
+        else:
+            rho_input = z_t
 
-        elif self.reg_mode == "l1_skip" and self.use_rho_net:
-            # ============================================
-            # L1 skip: penalize |mu_full - mu_no_skip|
-            # ============================================
-            # Full prediction (with skip)
-            if skip_input is not None:
-                rho_input = torch.cat([z_t, skip_input], dim=-1)
-            else:
-                rho_input = z_t
-
+        if self.use_rho_net:
             rho = self.rho_net(rho_input)
             rho = self.rho_norm(rho)
             mu = (rho * self.beta_neural).sum(dim=-1)
-
-            # Zero-skip prediction (skip input replaced with zeros)
-            if skip_input is not None:
-                zero_skip = torch.zeros_like(skip_input)
-                rho_input_zero = torch.cat([z_t, zero_skip], dim=-1)
-                rho_zero = self.rho_net(rho_input_zero)
-                rho_zero = self.rho_norm(rho_zero)
-                mu_no_skip = (rho_zero * self.beta_neural).sum(dim=-1)
-
-                # L1 penalty on marginal skip contribution
-                skip_contrib = (mu - mu_no_skip).abs()
-                if obs_mask is not None:
-                    # Average over observed positions only
-                    n_obs = obs_mask.sum().clamp(min=1)
-                    reg_dict["reg_term"] = (skip_contrib * obs_mask).sum() / n_obs
-                else:
-                    reg_dict["reg_term"] = skip_contrib.mean()
-
-                reg_dict["mu_full"] = mu.detach()
-                reg_dict["mu_no_skip"] = mu_no_skip.detach()
-                reg_dict["skip_contrib_mean"] = skip_contrib.detach().mean()
-            else:
-                reg_dict["reg_term"] = torch.tensor(0.0, device=device, dtype=dtype)
-
         else:
-            # ============================================
-            # Standard: single network, no regularization
-            # ============================================
-            if skip_input is not None:
-                rho_input = torch.cat([z_t, skip_input], dim=-1)
-            else:
-                rho_input = z_t
+            mu = (rho_input * self.w_neural).sum(dim=-1)
 
-            if self.use_rho_net:
-                rho = self.rho_net(rho_input)
-                rho = self.rho_norm(rho)
-                mu = (rho * self.beta_neural).sum(dim=-1)
-            else:
-                mu = (rho_input * self.w_neural).sum(dim=-1)
+        # --- Regularisation (data-independent) ---
+        reg_dict = self._compute_reg(skip_input)
 
         # --- Random effects design matrix Z ---
         if self.use_neural_re:
@@ -440,15 +390,20 @@ class NeuralODEConfig:
 
 class NeuralODEModel(nn.Module):
     """
-    Neural ODE-LMM with BMI skip connection.
+    Neural ODE-LMM with BMI skip connection (torchdiffeq version).
 
     Architecture:
       Encoder:  z(0) = Enc(t0, BMI0, static)
-      ODE:      dz/dt = f(z, t, BMI(t))            — BMI in dynamics
-      Decoder:  mu = rho(z(t), BMI_std(t)) @ beta   — BMI also in skip
+      ODE:      dz/dt = f(z, t, BMI(t))
+      Decoder:  mu = rho(z(t), skip_input) @ beta_neural
 
-    Forward signature is kept compatible with the CDE model's dataloader.
-    The c_mask (cumulative mask) argument is accepted but ignored.
+    Regularisation modes (reg_mode):
+      None:          no skip penalty
+      "skip_gate":   sigmoid gate on skip inputs, penalty = λ·Σ gate_k
+      "group_lasso": group L2 on first-layer skip weights, penalty = λ·Σ||W_k||
+
+    Both penalties are data-independent and smooth, enabling clean
+    M-estimator inference (Commenges et al., 2014).
     """
 
     def __init__(self, x_dim, static_dim=0, cfg=None,
@@ -461,8 +416,7 @@ class NeuralODEModel(nn.Module):
                  bmi_mean=0.0, bmi_std=1.0,
                  static_skip_dims=None,
                  use_bmi_skip=True,
-                 reg_mode=None,
-                 p_skip=None):
+                 reg_mode=None):
         """
         Args:
             x_dim: total columns in x_pad (e.g. 3 for [BMI_t, rs1, rs2])
@@ -471,9 +425,7 @@ class NeuralODEModel(nn.Module):
             static_skip_dims: indices of static covariates to skip-connect to decoder
                               e.g. [1] to pass AGEc directly. None = no static skip.
             use_bmi_skip: if False, decoder sees only z(t) — no direct BMI input.
-                          Use False for path-dependent scenarios (S5, S6).
-            reg_mode: None, "l1_skip", or "grad_penalty". See Decoder docstring.
-            p_skip: basis dimension for skip pathway in grad_penalty mode.
+            reg_mode: None, "skip_gate", or "group_lasso". See Decoder docstring.
         """
         super().__init__()
         if cfg is None:
@@ -486,7 +438,8 @@ class NeuralODEModel(nn.Module):
 
         # Encoder: sees [t0, BMI0] + static
         # BMI0 is column 0 of x_pad at time 0
-        encoder_input_dim = 1 + n_tv   # t0 + BMI0
+        # encoder_input_dim = 1 + n_tv   # t0 + BMI0
+        encoder_input_dim = 1   # t0
         self.encoder = BaselineEncoder(
             input_dim=encoder_input_dim,
             static_dim=static_dim,
@@ -506,6 +459,7 @@ class NeuralODEModel(nn.Module):
         )
 
         self.z_norm = nn.LayerNorm(cfg.hidden_channels)
+        # self.z_norm = nn.Identity()
 
         # Decoder with optional BMI skip
         self.decoder = Decoder(
@@ -524,7 +478,6 @@ class NeuralODEModel(nn.Module):
             static_skip_dims=static_skip_dims,
             use_bmi_skip=use_bmi_skip,
             reg_mode=reg_mode,
-            p_skip=p_skip,
         )
 
     def _interpolate_bmi(self, bmi_t, k, alpha):
@@ -597,6 +550,7 @@ class NeuralODEModel(nn.Module):
         to handle per-subject time grids.
         """
         from torchdiffeq import odeint
+        # from torchdiffeq import odeint_adjoint as odeint
 
         N, T = times.shape
         H = z0.shape[1]
@@ -604,7 +558,11 @@ class NeuralODEModel(nn.Module):
         solver = self.cfg.ode_solver
 
         # Build odeint options
-        odeint_kwargs = {"method": solver}
+        odeint_kwargs = {
+            "method": solver,
+            "atol": 1e-6,
+            "rtol": 1e-6,
+        }
         if self.cfg.euler_steps_per_interval is not None:
             # For fixed-step methods, set step_size in normalized [0,1] coords
             odeint_kwargs["options"] = {
@@ -693,7 +651,7 @@ class NeuralODEModel(nn.Module):
         x_pad,                                    # (N, T, Cx)
         masks=None,                               # (N, T) cumulative mask — IGNORED
         static_covariates=None,  
-        bmi_t = None,                 # (N, Cs)
+        bmi_t=None,                               # (N, T, 1)
         obs_mask=None,                            # (N, T) outcome observation mask
         return_hidden=False,
         interp=None,                              # ignored (no spline interpolation needed)
@@ -702,69 +660,18 @@ class NeuralODEModel(nn.Module):
         device, dtype = t_pad.device, t_pad.dtype
 
         # --- Encoder ---
-        # Input: [t0, BMI0, static]
         t0 = t_pad[:, 0:1]                                  # (N, 1)
-        bmi0 = x_pad[:, 0, 0:self.n_tv]                     # (N, n_tv) — baseline BMI
-        encoder_in = torch.cat([t0, bmi0, static_covariates], dim=-1)
+        bmi0 = x_pad[:, 0, 0:self.n_tv]                     # (N, n_tv)
+        encoder_in = torch.cat([t0, static_covariates], dim=-1)
         z0 = self.encoder(encoder_in)                        # (N, H)
 
-        # --- Gradient penalty: make bmi_t a differentiable leaf ---
-        # We need autograd to track ∂mu_ode/∂bmi_t through ODE integration
-        if self.reg_mode == "grad_penalty" and bmi_t is not None:
-            bmi_t_leaf = bmi_t.detach().requires_grad_(True)
-        else:
-            bmi_t_leaf = bmi_t
-
         # --- ODE integration ---
-        zt = self._integrate(z0, t_pad, static_covariates, bmi_t_leaf)  # (N, T, H)
+        zt = self._integrate(z0, t_pad, static_covariates, bmi_t)
         zt = self.z_norm(zt)
 
-        # --- Decoder (with BMI skip) ---
+        # --- Decoder (with skip) ---
         result = self.decoder(zt, x_pad, static_covariates,
                               obs_mask=obs_mask)
-        
-        # --- Compute gradient penalty at model level ---
-        if self.reg_mode == "grad_penalty" and bmi_t_leaf is not None:
-            mu, V, Z, D, sig2, reg_dict = result
- 
-            mu_ode = reg_dict["mu_ode"]  # (N, T) — with grad graph intact
- 
-            # Compute ∂mu_ode(t_k)/∂BMI(t_k) for each observation time k.
-            # This is the INSTANTANEOUS sensitivity only — accumulated effects
-            # ∂mu_ode(t_j)/∂BMI(t_k) for j>k are NOT penalized.
-            grad_penalty = torch.tensor(0.0, device=device, dtype=dtype)
-            n_valid = 0
- 
-            for k in range(T):
-                # Skip padded time steps
-                if obs_mask is not None:
-                    if obs_mask[:, k].sum() < 0.5:
-                        continue
- 
-                grads = torch.autograd.grad(
-                    mu_ode[:, k].sum(),
-                    bmi_t_leaf,
-                    create_graph=True,
-                    retain_graph=True,
-                )[0]                                         # (N, T) or (N, T, 1)
- 
-                # Extract instantaneous component: ∂mu_ode(t_k)/∂BMI(t_k)
-                g_k = grads[:, k]                            # (N,) or (N, 1)
- 
-                if obs_mask is not None:
-                    mask_k = obs_mask[:, k]                   # (N,)
-                    grad_penalty = grad_penalty + ((g_k ** 2) * mask_k).sum() / mask_k.sum().clamp(min=1)
-                else:
-                    grad_penalty = grad_penalty + (g_k ** 2).mean()
-                n_valid += 1
- 
-            if n_valid > 0:
-                grad_penalty = grad_penalty / n_valid
- 
-            reg_dict["reg_term"] = grad_penalty
-            reg_dict["grad_penalty_per_t"] = grad_penalty.detach()
- 
-            result = (mu, V, Z, D, sig2, reg_dict)
 
         if return_hidden:
             if isinstance(result, tuple):
