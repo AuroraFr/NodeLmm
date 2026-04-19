@@ -22,8 +22,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 
 # ─────────────────────────────────────────────
@@ -201,7 +199,7 @@ class Decoder(nn.Module):
             # Single network: [z(t), skip (possibly gated)] → R^p → scalar
             self.rho_net = MLP(latent_dim + skip_dim, rho_hidden, p,
                                depth=2, dropout=0.0)
-            self.rho_norm = nn.LayerNorm(p)
+            # self.rho_norm = nn.LayerNorm(p)
             self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
         else:
             self.rho_net = None
@@ -331,7 +329,7 @@ class Decoder(nn.Module):
 
         if self.use_rho_net:
             rho = self.rho_net(rho_input)
-            rho = self.rho_norm(rho)
+            # rho = self.rho_norm(rho)
             mu = (rho * self.beta_neural).sum(dim=-1)
         else:
             mu = (rho_input * self.w_neural).sum(dim=-1)
@@ -431,7 +429,6 @@ class NeuralODEModel(nn.Module):
         if cfg is None:
             cfg = NeuralODEConfig()
         self.cfg = cfg
-        self.x_dim = x_dim
         self.static_dim = static_dim
         self.n_tv = n_tv
         self.reg_mode = reg_mode

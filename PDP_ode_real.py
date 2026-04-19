@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PDP analysis — real 3C dataset")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_skipgate.pt")
+                        default="checkpoints/best_model_ode_real_3C_noreg.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--batch_size", type=int, default=256)
@@ -42,7 +42,7 @@ if __name__ == "__main__":
                         help="Counterfactual mode for PDP interventions")
     parser.add_argument("--slope", type=float, default=None,
                         help="Slope for linear mode (auto-estimated if omitted)")
-    parser.add_argument("--prefix", type=str, default="figures/pdp_real")
+    parser.add_argument("--prefix", type=str, default="figures/pdp_real_noreg")
     parser.add_argument("--with_blup", action="store_true",
                         help="Include BLUP random effects in ICE curves")
     args = parser.parse_args()

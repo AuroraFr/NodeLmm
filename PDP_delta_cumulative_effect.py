@@ -1119,15 +1119,15 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Full-parameter delta method for ∆PDP variance — cumulative scenario")
-    parser.add_argument("--n_sims", type=int, default=100)
+    parser.add_argument("--n_sims", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--true_coeff", type=float, default=-0.05,
                         help="True h5 coefficient: h5(t) = coeff * integral BMI(tau) dtau")
     parser.add_argument("--output_csv", type=str,
-                        default="results/simulation_cumulative_summary.csv")
+                        default="results_simu/simulation_cumulative_summary.csv")
     parser.add_argument("--data_dir", type=str, default="simu_datasets/S5_sims")
     parser.add_argument("--ckpt_dir", type=str,
-                        default="checkpoints/simulation_cumulative_effect_fullD")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder_norhonorm")
     parser.add_argument("--bmi_pairs", type=str, default=None)
     parser.add_argument("--sandwich", action="store_true",
                         help="Use sandwich variance J⁻¹FJ⁻¹ instead of F⁻¹")
@@ -1135,14 +1135,14 @@ if __name__ == "__main__":
                         help="Subsample N subjects for Hessian (e.g. 500).")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                         help="Weight decay used during training (added to J)")
-    parser.add_argument("--lambda_reg", type=float, default=0.05,
+    parser.add_argument("--lambda_reg", type=float, default=0.0,
                         help="Skip penalty coefficient (skip_gate or group_lasso)")
     parser.add_argument("--reg_mode", type=str, default=None,
                         choices=[None, "skip_gate", "group_lasso"],
                         help="Regularisation mode for skip connection")
     parser.add_argument("--max_dist", type=float, default=1.5,
                         help="Max distance (years) for time-windowed matching")
-    parser.add_argument("--hidden_channels", type=int, default=16)
+    parser.add_argument("--hidden_channels", type=int, default=8)
     parser.add_argument("--ode_solver", type=str, default="rk4")
     parser.add_argument("--euler_steps", type=int, default=4)
     args = parser.parse_args()
@@ -1160,7 +1160,7 @@ if __name__ == "__main__":
         bmi_pairs.append((23, 32))
 
     time_col, y_col, id_col = "time", "ISA15_sim", "NUM_ID"
-    x_cols = ["BMI_t", "rs1", "rs2"]
+    x_cols = ["BMI_t"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
     all_pair_results = {pair: [] for pair in bmi_pairs}
@@ -1212,7 +1212,7 @@ if __name__ == "__main__":
         model = NeuralODEModel(
             x_dim=len(x_cols), static_dim=len(static_cols), cfg=cfg,
             n_tv=1, use_rho_net=True, use_neural_re=True,
-            re_spline_cols=None, g_hidden=16, fullD=True,
+            re_spline_cols=None, g_hidden=16, fullD=False,
             bmi_mean=0.0, bmi_std=1.0,
             use_bmi_skip=False, static_skip_dims=None,
             reg_mode=args.reg_mode,

@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Neural ODE-LMM training")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder_norhonorm")
     parser.add_argument("--data", type=str,
                         default="simu_datasets/S5_sims")
     args = parser.parse_args()
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     x_cols = ["BMI_t", "rs1", "rs2"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
-    for i in range(100):
+    for i in range(68, 100):
         path = args.data + f"/sim_{i+1:03d}.rds"
         df = next(iter(pyreadr.read_r(path).values()))
         df["SEX"] = df["SEX"].astype("category")
@@ -144,9 +144,9 @@ if __name__ == "__main__":
         total_params = sum(p.numel() for p in model.parameters())
         print(f"\nTotal parameters: {total_params}")
         print(f"Architecture:")
-        print(f"  Encoder:  z(0) = Enc(t0, BMI0, static)")
+        print(f"  Encoder:  z(0) = Enc(t0,static)")
         print(f"  ODE:      dz/dt = f(z, t, x(t))")
-        print(f"  Decoder:  mu = rho(z(t), BMI_std, AGEc) @ beta_neural")
+        print(f"  Decoder:  mu = rho(z(t)) @ beta_neural")
         print(f"  RE:       g(z(t))")
         print(f"  Euler sub-steps: {cfg.euler_steps_per_interval}")
 
@@ -163,7 +163,7 @@ if __name__ == "__main__":
         # ---- Train ----
         best_test_loss = float("inf")
         best_state = None
-        patience = 300
+        patience = 75
 
         for epoch in range(1, EPOCHS + 1):
 
@@ -225,7 +225,7 @@ if __name__ == "__main__":
 
             if avg_test < best_test_loss:
                 best_test_loss = avg_test
-                patience = 300
+                patience = 150
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
                 torch.save({
                     'model_state_dict': best_state,

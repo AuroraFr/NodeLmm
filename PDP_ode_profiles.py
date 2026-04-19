@@ -33,9 +33,9 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="S5 profile PDP diagnostic")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder/best_model_ode_0.pt")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder/best_model_ode_1.pt")
     parser.add_argument("--data", type=str,
-                        default="simu_datasets/S5_sims/sim_001.rds")
+                        default="simu_datasets/S5_sims/sim_002.rds")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--bmi_lo", type=float, default=20.0)
     parser.add_argument("--bmi_hi", type=float, default=28.0)
@@ -53,7 +53,7 @@ if __name__ == "__main__":
     time_col = "time"
     y_col = "ISA15_sim"
     id_col = "NUM_ID"
-    x_cols = ["BMI_t", "rs1", "rs2"]
+    x_cols = ["BMI_t"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
     print(f"Loading data from {args.data}...")

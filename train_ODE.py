@@ -3,7 +3,7 @@ Neural ODE-LMM: Neural ODE +/- BMI Skip Connection.
 
 Architecture:
   - Encoder:  z(0) = Enc(t0, BMI0, static)
-  - Dynamics: dz/dt = f(z, t, static, x(t))          ← Neural ODE
+  - Dynamics: dz/dt = f(z, t, static)          ← Neural ODE
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural  ← BMI skip connection
   - RE:       Z = [1, rs1(t), rs2(t)] or g(z(t))          (classical spline basis/neural network)
 
