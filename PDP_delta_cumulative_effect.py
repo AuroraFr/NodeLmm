@@ -1119,7 +1119,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(
         description="Full-parameter delta method for ∆PDP variance — cumulative scenario")
-    parser.add_argument("--n_sims", type=int, default=30)
+    parser.add_argument("--n_sims", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--true_coeff", type=float, default=-0.05,
                         help="True h5 coefficient: h5(t) = coeff * integral BMI(tau) dtau")

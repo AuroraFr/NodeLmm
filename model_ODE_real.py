@@ -240,6 +240,7 @@ class Decoder(nn.Module):
             self.rho_net = MLP(latent_dim + self.skip_dim, rho_hidden, p,
                                depth=2, dropout=0.0)
             self.rho_norm = nn.LayerNorm(p)
+            # self.rho_norm = nn.Identity(p)
             self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
         else:
             self.rho_net = None
@@ -461,6 +462,7 @@ class NeuralODEConfig:
     dropout: float = 0.0
     euler_steps_per_interval: int = 4
     ode_solver: str = "euler"
+    # use_rho_norm: False
 
 
 # ─────────────────────────────────────────────

@@ -320,7 +320,7 @@ def plot_individual_predictions(df_fit, n_subjects=25, ncols=5,
         if hlme_df is not None:
             hlme_s = hlme_df[hlme_df["patient_id"] == sid].sort_values("time")
             if len(hlme_s) > 0:
-                ax.plot(hlme_s["time"], hlme_s["y_full"], "k--",
+                ax.plot(hlme_s["time"], hlme_s["y_blup"], "k--",
                         linewidth=1.5, label="HLME")
 
         ax.set_title(f"ID {sid} (n={len(df_s)})", fontsize=9)
@@ -357,8 +357,8 @@ def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
         ax.plot(df_pop["time"], df_pop[pred_col], "o--", color="green",
                 linewidth=2, markersize=6, label=label)
 
-    ax.plot(df_pop["time"], df_pop["mean_mu_pop"], "o:", color="red",
-            linewidth=1.5, markersize=5, alpha=0.7, label="ODE pop mean")
+    # ax.plot(df_pop["time"], df_pop["mean_mu_pop"], "o:", color="red",
+    #         linewidth=1.5, markersize=5, alpha=0.7, label="ODE pop mean")
 
     if hlme_pop is not None and "mean_y_blup" in hlme_pop.columns:
         ax.plot(hlme_pop["time"], hlme_pop["mean_y_blup"], "o--",
@@ -583,20 +583,20 @@ if __name__ == "__main__":
     print("4. PLOTS")
     print(f"{'='*60}")
 
-    plot_individual_predictions(
-        df_fit_train, n_subjects=25, ncols=5,
-        hlme_df=hlme_train_fit,
-        save_path=os.path.join(args.output_dir, "fit_individual_train.png"))
+    # plot_individual_predictions(
+    #     df_fit_train, n_subjects=25, ncols=5,
+    #     hlme_df=hlme_train_fit,
+    #     save_path=os.path.join(args.output_dir, "fit_individual_train.png"))
     
-    plot_individual_predictions(
-        df_pred_test, n_subjects=25, ncols=5,
-        hlme_df=hlme_val_pred,
-        save_path=os.path.join(args.output_dir, "pred_individual_val.png"))
+    # plot_individual_predictions(
+    #     df_pred_test, n_subjects=25, ncols=5,
+    #     hlme_df=hlme_val_pred,
+    #     save_path=os.path.join(args.output_dir, "pred_individual_val.png"))
 
     hlme_pop = None
     if hlme_val_fit is not None:
         hlme_pop = population_averaged_predictions(
-            hlme_val_fit.rename(columns={"y_blup":"y_blup_noBM", "y_full": "y_blup"}))
+            hlme_val_fit)
 
     plot_population_averaged(
         df_pop_test, hlme_pop=hlme_pop, mode="fit",

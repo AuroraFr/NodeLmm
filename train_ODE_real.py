@@ -122,7 +122,7 @@ if __name__ == "__main__":
     LAMBDA_REG = 0.1
     INTERP_METHOD = "linear"      # "ffill", "linear", or "cubic"
     MASK_TYPE = "binary"           # "binary" or "cumulative"
-    REG_MODE = None         # None, "skip_gate", or "group_lasso"
+    REG_MODE = "skip_gate"        # None, "skip_gate", or "group_lasso"
 
     print("=" * 60)
     print("NEURAL ODE-LMM — REAL 3C DATASET")
@@ -205,7 +205,7 @@ if __name__ == "__main__":
     # ── Model ───────────────────────────────────────────────────────────
     cfg = NeuralODEConfig(
         hidden_channels=16,
-        enc_mlp_hidden=32,
+        enc_mlp_hidden=16,
         func_mlp_hidden=32,
         dec_rho_hidden=16,
         dec_p=4,
@@ -213,7 +213,7 @@ if __name__ == "__main__":
         depth=2,
         dropout=0.0,
         euler_steps_per_interval=4,
-        ode_solver='rk4',
+        ode_solver='rk4'
     )
 
     model = NeuralODEModel(

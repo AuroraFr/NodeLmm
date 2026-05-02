@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PDP analysis — real 3C dataset")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_noreg.pt")
+                        default="checkpoints/best_model_ode_real_3C_skipgate.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--batch_size", type=int, default=256)
@@ -42,7 +42,7 @@ if __name__ == "__main__":
                         help="Counterfactual mode for PDP interventions")
     parser.add_argument("--slope", type=float, default=None,
                         help="Slope for linear mode (auto-estimated if omitted)")
-    parser.add_argument("--prefix", type=str, default="figures/pdp_real_noreg")
+    parser.add_argument("--prefix", type=str, default="figures/pdp_real_2")
     parser.add_argument("--with_blup", action="store_true",
                         help="Include BLUP random effects in ICE curves")
     args = parser.parse_args()
@@ -57,6 +57,7 @@ if __name__ == "__main__":
     print(f"Checkpoint: {args.checkpoint}")
     print(f"  epoch     = {checkpoint.get('epoch', '?')}")
     print(f"  test loss = {checkpoint.get('best_test_loss', '?'):.4f}")
+    print(ckpt_cfg)
 
     # ── Feature definitions from checkpoint ─────────────────────────────
     id_col = "NUM_ID"
@@ -65,8 +66,8 @@ if __name__ == "__main__":
     static_features = ckpt_cfg['static_features']
     K = len(time_varying_features)
     Ks = len(static_features)
-    interp_method = ckpt_cfg.get('interp_method', 'ffill')
-    mask_type = ckpt_cfg.get('mask_type', 'cumulative')
+    interp_method = ckpt_cfg.get('interp_method', 'linear')
+    mask_type = ckpt_cfg.get('mask_type', 'binary')
 
     cov_means = checkpoint['cov_means']
     cov_stds = checkpoint['cov_stds']
@@ -106,7 +107,7 @@ if __name__ == "__main__":
     # ── Rebuild model from checkpoint ───────────────────────────────────
     cfg = NeuralODEConfig(
         hidden_channels=ckpt_cfg['hidden_channels'],
-        enc_mlp_hidden=ckpt_cfg.get('enc_mlp_hidden', 32),
+        enc_mlp_hidden=ckpt_cfg.get('enc_mlp_hidden', 16),
         func_mlp_hidden=ckpt_cfg.get('func_mlp_hidden', 32),
         dec_rho_hidden=ckpt_cfg.get('dec_rho_hidden', 16),
         dec_p=ckpt_cfg.get('dec_p', 4),
@@ -132,7 +133,7 @@ if __name__ == "__main__":
         reg_mode=ckpt_cfg.get('reg_mode', None),
     ).to(device)
 
-    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     model.eval()
 
     # ── Print model info ────────────────────────────────────────────────
@@ -168,22 +169,45 @@ if __name__ == "__main__":
     # ── PDP Analysis ────────────────────────────────────────────────────
     visit_times = VISIT_TIMES_3C
 
-    # Intervention grids (approximate clinical ranges)
+    # ── Intervention ranges ─────────────────────────────────────────────
+    # BMI: data-driven Q25 / Q75  (same as R)
+    # Other covariates: hardcoded clinical ranges (same in R and Python)
+
+    bmi_vals = df["BMI"].dropna().values
+    bmi_q25 = float(np.percentile(bmi_vals, 25))
+    bmi_q75 = float(np.percentile(bmi_vals, 75))
+    bmi_q05 = float(np.percentile(bmi_vals, 5))
+    bmi_q95 = float(np.percentile(bmi_vals, 95))
+
+    print(f"  BMI quantiles: Q05={bmi_q05:.2f}  Q25={bmi_q25:.2f}  "
+          f"Q75={bmi_q75:.2f}  Q95={bmi_q95:.2f}")
+
+    # Intervention grids
     INTERVENTION_GRIDS = {
-        "BMI":  [20, 23, 26, 29, 32, 35],
+        "BMI":  sorted(set(
+                    list(np.linspace(bmi_q05, bmi_q95, 6)) +
+                    [bmi_q25, bmi_q75]
+                )),
         "PAS":  [110, 120, 130, 140, 150, 160],
         "PAD":  [60, 65, 70, 75, 80, 85],
         "GLUC": [4, 5, 6, 7, 8, 10],
         "HDL":  [0.8, 1.0, 1.2, 1.5, 1.8, 2.2],
     }
 
+    # ΔPDP and trajectory-profile ranges
     DELTA_RANGES = {
-        "BMI":  (20, 35),
-        "PAS":  (110, 160),
-        "PAD":  (60, 85),
-        "GLUC": (4, 10),
-        "HDL":  (0.8, 2.2),
+        "BMI":  (bmi_q25, bmi_q75),    # data-driven
+        "PAS":  (120, 150),             # hardcoded clinical range
+        "PAD":  (65, 80),               # hardcoded clinical range
+        "GLUC": (5, 8),              # hardcoded clinical range
+        "HDL":  (1.0, 1.8),            # hardcoded clinical range
     }
+
+    print(f"\nIntervention ranges:")
+    for feat in time_varying_features:
+        v_lo, v_hi = DELTA_RANGES[feat]
+        src = "Q25/Q75" if feat == "BMI" else "hardcoded"
+        print(f"  {feat:>6s}: {v_lo:.2f} → {v_hi:.2f}  ({src})")
 
     os.makedirs(os.path.dirname(args.prefix) or ".", exist_ok=True)
     suffix = f"_{args.mode}" if args.mode != "constant" else ""
@@ -264,8 +288,8 @@ if __name__ == "__main__":
                        visit_times=visit_times, target_name=feat_name)
 
         # Trajectory-profile PDP (path-dependence diagnostic)
-        T_grid = len(VISIT_TIMES_3C)
-        profiles = make_profiles(T_grid, v_lo=val_lo, v_hi=val_hi)
+        profiles = make_profiles(visit_times=VISIT_TIMES_3C,
+                                 v_lo=val_lo, v_hi=val_hi)
         traj_results, traj_masks, traj_times = compute_trajectory_profile_pdp(
             model, eval_loader, device, profiles,
             target_col=col_idx, n_tv=K,

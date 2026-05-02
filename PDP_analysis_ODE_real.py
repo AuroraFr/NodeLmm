@@ -475,28 +475,35 @@ def compute_delta_pdp_stratified(results, ages, masks, times,
 # Trajectory-profile PDP
 # ─────────────────────────────────────────────
 
-def make_profiles(n_slots, v_lo, v_hi):
+def make_profiles(visit_times=None, v_lo=None, v_hi=None):
     """
     Define counterfactual trajectory profiles for a covariate.
 
-    Matches the R function make_profiles() for direct comparison with HLME.
+    Matches the R function make_profiles() exactly:
+      - takes visit_times (the actual time vector, not just a count)
+      - uses ceiling(n / 2) for the switch point
 
     Args:
-        n_slots: number of time slots (T=6 for canonical grid)
-        v_lo:    low value (e.g. Q25)
-        v_hi:    high value (e.g. Q75)
+        visit_times: array-like of canonical visit times
+                     (default: VISIT_TIMES_3C)
+        v_lo:        low value (e.g. Q25)
+        v_hi:        high value (e.g. Q75)
 
     Returns:
         dict of {profile_name: (T,) numpy array of covariate values}
     """
-    half = (n_slots + 1) // 2
+    import math
+    if visit_times is None:
+        visit_times = VISIT_TIMES_3C
+    n = len(visit_times)
+    half = math.ceil(n / 2)          # R: ceiling(n / 2)
     return {
-        "stable_low":      np.full(n_slots, v_lo),
-        "stable_high":     np.full(n_slots, v_hi),
-        "late_spike":      np.array([v_lo]*half + [v_hi]*(n_slots - half)),
-        "early_burden":    np.array([v_hi]*half + [v_lo]*(n_slots - half)),
-        "gradual_rise":    np.linspace(v_lo, v_hi, n_slots),
-        "gradual_decline": np.linspace(v_hi, v_lo, n_slots),
+        "stable_low":      np.full(n, v_lo),
+        "stable_high":     np.full(n, v_hi),
+        "late_spike":      np.array([v_lo]*half + [v_hi]*(n - half)),
+        "late_decline":    np.array([v_hi]*half + [v_lo]*(n - half)),
+        "gradual_rise":    np.linspace(v_lo, v_hi, n),
+        "gradual_decline": np.linspace(v_hi, v_lo, n),
     }
 
 
@@ -635,12 +642,12 @@ def compute_trajectory_profile_pdp(model, loader, device, profiles,
         print()
 
     # Diagnostic: early_burden vs late_spike
-    if "early_burden" in results and "late_spike" in results:
-        eb = results["early_burden"]
+    if "late_decline" in results and "late_spike" in results:
+        eb = results["late_decline"]
         ls = results["late_spike"]
         diff = eb - ls
         closest_diff = _closest_obs_per_subject(diff, masks, times, visit_times)
-        print(f"\n    Diagnostic: early_burden − late_spike")
+        print(f"\n    Diagnostic: late_decline − late_spike")
         print(f"    {'Time':>8s}  {'Diff':>8s}  {'SE':>8s}  {'Interp':>20s}")
         for vt in visit_times:
             d = closest_diff[vt]
@@ -658,33 +665,79 @@ def compute_trajectory_profile_pdp(model, loader, device, profiles,
 def plot_trajectory_profile_pdp(results, masks, times,
                                  save_path="traj_profile_pdp.png",
                                  visit_times=None,
-                                 target_name="covariate"):
+                                 target_name="covariate",
+                                 ylim=None,
+                                 title=None,
+                                 figsize=(9, 6)):
     """
-    Plot trajectory-profile PDP. Matches R's plot_trajectory_profile_pdp().
+    Plot trajectory-profile PDP.
+
+    Visually aligned with R's plot_trajectory_profile_pdp() so that
+    the two panels look consistent when placed side-by-side in a Beamer slide.
+
+    Args:
+        ylim:    (ymin, ymax) tuple for shared Y-axis scale across models.
+                 If None, matplotlib auto-scales.
+        title:   Custom title (None → default; '' → no title).
+        figsize: Figure size in inches (default 9×6 to match R ggsave).
     """
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
 
+    # ── Shared palette (identical to R) ──────────────────────────────────
     profile_colours = {
-        "stable_low":      "#2166AC",
-        "stable_high":     "#B2182B",
-        "late_spike":      "#F4A582",
-        "early_burden":    "#D6604D",
-        "gradual_rise":    "#92C5DE",
-        "gradual_decline": "#4393C3",
+        "stable_low":      "#2166AC",   # blue
+        "stable_high":     "#B2182B",   # dark red
+        "late_spike":      "#FF7F00",   # orange
+        "late_decline":    "#6A3D9A",   # purple
+        "gradual_rise":    "#33A02C",   # green
+        "gradual_decline": "#E31A1C",   # bright red
+    }
+
+    profile_linestyles = {
+        "stable_low":      "-",
+        "stable_high":     "-",
+        "late_spike":      "--",
+        "late_decline":    "--",
+        "gradual_rise":    "-.",
+        "gradual_decline": "-.",
+    }
+
+    profile_markers = {
+        "stable_low":      "o",
+        "stable_high":     "s",
+        "late_spike":      "^",
+        "late_decline":    "v",
+        "gradual_rise":    "D",
+        "gradual_decline": "d",
     }
 
     profile_labels = {
-        "stable_low":      "Stable low (Q25)",
-        "stable_high":     "Stable high (Q75)",
-        "late_spike":      "Late spike (Q25→Q75)",
-        "early_burden":    "Early burden (Q75→Q25)",
+        "stable_low":      "Stable low",
+        "stable_high":     "Stable high",
+        "late_spike":      "Late spike",
+        "late_decline":    "Late decline",
         "gradual_rise":    "Gradual rise",
         "gradual_decline": "Gradual decline",
     }
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    # ── Figure setup (theme_minimal–like) ────────────────────────────────
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_facecolor('white')
+    fig.set_facecolor('white')
 
+    # Subtle grey grid (matches ggplot theme_minimal)
+    ax.grid(True, color='#D9D9D9', linewidth=0.5, zorder=0)
+    ax.set_axisbelow(True)
+
+    # Remove top/right spines (theme_minimal style)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_color('#636363')
+    ax.spines['bottom'].set_color('#636363')
+    ax.tick_params(colors='#636363', labelsize=11)
+
+    # ── Plot each profile ────────────────────────────────────────────────
     for pname, mu in results.items():
         closest = _closest_obs_per_subject(mu, masks, times, visit_times)
 
@@ -700,21 +753,35 @@ def plot_trajectory_profile_pdp(results, masks, times,
                 hi_plot.append(m + 1.96 * se)
 
         color = profile_colours.get(pname, "grey")
+        ls = profile_linestyles.get(pname, "-")
+        marker = profile_markers.get(pname, "o")
         label = profile_labels.get(pname, pname)
 
-        ax.fill_between(t_plot, lo_plot, hi_plot, color=color, alpha=0.12)
-        ax.plot(t_plot, mean_plot, 'o-', color=color,
-                linewidth=1.5, markersize=5, label=label)
+        ax.fill_between(t_plot, lo_plot, hi_plot, color=color,
+                        alpha=0.10, zorder=1)
+        ax.plot(t_plot, mean_plot, linestyle=ls, marker=marker, color=color,
+                linewidth=1.3, markersize=5, label=label, zorder=2)
 
-    ax.set_xlabel('Time (years)')
-    ax.set_ylabel('E[ISA15]')
-    ax.set_title(f'Trajectory-profile PDP of {target_name} (Neural ODE-LMM)')
-    ax.legend(loc='best', fontsize=9, ncol=2)
-    ax.grid(True, alpha=0.3)
+    # ── Labels ───────────────────────────────────────────────────────────
+    ax.set_xlabel('Time (years)', fontsize=13, color='#252525')
+    ax.set_ylabel('E[IST]', fontsize=13, color='#252525')
+
+    if title is None:
+        ax.set_title(f'Trajectory-profile PDP of {target_name}',
+                     fontsize=13, fontweight='bold', color='#252525')
+    elif title != '':
+        ax.set_title(title, fontsize=13, fontweight='bold', color='#252525')
+
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    # Legend at bottom (matches R legend.position = "bottom")
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.12),
+              fontsize=10, ncol=3, frameon=False)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    print(f"  → {save_path}")
+    print(f"  \u2192 {save_path}")
     plt.close()
 
 
