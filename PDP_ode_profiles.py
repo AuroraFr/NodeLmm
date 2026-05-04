@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="S5 profile PDP diagnostic")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder/best_model_ode_1.pt")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder_norhonorm/best_model_ode_1.pt")
     parser.add_argument("--data", type=str,
                         default="simu_datasets/S5_sims/sim_002.rds")
     parser.add_argument("--batch_size", type=int, default=256)
@@ -103,7 +103,7 @@ if __name__ == "__main__":
     print(f"Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=True)
         print(f"  epoch = {checkpoint.get('epoch', '?')}")
         print(f"  loss  = {checkpoint.get('best_test_loss', '?')}")
     else:
@@ -146,8 +146,8 @@ if __name__ == "__main__":
     # ================================================================
     # 2. Visualize the profiles themselves
     # ================================================================
-    plot_profiles(profiles, times, masks,
-                  save_path=f"{args.prefix}_shapes.png")
+    # plot_profiles(profiles, times, masks,
+    #               save_path=f"{args.prefix}_shapes.png")
 
     # ================================================================
     # 3. Plot PDP results
@@ -219,13 +219,13 @@ if __name__ == "__main__":
 
     if diagnostic:
         # Header
-        print(f"\n  {'t':>4s}  {'late_spike':>12s}  {'early_burden':>14s}  "
+        print(f"\n  {'t':>4s}  {'late_spike':>12s}  {'late_decline':>14s}  "
               f"{'Δ(EB−LS)':>10s}  {'Signal':>14s}")
         print(f"  {'-'*60}")
 
         for vt in sorted(diagnostic.keys()):
             d = diagnostic[vt]
-            print(f"  {vt:4.0f}  {d['late_spike']:12.3f}  {d['early_burden']:14.3f}  "
+            print(f"  {vt:4.0f}  {d['late_spike']:12.3f}  {d['late_decline']:14.3f}  "
                   f"{d['delta']:+10.3f}  {d['signal']:>14s}")
 
         # Oracle comparison table: ΔPDP (stable_high - stable_low) vs true

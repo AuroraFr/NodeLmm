@@ -33,7 +33,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PDP analysis — real 3C dataset")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_skipgate.pt")
+                        default="checkpoints/best_model_ode_real_3C_sepreg.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--batch_size", type=int, default=256)
@@ -42,7 +42,7 @@ if __name__ == "__main__":
                         help="Counterfactual mode for PDP interventions")
     parser.add_argument("--slope", type=float, default=None,
                         help="Slope for linear mode (auto-estimated if omitted)")
-    parser.add_argument("--prefix", type=str, default="figures/pdp_real_2")
+    parser.add_argument("--prefix", type=str, default="figures/pdp_real_sepreg")
     parser.add_argument("--with_blup", action="store_true",
                         help="Include BLUP random effects in ICE curves")
     args = parser.parse_args()
@@ -116,6 +116,7 @@ if __name__ == "__main__":
         dropout=0.0,
         euler_steps_per_interval=ckpt_cfg['euler_steps'],
         ode_solver=ckpt_cfg.get('ode_solver', 'euler'),
+        use_rho_norm=ckpt_cfg.get('use_rho_norm', True),
     )
 
     model = NeuralODEModel(
@@ -199,8 +200,8 @@ if __name__ == "__main__":
         "BMI":  (bmi_q25, bmi_q75),    # data-driven
         "PAS":  (120, 150),             # hardcoded clinical range
         "PAD":  (65, 80),               # hardcoded clinical range
-        "GLUC": (5, 8),              # hardcoded clinical range
-        "HDL":  (1.0, 1.8),            # hardcoded clinical range
+        "GLUC": (4, 10),              # hardcoded clinical range
+        "HDL":  (0.8, 2.2),            # hardcoded clinical range
     }
 
     print(f"\nIntervention ranges:")

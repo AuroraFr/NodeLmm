@@ -165,7 +165,8 @@ class Decoder(nn.Module):
                  cov_means=None, cov_stds=None,
                  static_skip_dims=None,
                  use_dynamic_skip=True,
-                 reg_mode=None):
+                 reg_mode=None,
+                 use_rho_norm=True):
         """
         Args:
             latent_dim:   dimension of z(t)
@@ -239,8 +240,11 @@ class Decoder(nn.Module):
         if use_rho_net:
             self.rho_net = MLP(latent_dim + self.skip_dim, rho_hidden, p,
                                depth=2, dropout=0.0)
-            self.rho_norm = nn.LayerNorm(p)
-            # self.rho_norm = nn.Identity(p)
+            if use_rho_norm:
+                self.rho_norm = nn.LayerNorm(p)
+            else:
+                self.rho_norm = nn.Identity(p)
+
             self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
         else:
             self.rho_net = None
@@ -462,7 +466,7 @@ class NeuralODEConfig:
     dropout: float = 0.0
     euler_steps_per_interval: int = 4
     ode_solver: str = "euler"
-    # use_rho_norm: False
+    use_rho_norm: bool = False
 
 
 # ─────────────────────────────────────────────
@@ -556,6 +560,7 @@ class NeuralODEModel(nn.Module):
             static_skip_dims=static_skip_dims,
             use_dynamic_skip=use_dynamic_skip,
             reg_mode=reg_mode,
+            use_rho_norm=cfg.use_rho_norm
         )
 
     # ── Sub-step interpolation for ODE integration ──────────────────────

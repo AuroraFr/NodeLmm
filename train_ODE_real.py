@@ -213,7 +213,8 @@ if __name__ == "__main__":
         depth=2,
         dropout=0.0,
         euler_steps_per_interval=4,
-        ode_solver='rk4'
+        ode_solver='rk4',
+        use_rho_norm=True
     )
 
     model = NeuralODEModel(
@@ -243,14 +244,33 @@ if __name__ == "__main__":
     print(f"  Reg mode: {REG_MODE}, lambda: {LAMBDA_REG}")
 
     # ── Optimiser ───────────────────────────────────────────────────────
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
+    nn_weights, gate_params, var_params, fe_params = [], [], [], []
+    for n, p in model.named_parameters():
+        print(n)
+        if 'skip_gate_logit' in n:
+            gate_params.append(p)
+        elif 'log_residual_var' in n or 'log_std' in n:
+            var_params.append(p)
+        elif 'beta_neural' in n:
+            fe_params.append(p)
+        else:
+            nn_weights.append(p)
+
+    print(gate_params, fe_params, var_params)
+    optimizer = torch.optim.AdamW([
+        {'params': nn_weights, 'weight_decay': WD},
+        {'params': gate_params, 'weight_decay': 0.0},
+        {'params': var_params, 'weight_decay': 0.0},
+        {'params': fe_params,  'weight_decay': 0.0},  # or a small value if desired
+    ])
+    # optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=50, verbose=True
     )
 
     # ── Checkpoint ──────────────────────────────────────────────────────
     os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = "checkpoints/best_model_ode_real_3C_noreg.pt"
+    ckpt_path = "checkpoints/best_model_ode_real_3C_sepreg.pt"
 
     # ── Training loop ───────────────────────────────────────────────────
     best_test_loss = float("inf")
@@ -344,6 +364,7 @@ if __name__ == "__main__":
                     'lambda_reg': LAMBDA_REG,
                     'static_skip_dims': list(range(Ks)),
                     'use_dynamic_skip': True,
+                    'use_rho_norm': cfg.use_rho_norm
                 },
             }, ckpt_path)
 

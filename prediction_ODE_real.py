@@ -385,7 +385,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Prediction and evaluation for Neural ODE-LMM (3C cohort)")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_skipgate.pt")
+                        default="checkpoints/best_model_ode_real_3C_sepreg.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--hlme_csv", type=str, default='results_3C/hlme/',
@@ -461,6 +461,7 @@ if __name__ == "__main__":
     # ── Rebuild model from checkpoint config ────────────────────────────
     cfg = NeuralODEConfig(
         hidden_channels=ckpt_cfg['hidden_channels'],
+        enc_mlp_hidden=ckpt_cfg.get('enc_mlp_hidden', 16),
         func_mlp_hidden=ckpt_cfg.get('func_mlp_hidden', 32),
         dec_rho_hidden=ckpt_cfg.get('dec_rho_hidden', 16),
         dec_p=ckpt_cfg.get('dec_p', 4),
@@ -468,6 +469,7 @@ if __name__ == "__main__":
         depth=ckpt_cfg.get('depth', 2),
         euler_steps_per_interval=ckpt_cfg['euler_steps'],
         ode_solver=ckpt_cfg.get('ode_solver', 'euler'),
+        use_rho_norm=ckpt_cfg.get('use_rho_norm', True)
     )
 
     model = NeuralODEModel(
@@ -485,7 +487,7 @@ if __name__ == "__main__":
         reg_mode=ckpt_cfg.get('reg_mode', None),
     ).to(device)
 
-    model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    model.load_state_dict(checkpoint['model_state_dict'], strict=True)
     model.eval()
 
     # Print model info
@@ -593,13 +595,13 @@ if __name__ == "__main__":
     #     hlme_df=hlme_val_pred,
     #     save_path=os.path.join(args.output_dir, "pred_individual_val.png"))
 
-    hlme_pop = None
-    if hlme_val_fit is not None:
-        hlme_pop = population_averaged_predictions(
-            hlme_val_fit)
+    # hlme_pop = None
+    # if hlme_val_fit is not None:
+    #     hlme_pop = population_averaged_predictions(
+    #         hlme_val_fit)
 
-    plot_population_averaged(
-        df_pop_test, hlme_pop=hlme_pop, mode="fit",
-        save_path=os.path.join(args.output_dir, "population_average.png"))
+    # plot_population_averaged(
+    #     df_pop_test, hlme_pop=hlme_pop, mode="fit",
+    #     save_path=os.path.join(args.output_dir, "population_average.png"))
 
     print("\nDone.")

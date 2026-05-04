@@ -84,7 +84,7 @@ def make_profiles(t_pad, mask, bmi_lo=22.0, bmi_hi=30.0):
     #    0.50 ≤ t_frac ≤ 0.60 → linear ramp down
     #    t_frac > 0.60 → bmi_lo
     beta = ((t_frac - 0.50) / 0.10).clamp(0.0, 1.0)
-    profiles["early_burden"] = bmi_hi - (bmi_hi - bmi_lo) * beta
+    profiles["late_decline"] = bmi_hi - (bmi_hi - bmi_lo) * beta
 
     # 5. Gradual rise: linear from bmi_lo at t=0 to bmi_hi at t=Ti
     profiles["gradual_rise"] = bmi_lo + (bmi_hi - bmi_lo) * t_frac.clamp(0.0, 1.0)
@@ -307,21 +307,21 @@ def compute_profile_diagnostic(results, integrals, masks, times, ages,
         print(f"  {n_obs:6d}")
 
     # --- 2. Key diagnostic: late_spike vs early_burden ---
-    if "late_spike" in results and "early_burden" in results:
+    if "late_spike" in results and "late_decline" in results:
         print(f"\n  KEY DIAGNOSTIC: late_spike vs early_burden")
         print(f"  At final visits: late_spike has HIGH current BMI, LOW cumulative")
         print(f"                   early_burden has LOW current BMI, HIGH cumulative")
         print(f"  Under true S5:   early_burden should predict WORSE cognition")
         print(f"                   (lower ISA15 = worse)")
         print()
-        print(f"  {'Time':>6s}  {'late_spike':>12s}  {'early_burden':>14s}  "
+        print(f"  {'Time':>6s}  {'late_spike':>12s}  {'late_decline':>14s}  "
               f"{'Δ(EB−LS)':>10s}  {'Signal':>12s}")
         print(f"  {'-'*62}")
 
         diagnostic = {}
         for vt in visit_times:
             ls = profile_means["late_spike"].get(vt, np.array([]))
-            eb = profile_means["early_burden"].get(vt, np.array([]))
+            eb = profile_means["late_decline"].get(vt, np.array([]))
             if len(ls) > 10 and len(eb) > 10:
                 delta = eb.mean() - ls.mean()
                 if delta < -0.05:
@@ -333,7 +333,7 @@ def compute_profile_diagnostic(results, integrals, masks, times, ages,
 
                 diagnostic[vt] = {
                     "late_spike": ls.mean(),
-                    "early_burden": eb.mean(),
+                    "late_decline": eb.mean(),
                     "delta": delta,
                     "signal": signal,
                 }
@@ -356,7 +356,7 @@ def compute_profile_diagnostic(results, integrals, masks, times, ages,
     last_vt = visit_times[-1]
     pairs = [
         ("stable_high", "stable_low"),
-        ("early_burden", "late_spike"),
+        ("late_decline", "late_spike"),
         ("gradual_decline", "gradual_rise"),
     ]
     for p_hi, p_lo in pairs:
@@ -419,7 +419,7 @@ def compute_skip_ablation(model, loader, device, bmi_lo=22.0, bmi_hi=30.0,
     # Focus on the diagnostic pair
     profiles = OrderedDict(
         (k, v) for k, v in profiles.items()
-        if k in ["stable_low", "stable_high", "late_spike", "early_burden"]
+        if k in ["stable_low", "stable_high", "late_spike", "late_decline"]
     )
 
     bmi_mean_val = model.decoder.bmi_mean.item()
@@ -536,8 +536,8 @@ def plot_pdp_profiles(results, masks, times, profiles,
     profile_colors = {
         "stable_low":      "#2196F3",  # blue
         "stable_high":     "#F44336",  # red
-        "late_spike":      "#FF9800",  # orange
-        "early_burden":    "#9C27B0",  # purple
+        "late_spike":      "#F44336",  # orange
+        "late_decline":    "#2196F3",  # purple #F44336 #9C27B0
         "gradual_rise":    "#4CAF50",  # green
         "gradual_decline": "#795548",  # brown
     }
@@ -545,42 +545,45 @@ def plot_pdp_profiles(results, masks, times, profiles,
         "stable_low":      "-",
         "stable_high":     "-",
         "late_spike":      "--",
-        "early_burden":    "--",
+        "late_decline":    "--",
         "gradual_rise":    ":",
         "gradual_decline": ":",
     }
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    # fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, ax2 = plt.subplots(figsize=(7, 5))
 
-    # --- Left panel: PDP curves ---
-    ax = axes[0]
-    for prof_name in results:
-        mu_np = results[prof_name].numpy()
-        closest = _closest_obs_per_subject_arr(mu_np, masks_np, times_np, visit_times)
+    # # --- Left panel: PDP curves ---
+    # ax = axes[0]
+    # for prof_name in results:
+    #     mu_np = results[prof_name].numpy()
+    #     closest = _closest_obs_per_subject_arr(mu_np, masks_np, times_np, visit_times)
 
-        mean_pred, vt_plot = [], []
-        for vt in visit_times:
-            preds = closest[vt]
-            if len(preds) > 10:
-                mean_pred.append(preds.mean())
-                vt_plot.append(vt)
+    #     mean_pred, vt_plot = [], []
+    #     for vt in visit_times:
+    #         preds = closest[vt]
+    #         if len(preds) > 10:
+    #             mean_pred.append(preds.mean())
+    #             vt_plot.append(vt)
 
-        if vt_plot:
-            color = profile_colors.get(prof_name, "grey")
-            style = profile_styles.get(prof_name, "-")
-            ax.plot(vt_plot, mean_pred, f'o{style}', color=color,
-                    label=prof_name.replace('_', ' '), linewidth=2, markersize=5)
+    #     if vt_plot:
+    #         color = profile_colors.get(prof_name, "grey")
+    #         style = profile_styles.get(prof_name, "-")
+    #         ax.plot(vt_plot, mean_pred, f'o{style}', color=color,
+    #                 label=prof_name.replace('_', ' '), linewidth=2, markersize=5)
 
-    ax.set_xlabel('Time (years)')
-    ax.set_ylabel('Mean predicted ISA15')
-    ax.set_title('PDP by Trajectory Profile')
-    ax.legend(fontsize=8, loc='lower left')
-    ax.grid(True, alpha=0.3)
+    # ax.set_xlabel('Time (years)')
+    # ax.set_ylabel('Mean predicted ISA15')
+    # ax.set_title('PDP by Trajectory Profile')
+    # ax.legend(fontsize=8, loc='lower left')
+    # ax.grid(True, alpha=0.3)
 
     # --- Right panel: diagnostic pair zoom ---
-    ax2 = axes[1]
-    if "late_spike" in results and "early_burden" in results:
-        for prof_name in ["late_spike", "early_burden", "stable_low", "stable_high"]:
+    # ax2 = axes[0]
+    # print(results)
+    if "late_spike" in results and "late_decline" in results:
+        # for prof_name in ["late_spike", "late_decline", "stable_low", "stable_high"]:
+        for prof_name in ["late_spike", "late_decline"]:
             if prof_name not in results:
                 continue
             mu_np = results[prof_name].numpy()
@@ -596,13 +599,13 @@ def plot_pdp_profiles(results, masks, times, profiles,
             if vt_plot:
                 color = profile_colors.get(prof_name, "grey")
                 style = profile_styles.get(prof_name, "-")
-                lw = 3 if prof_name in ["late_spike", "early_burden"] else 1.5
+                lw = 3 if prof_name in ["late_spike", "late_decline"] else 1.5
                 ax2.plot(vt_plot, mean_pred, f'o{style}', color=color,
                          label=prof_name.replace('_', ' '), linewidth=lw, markersize=6)
 
         ax2.set_xlabel('Time (years)')
-        ax2.set_ylabel('Mean predicted ISA15')
-        ax2.set_title('Diagnostic Pair: Late Spike vs Early Burden')
+        ax2.set_ylabel('E[IST]')
+        ax2.set_title('Diagnostic Pair: Late Spike vs Late decline')
         ax2.legend(fontsize=9)
         ax2.grid(True, alpha=0.3)
 
@@ -651,7 +654,7 @@ def plot_skip_ablation(results_full, results_ablated, masks, times,
         ax.set_title(prof_name.replace('_', ' ').title(), fontsize=10)
         ax.set_xlabel('Time (years)')
         if idx == 0:
-            ax.set_ylabel('Mean predicted ISA15')
+            ax.set_ylabel('E[IST]')
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 

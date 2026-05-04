@@ -39,7 +39,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Continuous-time PDP analysis — Neural ODE-LMM on 3C")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_skipgate.pt")
+                        default="checkpoints/best_model_ode_real_3C_sepreg.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--batch_size", type=int, default=256)
@@ -48,7 +48,7 @@ if __name__ == "__main__":
     parser.add_argument("--t_max", type=float, default=14.0,
                         help="Maximum time (years)")
     parser.add_argument("--prefix", type=str,
-                        default="figures/pdp_real_skipgate_continuous")
+                        default="figures/pdp_real_sepreg_continuous")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -112,6 +112,7 @@ if __name__ == "__main__":
         dropout=0.0,
         euler_steps_per_interval=ckpt_cfg['euler_steps'],
         ode_solver=ckpt_cfg.get('ode_solver', 'euler'),
+        use_rho_norm=ckpt_cfg.get('use_rho_norm', True)
     )
 
     model = NeuralODEModel(

@@ -56,10 +56,8 @@ def make_profiles_continuous(eval_grid, v_lo, v_hi):
     profiles = {
         "stable_low":      np.full(L, v_lo),
         "stable_high":     np.full(L, v_hi),
-        "late_spike":      np.where(t_norm < 0.5, v_lo,
-                                    v_lo + (v_hi - v_lo) * (t_norm - 0.5) / 0.5),
-        "early_burden":    np.where(t_norm < 0.5, v_hi,
-                                    v_hi + (v_lo - v_hi) * (t_norm - 0.5) / 0.5),
+        "late_spike":     np.where(t_norm < 0.5, v_lo, v_hi),
+        "early_burden":   np.where(t_norm < 0.5, v_hi, v_lo),
         "gradual_rise":    v_lo + (v_hi - v_lo) * t_norm,
         "gradual_decline": v_hi + (v_lo - v_hi) * t_norm,
     }
