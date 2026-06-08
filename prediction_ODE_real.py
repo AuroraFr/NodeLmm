@@ -385,7 +385,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Prediction and evaluation for Neural ODE-LMM (3C cohort)")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_sepreg.pt")
+                        default="checkpoints/best_model_ode_real_3C_sepreg_reduced_H12.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--hlme_csv", type=str, default='results_3C/hlme/',
@@ -414,8 +414,8 @@ if __name__ == "__main__":
     static_features = ckpt_cfg['static_features']
     K = len(time_varying_features)
     Ks = len(static_features)
-    interp_method = ckpt_cfg.get('interp_method', 'ffill')
-    mask_type = ckpt_cfg.get('mask_type', 'cumulative')
+    interp_method = ckpt_cfg.get('interp_method', 'linear')
+    mask_type = ckpt_cfg.get('mask_type', 'binary')
 
     # ── Load and preprocess data ────────────────────────────────────────
     df = pd.read_csv(args.data)
@@ -478,7 +478,7 @@ if __name__ == "__main__":
         cfg=cfg,
         use_rho_net=True,
         use_neural_re=True,
-        g_hidden=16,
+        g_hidden=8,
         fullD=False,
         cov_means=checkpoint['cov_means'],
         cov_stds=checkpoint['cov_stds'],
@@ -559,24 +559,24 @@ if __name__ == "__main__":
     print(f"\n  Population-averaged (fit mode):")
     print(df_pop_test.to_string(index=False))
 
-    # ================================================================
-    # 3. FORECASTING MODE
-    # ================================================================
-    print(f"\n{'='*60}")
-    print("3. FORECASTING MODE")
-    print(f"{'='*60}")
+    # # ================================================================
+    # # 3. FORECASTING MODE
+    # # ================================================================
+    # print(f"\n{'='*60}")
+    # print("3. FORECASTING MODE")
+    # print(f"{'='*60}")
 
-    for name, loader in [("train", train_loader), ("test", test_loader)]:
-        df_fc = predict_forecast_mode(model, loader, device)
-        if len(df_fc) > 0:
-            mse_pop = compute_mse(df_fc, y_col="y_true", pred_col="mu_pop")
-            mse_pred = compute_mse(df_fc, y_col="y_true", pred_col="y_blup")
-            print(f"  {name:6s}: MSE(pop) = {mse_pop:.4f}, "
-                  f"MSE(pred) = {mse_pred:.4f}, n = {len(df_fc)}")
+    # for name, loader in [("train", train_loader), ("test", test_loader)]:
+    #     df_fc = predict_forecast_mode(model, loader, device)
+    #     if len(df_fc) > 0:
+    #         mse_pop = compute_mse(df_fc, y_col="y_true", pred_col="mu_pop")
+    #         mse_pred = compute_mse(df_fc, y_col="y_true", pred_col="y_blup")
+    #         print(f"  {name:6s}: MSE(pop) = {mse_pop:.4f}, "
+    #               f"MSE(pred) = {mse_pred:.4f}, n = {len(df_fc)}")
 
-            csv_path = os.path.join(args.output_dir,
-                                    f"forecast_{name.lower()}.csv")
-            df_fc.to_csv(csv_path, index=False)
+    #         csv_path = os.path.join(args.output_dir,
+    #                                 f"forecast_{name.lower()}.csv")
+    #         df_fc.to_csv(csv_path, index=False)
 
     # ================================================================
     # 4. PLOTS
@@ -585,23 +585,23 @@ if __name__ == "__main__":
     print("4. PLOTS")
     print(f"{'='*60}")
 
-    # plot_individual_predictions(
-    #     df_fit_train, n_subjects=25, ncols=5,
-    #     hlme_df=hlme_train_fit,
-    #     save_path=os.path.join(args.output_dir, "fit_individual_train.png"))
+    plot_individual_predictions(
+        df_fit_train, n_subjects=25, ncols=5,
+        hlme_df=hlme_train_fit,
+        save_path=os.path.join(args.output_dir, "fit_individual_train.png"))
     
-    # plot_individual_predictions(
-    #     df_pred_test, n_subjects=25, ncols=5,
-    #     hlme_df=hlme_val_pred,
-    #     save_path=os.path.join(args.output_dir, "pred_individual_val.png"))
+    plot_individual_predictions(
+        df_pred_test, n_subjects=25, ncols=5,
+        hlme_df=hlme_val_pred,
+        save_path=os.path.join(args.output_dir, "pred_individual_val.png"))
 
-    # hlme_pop = None
-    # if hlme_val_fit is not None:
-    #     hlme_pop = population_averaged_predictions(
-    #         hlme_val_fit)
+    hlme_pop = None
+    if hlme_val_fit is not None:
+        hlme_pop = population_averaged_predictions(
+            hlme_val_fit)
 
-    # plot_population_averaged(
-    #     df_pop_test, hlme_pop=hlme_pop, mode="fit",
-    #     save_path=os.path.join(args.output_dir, "population_average.png"))
+    plot_population_averaged(
+        df_pop_test, hlme_pop=hlme_pop, mode="fit",
+        save_path=os.path.join(args.output_dir, "population_average.png"))
 
     print("\nDone.")

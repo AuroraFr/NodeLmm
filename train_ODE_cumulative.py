@@ -103,6 +103,11 @@ if __name__ == "__main__":
         print(f"Subjects: {N} total → {len(train_idx)} train, {len(test_idx)} test")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed_all(SEED)
+        np.random.seed(SEED)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
         n_tv = 1   # only BMI_t
 

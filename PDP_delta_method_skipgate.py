@@ -712,6 +712,52 @@ def compute_sandwich_variance_cg(
 # 3. ∆PDP gradient  g_ℓ = ∇_θ  ∆PDP_ℓ
 # ─────────────────────────────────────────────────────────
 
+def _resample_batch_to_grid(t_pad, x_pad, mask, eval_grid):
+    """
+    Resample batch covariates from irregular observed times onto a fixed grid.
+
+    For each subject, linearly interpolates each covariate channel from
+    observed time points to eval_grid (LOCF/FOCB beyond range via np.interp).
+
+    Args:
+        t_pad:     (B, T_orig) original time points
+        x_pad:     (B, T_orig, C) original covariates
+        mask:      (B, T_orig) observation mask
+        eval_grid: (L,) array of target times
+
+    Returns:
+        t_grid:    (B, L)    common time grid
+        x_grid:    (B, L, C) interpolated covariates
+        mask_grid: (B, L)    all-ones mask
+    """
+    B, T_orig, C = x_pad.shape
+    L = len(eval_grid)
+    device = x_pad.device
+    dtype = x_pad.dtype
+
+    t_grid = torch.tensor(eval_grid, device=device, dtype=dtype
+                          ).unsqueeze(0).expand(B, -1).clone()
+    x_grid = torch.zeros(B, L, C, device=device, dtype=dtype)
+    mask_grid = torch.ones(B, L, device=device, dtype=dtype)
+
+    t_np = t_pad.cpu().numpy()
+    x_np = x_pad.cpu().numpy()
+    m_np = mask.cpu().numpy()
+
+    for i in range(B):
+        obs_i = m_np[i] > 0.5
+        if not obs_i.any():
+            continue
+        t_obs = t_np[i, obs_i]
+        for c in range(C):
+            vals_obs = x_np[i, obs_i, c]
+            x_grid[i, :, c] = torch.tensor(
+                np.interp(eval_grid, t_obs, vals_obs),
+                device=device, dtype=dtype)
+
+    return t_grid, x_grid, mask_grid
+
+
 def compute_delta_pdp_gradients(model, loader, device,
                                  bmi_lo, bmi_hi,
                                  visit_times,
@@ -719,28 +765,29 @@ def compute_delta_pdp_gradients(model, loader, device,
     """
     Compute g_ℓ = ∇_θ ∆PDP_ℓ for each visit time.
 
-    ∆PDP_ℓ = (1/n_ℓ) Σ_i [μ^{hi}_{i,c(i,ℓ)} − μ^{lo}_{i,c(i,ℓ)}]
+    All subjects are resampled onto the eval grid (= visit_times), so
+    every subject contributes at every time point.  The ODE is solved
+    on the common grid — no argmin snapping to observed times.
+
+    ∆PDP_ℓ = (1/N) Σ_i [μ^{hi}_{i,ℓ} − μ^{lo}_{i,ℓ}]
 
     The gradient is accumulated across batches by linearity:
-        g_ℓ = (1/n_ℓ) Σ_batch  ∇_θ  Σ_{i∈batch} δ_{i,ℓ}
-
-    The computation graph spans both forward passes (hi and lo)
-    because they share the same model parameters.
-
-    Also returns the ∆PDP point estimates for each visit time.
+        g_ℓ = (1/N) Σ_batch  ∇_θ  Σ_{i∈batch} δ_{i,ℓ}
 
     Returns:
         gradients: dict {vt: g_ℓ ∈ R^P}  (CPU)
         estimates: dict {vt: float}        ∆PDP estimates
-        counts:    dict {vt: int}          subjects per visit time
+        counts:    dict {vt: int}          subjects per visit time (= N for all ℓ)
     """
     model.eval()
     params = _param_list(model)
     P = sum(p.numel() for p in params)
+    L = len(visit_times)
+    eval_grid = np.array(visit_times, dtype=np.float64)
 
     g_accum = {vt: torch.zeros(P) for vt in visit_times}
     est_accum = {vt: 0.0 for vt in visit_times}
-    n_accum = {vt: 0 for vt in visit_times}
+    n_total = 0
 
     for batch in loader:
         _, t_pad, x_pad, y_pad, c_mask, mask, s = batch
@@ -749,72 +796,63 @@ def compute_delta_pdp_gradients(model, loader, device,
         mask = mask.to(device)
         s = s.to(device)
 
-        B, T = t_pad.shape
+        B = t_pad.shape[0]
 
-        # --- Two counterfactual forward passes (with grad) ---
-        x_hi = x_pad.clone()
+        # --- Resample all subjects onto common eval grid ---
+        t_grid, x_grid, mask_grid = _resample_batch_to_grid(
+            t_pad, x_pad, mask, eval_grid)
+
+        # --- Two counterfactual forward passes on the grid ---
+        x_hi = x_grid.clone()
         x_hi[:, :, 0] = bmi_hi
         mu_hi, _, _, _, _, _ = model(
-            t_pad, x_hi, masks=None,
-            static_covariates=s, bmi_t=x_hi[:, :, 0:1], obs_mask=mask
+            t_grid, x_hi, masks=None,
+            static_covariates=s, bmi_t=x_hi[:, :, 0:1], obs_mask=mask_grid
         )
 
-        x_lo = x_pad.clone()
+        x_lo = x_grid.clone()
         x_lo[:, :, 0] = bmi_lo
         mu_lo, _, _, _, _, _ = model(
-            t_pad, x_lo, masks=None,
-            static_covariates=s, bmi_t=x_lo[:, :, 0:1], obs_mask=mask
+            t_grid, x_lo, masks=None,
+            static_covariates=s, bmi_t=x_lo[:, :, 0:1], obs_mask=mask_grid
         )
 
-        # --- For each visit time, build differentiable sum ---
+        # --- Gradient per visit time (direct indexing, no argmin) ---
         for vt_idx, vt in enumerate(visit_times):
-            delta_sum = torch.tensor(0.0, device=device)
-            n_vt = 0
+            delta_sum = (mu_hi[:, vt_idx] - mu_lo[:, vt_idx]).sum()
 
-            for i in range(B):
-                obs_idx = torch.where(mask[i] > 0.5)[0]
-                if len(obs_idx) == 0:
-                    continue
-                obs_times = t_pad[i, obs_idx]
-                closest = obs_idx[torch.argmin(torch.abs(obs_times - vt))]
-                delta_sum = delta_sum + (mu_hi[i, closest] - mu_lo[i, closest])
-                n_vt += 1
+            retain = (vt_idx < L - 1)
+            grads = torch.autograd.grad(delta_sum, params,
+                                        retain_graph=retain,
+                                        allow_unused=True)
+            grads = [g if g is not None else torch.zeros_like(p)
+                     for g, p in zip(grads, params)]
+            g_batch = _cat_grads(grads).cpu()
 
-            if n_vt > 0:
-                # Backward — keep graph for remaining visit times
-                # allow_unused: g_net, L_unconstrained, log_residual_var
-                # are not in the mu computation graph
-                retain = (vt_idx < len(visit_times) - 1)
-                grads = torch.autograd.grad(delta_sum, params,
-                                            retain_graph=retain,
-                                            allow_unused=True)
-                # Replace None grads (unused params) with zeros
-                grads = [g if g is not None else torch.zeros_like(p)
-                         for g, p in zip(grads, params)]
-                g_batch = _cat_grads(grads).cpu()
+            g_accum[vt] += g_batch
+            est_accum[vt] += delta_sum.item()
 
-                g_accum[vt] += g_batch
-                est_accum[vt] += delta_sum.item()
-                n_accum[vt] += n_vt
+        n_total += B
 
-    # Normalise
+    # Normalise: n_total is the same for all visit times
     gradients = {}
     estimates = {}
+    counts = {}
     for vt in visit_times:
-        n = n_accum[vt]
-        if n > 0:
-            gradients[vt] = g_accum[vt] / n
-            estimates[vt] = est_accum[vt] / n
+        if n_total > 0:
+            gradients[vt] = g_accum[vt] / n_total
+            estimates[vt] = est_accum[vt] / n_total
         else:
             gradients[vt] = torch.zeros(P)
             estimates[vt] = 0.0
+        counts[vt] = n_total
 
     if verbose:
         for vt in visit_times:
             print(f"    g_{int(vt)}: ||g|| = {gradients[vt].norm().item():.4f}, "
-                  f"n = {n_accum[vt]}, ∆PDP = {estimates[vt]:.4f}")
+                  f"n = {counts[vt]}, ∆PDP = {estimates[vt]:.4f}")
 
-    return gradients, estimates, n_accum
+    return gradients, estimates, counts
 
 
 # ─────────────────────────────────────────────────────────
@@ -1100,7 +1138,7 @@ if __name__ == "__main__":
     parser.add_argument("--true_beta_bmi", type=float, default=-0.30)
     parser.add_argument("--true_beta_int", type=float, default=-0.05)
     parser.add_argument("--output_csv", type=str,
-                        default="results/simulation_baseline_nonorm_diagD_summary_2328.csv")
+                        default="results_simu/simulation_baseline_seed42_nonorm_diagD_summary_2328.csv")
     parser.add_argument("--bmi_pairs", type=str, default=None)
     parser.add_argument("--sandwich", action="store_true",
                         help="Use sandwich variance J⁻¹FJ⁻¹ instead of F⁻¹")
@@ -1116,7 +1154,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    visit_times = np.array([0, 5, 10, 15])
+    visit_times = np.array([0, 4, 8, 10])
 
     # BMI pairs
     if args.bmi_pairs:
@@ -1149,13 +1187,13 @@ if __name__ == "__main__":
     for sim_idx in range(start_sim, args.n_sims):
         if args.n_sims > 1:
             data_path = f"simu_datasets/S2a_sims/sim_{sim_idx+1:03d}.rds"
-            ckpt_path = f"checkpoints/simulation_baseline_skipgate_norhonorm_diagoD/best_model_ode_{sim_idx}.pt"
+            ckpt_path = f"checkpoints/simulation_baseline_skip_noreg_seed42_norhonorm_diagoD/best_model_ode_{sim_idx}.pt"
             print(f"\n{'#'*60}")
             print(f"# SIMULATION {sim_idx}")
             print(f"{'#'*60}")
         else:
             data_path = "simu_datasets/S2a_sims/sim_001.rds"
-            ckpt_path = "checkpoints/simulation_baseline_skipgate_norhonorm_diagoD/best_model_ode_0.pt"
+            ckpt_path = "checkpoints/simulation_baseline_skip_noreg_seed42_norhonorm_diagoD/best_model_ode_0.pt"
 
         # --- Data ---
         df = next(iter(pyreadr.read_r(data_path).values()))
@@ -1171,14 +1209,14 @@ if __name__ == "__main__":
 
         # --- Model ---
         cfg = NeuralODEConfig(
-            hidden_channels=8, enc_mlp_hidden=32, func_mlp_hidden=32,
+            hidden_channels=8, enc_mlp_hidden=16, func_mlp_hidden=16,
             dec_rho_hidden=16, dec_p=4, dec_q=3, depth=2, dropout=0.0,
             euler_steps_per_interval=4,
         )
         model = NeuralODEModel(
             x_dim=len(x_cols), static_dim=len(static_cols), cfg=cfg,
             n_tv=1, use_rho_net=True, use_neural_re=True,
-            re_spline_cols=None, g_hidden=16, fullD=False,
+            re_spline_cols=None, g_hidden=8, fullD=False,
             bmi_mean=0.0, bmi_std=1.0, static_skip_dims=[1],
             reg_mode=args.reg_mode,
         ).to(device)

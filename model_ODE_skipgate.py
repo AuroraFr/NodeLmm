@@ -110,9 +110,10 @@ class ODEFunc(nn.Module):
         else:
             t_expanded = t_scalar
 
+        # inp = torch.cat([z, t_expanded, static], dim=-1)
         # inp = torch.cat([z, t_expanded, bmi_t, static], dim=-1)
-        # inp = torch.cat([z, t_expanded, bmi_t], dim=-1)
         inp = torch.cat([z, t_expanded], dim=-1)
+        # inp = torch.cat([z, t_expanded], dim=-1)
         return torch.tanh(self.net(inp))
 
 
@@ -200,7 +201,7 @@ class Decoder(nn.Module):
             self.rho_net = MLP(latent_dim + skip_dim, rho_hidden, p,
                                depth=2, dropout=0.0)
             # self.rho_norm = nn.LayerNorm(p)
-            self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
+            self.beta_neural = nn.Parameter(0.01 * torch.randn(p))
         else:
             self.rho_net = None
             self.w_neural = nn.Parameter(0.01 * torch.randn(latent_dim + skip_dim))

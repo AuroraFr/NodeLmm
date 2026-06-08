@@ -306,6 +306,9 @@ def process_data(
             lambda s: (s - s.min()).dt.total_seconds() / (365.25 * 24 * 3600)
         )
 
+    # if "GLUC" in df.columns:
+    #     df['GLUC'] = np.log(df['GLUC'])
+
     # ── Add baseline metabolic features ───────────────────────────────────
     if metabolic_baseline_features is not None:
         feature_to_source = {

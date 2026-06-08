@@ -8,3 +8,7 @@ checkpoints/
 simu_datasets/
 EXPs/
 results_3C/
+*.pt
+*.json
+*.err
+*.out

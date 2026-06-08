@@ -245,7 +245,7 @@ class Decoder(nn.Module):
             else:
                 self.rho_norm = nn.Identity(p)
 
-            self.beta_neural = nn.Parameter(0.1 * torch.randn(p))
+            self.beta_neural = nn.Parameter(0.01 * torch.randn(p))
         else:
             self.rho_net = None
             self.w_neural = nn.Parameter(

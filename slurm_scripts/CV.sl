@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH -J ODE_LMM_q6
+#SBATCH -J CV_NODE_LMM
 # Asking for one node
-#SBATCH -w bora028 --time=2-10:00:00 --exclusive
+#SBATCH -w sirocco23 --time=2-10:00:00 --exclusive
 # Standard output
 #SBATCH -o slurm.sh%j.out
 # Standard error
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python train_ODE_real.py
+python CV_NODE_LMM.py

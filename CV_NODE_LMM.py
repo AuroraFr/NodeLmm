@@ -9,7 +9,7 @@ Protocol (three CSVs, three roles, no additional splits):
 Per-config flow:
   train on full train CSV -> val CSV for early stopping -> record val metrics.
 Selection:
-  winner = argmin over configs of val forecasting NLL.
+  winner = argmin over configs of val marginal NLL.
 Final:
   retrain winner on train with val for early stopping -> evaluate on test.
 
@@ -45,9 +45,9 @@ from train_ODE_real import RealDataset, collate_real, compute_covariate_stats
 @dataclass
 class CVConfig:
     # Architecture
-    hidden_channels: int = 16
-    enc_mlp_hidden: int = 32
-    func_mlp_hidden: int = 32
+    hidden_channels: int = 4
+    enc_mlp_hidden: int = 16
+    func_mlp_hidden: int = 16
     dec_rho_hidden: int = 16
     dec_p: int = 4
     dec_q: int = 3
@@ -58,15 +58,15 @@ class CVConfig:
 
     # Decoder variants
     use_rho_net: bool = True
-    use_rho_norm: bool = False
+    use_rho_norm: bool = False  
     use_neural_re: bool = True
-    g_hidden: int = 16
+    g_hidden: int = 8
     fullD: bool = False
 
     # Skip architecture
     use_dynamic_skip: bool = True
     static_skip_all: bool = True
-
+    static_skip_dims: int = 4,
     # Regularisation
     reg_mode: Optional[str] = None
     lambda_reg: float = 0.0
@@ -75,8 +75,8 @@ class CVConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-5
     batch_size: int = 128
-    max_epochs: int = 400
-    patience: int = 50
+    max_epochs: int = 1000
+    patience: int = 300
 
     def key(self) -> str:
         return (f"h{self.hidden_channels}_p{self.dec_p}_q{self.dec_q}"
@@ -181,7 +181,7 @@ def build_model(cfg: CVConfig, n_tv: int, static_dim: int,
 # ─────────────────────────────────────────────────────────────────
 
 def train_model(model, train_loader, val_loader, cfg: CVConfig, device,
-                verbose: bool = False):
+                verbose: bool = True):
     """
     Train on train_loader, early-stop on val_loader.
 
@@ -191,10 +191,29 @@ def train_model(model, train_loader, val_loader, cfg: CVConfig, device,
       - best-val-NLL checkpointing, early stop after `patience` epochs
         without improvement
     """
-    opt = torch.optim.Adam(model.parameters(),
-                           lr=cfg.lr, weight_decay=cfg.weight_decay)
+
+    nn_weights, gate_params, var_params, fe_params = [], [], [], []
+    for n, p in model.named_parameters():
+        print(n)
+        if 'skip_gate_logit' in n:
+            gate_params.append(p)
+        elif 'log_residual_var' in n or 'log_std' in n:
+            var_params.append(p)
+        elif 'beta_neural' in n:
+            fe_params.append(p)
+        else:
+            nn_weights.append(p)
+
+    print(gate_params, fe_params, var_params)
+    opt = torch.optim.AdamW([
+        {'params': nn_weights, 'weight_decay': cfg.weight_decay},
+        {'params': gate_params, 'weight_decay': 0.0},
+        {'params': var_params, 'weight_decay': 0.0},
+        {'params': fe_params,  'weight_decay': 0.0},  # or a small value if desired
+    ])
+    
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=max(10, cfg.patience // 3),
+        opt, mode="min", factor=0.5, patience=50,
         verbose=False)
 
     best_val = float("inf")
@@ -288,13 +307,17 @@ def _blup_point_predictions(mu, V, Z, D, sig2, y, target_mask,
 def evaluate_loader(model, loader, device):
     """
     Evaluate on any held-out loader (val or test).
-    Returns fit-mode NLL/MSE and forecast-mode NLL/MSE (last visit held out).
+
+    Returns:
+      - nll_per_subject:  marginal NLL (b_i integrated out) — model selection criterion
+      - mse_fit_per_obs:  MSE with BLUP using all visits
+      - mse_fc_per_obs:   MSE with BLUP using all visits except the last (forecast)
     """
     model.eval()
     tot = {
-        "nll_fit_sum": 0.0, "n_subj": 0, "n_obs_total": 0,
+        "nll_sum": 0.0, "n_subj": 0, "n_obs_total": 0,
         "sqerr_fit_sum": 0.0,
-        "nll_fc_sum": 0.0, "sqerr_fc_sum": 0.0, "n_fc": 0,
+        "sqerr_fc_sum": 0.0, "n_fc": 0,
     }
     with torch.no_grad():
         for _, x_aug, y, target_mask, static in loader:
@@ -304,16 +327,17 @@ def evaluate_loader(model, loader, device):
                 x_aug, static_covariates=static, obs_mask=target_mask)
 
             N, T = y.shape
-            tot["nll_fit_sum"] += masked_NLL(mu, y, V, target_mask).item() * N
+            tot["nll_sum"] += masked_NLL(mu, y, V, target_mask).item() * N
             tot["n_subj"] += N
             tot["n_obs_total"] += int(target_mask.sum().item())
 
+            # Fit MSE: BLUP from all observed visits
             Y_hat_fit = _blup_point_predictions(
                 mu, V, Z, D, sig2, y, target_mask, forecast_cutoff=None)
             sq = ((Y_hat_fit - y) ** 2) * target_mask
             tot["sqerr_fit_sum"] += sq.sum().item()
 
-            # Forecast: last observed visit, BLUP from preceding visits
+            # Forecast MSE: BLUP from all visits except the last
             cutoff = torch.zeros(N, dtype=torch.long, device=device)
             last_obs = torch.full((N,), -1, dtype=torch.long, device=device)
             for i in range(N):
@@ -327,23 +351,18 @@ def evaluate_loader(model, loader, device):
                 j = int(last_obs[i].item())
                 if j < 0:
                     continue
-                resid = (Y_hat_fc[i, j] - y[i, j]).item()
-                v = (Z[i, j] @ D @ Z[i, j]).item() + sig2.item()
-                tot["sqerr_fc_sum"] += resid ** 2
-                tot["nll_fc_sum"] += 0.5 * (
-                    resid ** 2 / v + np.log(v) + np.log(2 * np.pi))
+                tot["sqerr_fc_sum"] += (Y_hat_fc[i, j] - y[i, j]).item() ** 2
                 tot["n_fc"] += 1
 
     n_subj = max(tot["n_subj"], 1)
     n_obs = max(tot["n_obs_total"], 1)
     n_fc = max(tot["n_fc"], 1)
     return {
-        "nll_fit_per_subject":   tot["nll_fit_sum"] / n_subj,
-        "mse_fit_per_obs":       tot["sqerr_fit_sum"] / n_obs,
-        "nll_forecast_per_obs":  tot["nll_fc_sum"] / n_fc,
-        "mse_forecast_per_obs":  tot["sqerr_fc_sum"] / n_fc,
-        "n_subjects":            tot["n_subj"],
-        "n_obs_forecast":        tot["n_fc"],
+        "nll_per_subject":   tot["nll_sum"] / n_subj,
+        "mse_fit_per_obs":   tot["sqerr_fit_sum"] / n_obs,
+        "mse_fc_per_obs":    tot["sqerr_fc_sum"] / n_fc,
+        "n_subjects":        tot["n_subj"],
+        "n_obs_forecast":    tot["n_fc"],
     }
 
 
@@ -357,11 +376,23 @@ def run_config(
     cov_means, cov_stds,
     info: dict, device: str,
     verbose: bool = True,
+    init_seed: int = 42
 ):
     """
     Train the config on the train CSV with early stopping on the val CSV,
     and return the full set of val metrics plus the trained model.
     """
+
+    # Reset RNG so every config starts from the same initialisation state.
+    # Layers with identical shapes across configs will get identical weights;
+    # layers that differ (because the architecture differs) will still get
+    # deterministic draws from the same generator sequence.
+    torch.manual_seed(init_seed)
+    np.random.seed(init_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(init_seed)
+
+
     model = build_model(cfg, info["n_tv"], info["static_dim"],
                         cov_means, cov_stds, device)
     model, best_val_nll = train_model(
@@ -384,7 +415,7 @@ def grid_search(
 ):
     """
     For each config: train on train CSV, early-stop + select on val CSV.
-    Rank by val forecasting NLL.
+    Rank by val marginal NLL.
 
     The best config's trained model is saved to disk so we don't need to
     retrain it for the test evaluation.
@@ -400,7 +431,7 @@ def grid_search(
         shuffle=False, collate_fn=collate_real)
 
     all_results = []
-    best_val_fc_nll = float("inf")
+    best_val_nll = float("inf")
 
     for i, cfg in enumerate(configs):
         print(f"\n[{i+1}/{len(configs)}] {cfg.key()}")
@@ -408,12 +439,11 @@ def grid_search(
         try:
             model, val_metrics = run_config(
                 cfg, train_loader, val_loader,
-                cov_means, cov_stds, info, device, verbose=False)
+                cov_means, cov_stds, info, device, verbose=True)
             v = val_metrics
-            print(f"  VAL  fc_nll={v['nll_forecast_per_obs']:.4f}  "
-                  f"fc_mse={v['mse_forecast_per_obs']:.4f}  "
-                  f"fit_nll={v['nll_fit_per_subject']:.4f}  "
-                  f"fit_mse={v['mse_fit_per_obs']:.4f}")
+            print(f"  VAL  nll={v['nll_per_subject']:.4f}  "
+                  f"fit_mse={v['mse_fit_per_obs']:.4f}  "
+                  f"fc_mse={v['mse_fc_per_obs']:.4f}")
 
             res = {
                 "config_key": cfg.key(), "config": asdict(cfg),
@@ -423,8 +453,8 @@ def grid_search(
 
             # Save the best model to disk so we don't retrain for test
             if (save_best_model_path is not None
-                    and val_metrics["nll_forecast_per_obs"] < best_val_fc_nll):
-                best_val_fc_nll = val_metrics["nll_forecast_per_obs"]
+                    and val_metrics["nll_per_subject"] < best_val_nll):
+                best_val_nll = val_metrics["nll_per_subject"]
                 torch.save({
                     "model_state_dict": model.state_dict(),
                     "config": asdict(cfg),
@@ -450,17 +480,17 @@ def grid_search(
 
     # Rank
     ok = [r for r in all_results if r.get("status") == "ok"]
-    ok.sort(key=lambda r: r["val_metrics"]["nll_forecast_per_obs"])
+    ok.sort(key=lambda r: r["val_metrics"]["nll_per_subject"])
 
     print("\n" + "=" * 80)
-    print("Top 10 configs by VAL forecasting NLL")
+    print("Top 10 configs by VAL NLL")
     print("=" * 80)
     for r in ok[:10]:
         v = r["val_metrics"]
         print(f"  {r['config_key']:70s}")
-        print(f"     fc_nll={v['nll_forecast_per_obs']:.4f}  "
-              f"fc_mse={v['mse_forecast_per_obs']:.4f}  "
-              f"fit_mse={v['mse_fit_per_obs']:.4f}")
+        print(f"     nll={v['nll_per_subject']:.4f}  "
+              f"fit_mse={v['mse_fit_per_obs']:.4f}  "
+              f"fc_mse={v['mse_fc_per_obs']:.4f}")
     return all_results
 
 
@@ -576,7 +606,7 @@ def compute_lcva_empirical_fisher(model, loader, device, ridge: float = 1e-3):
 def build_tier1_grid() -> list[CVConfig]:
     """Tier 1: reg_mode × lambda × use_dynamic_skip."""
     grid = []
-    for reg_mode in [None, "skip_gate", "group_lasso"]:
+    for reg_mode in [None, "skip_gate"]:
         lams = [0.0] if reg_mode is None else [0.1, 1.0]
         for lam in lams:
             for use_skip in [True, False]:
@@ -584,7 +614,8 @@ def build_tier1_grid() -> list[CVConfig]:
                     reg_mode=reg_mode,
                     lambda_reg=lam,
                     use_dynamic_skip=use_skip,
-                    use_rho_norm=False,
+                    use_rho_norm=True,
+                    static_skip_dims = 4
                 ))
     return grid
 
@@ -593,8 +624,8 @@ def build_tier2_grid(best: CVConfig) -> list[CVConfig]:
     """Tier 2: around the winner, sweep rho_norm, latent dim, p."""
     grid = []
     for rho_norm in [False, True]:
-        for h in [8, 16, 32]:
-            for p in [2, 4, 8]:
+        for h in [4, 8, 16]:
+            for p in [2, 4]:
                 cfg = CVConfig(**asdict(best))
                 cfg.use_rho_norm = rho_norm
                 cfg.hidden_channels = h
@@ -629,7 +660,7 @@ if __name__ == "__main__":
 
     # ---- 3. Tier-2 around the Tier-1 winner ----
     ok1 = [r for r in tier1_results if r.get("status") == "ok"]
-    ok1.sort(key=lambda r: r["val_metrics"]["nll_forecast_per_obs"])
+    ok1.sort(key=lambda r: r["val_metrics"]["nll_per_subject"])
     best_tier1 = CVConfig(**ok1[0]["config"])
     print(f"\nBest Tier 1: {best_tier1.key()}")
 
@@ -643,11 +674,11 @@ if __name__ == "__main__":
 
     # ---- 4. Pick final winner, evaluate on test ----
     ok2 = [r for r in tier2_results if r.get("status") == "ok"]
-    ok2.sort(key=lambda r: r["val_metrics"]["nll_forecast_per_obs"])
+    ok2.sort(key=lambda r: r["val_metrics"]["nll_per_subject"])
 
-    # Use whichever tier produced the best val fc_nll
-    best_tier2_val = ok2[0]["val_metrics"]["nll_forecast_per_obs"]
-    best_tier1_val = ok1[0]["val_metrics"]["nll_forecast_per_obs"]
+    # Use whichever tier produced the best val NLL
+    best_tier2_val = ok2[0]["val_metrics"]["nll_per_subject"]
+    best_tier1_val = ok1[0]["val_metrics"]["nll_per_subject"]
     winner_path = ("cv_best_tier2.pt" if best_tier2_val < best_tier1_val
                    else "cv_best_tier1.pt")
 

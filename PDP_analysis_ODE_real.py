@@ -379,7 +379,7 @@ def compute_delta_pdp(results, ages, masks, times, val_lo, val_hi,
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
 
-    closest = _closest_obs_per_subject_2(delta, masks, times, visit_times)
+    closest = _closest_obs_per_subject(delta, masks, times, visit_times)
 
     print(f"\nΔPDP for {target_name} ({val_lo} → {val_hi}, Δv = {delta_v}):")
     print(f"  {'Time':>6s}  {'ΔPDP':>10s}  {'SE':>10s}  {'n':>6s}")
@@ -438,7 +438,7 @@ def compute_delta_pdp_stratified(results, ages, masks, times,
         masks_group = masks[group_mask]
         times_group = times[group_mask]
 
-        closest_delta = _closest_obs_per_subject_2(
+        closest_delta = _closest_obs_per_subject(
             delta_group, masks_group, times_group, visit_times)
 
         print(f"\n  {group_name} (n={n_group}, mean AGEc={mean_age:.2f})")
@@ -631,7 +631,7 @@ def compute_trajectory_profile_pdp(model, loader, device, profiles,
 
     for pname in profiles:
         mu = results[pname]
-        closest = _closest_obs_per_subject_2(mu, masks, times, visit_times)
+        closest = _closest_obs_per_subject(mu, masks, times, visit_times)
         print(f"    {pname:<20s}", end="")
         for vt in visit_times:
             d = closest[vt]
@@ -641,23 +641,23 @@ def compute_trajectory_profile_pdp(model, loader, device, profiles,
                 print(f"  {'N/A':>7s}", end="")
         print()
 
-    # Diagnostic: early_burden vs late_spike
-    if "late_decline" in results and "late_spike" in results:
-        eb = results["late_decline"]
-        ls = results["late_spike"]
-        diff = eb - ls
-        closest_diff = _closest_obs_per_subject_2(diff, masks, times, visit_times)
-        print(f"\n    Diagnostic: late_decline − late_spike")
-        print(f"    {'Time':>8s}  {'Diff':>8s}  {'SE':>8s}  {'Interp':>20s}")
-        for vt in visit_times:
-            d = closest_diff[vt]
-            if len(d) > 10:
-                m = d.mean()
-                se = d.std() / np.sqrt(len(d))
-                interp = ("cumulative ✓" if m < -0.1
-                          else "instantaneous" if abs(m) < 0.1
-                          else "unexpected (+)")
-                print(f"    {vt:8.0f}  {m:+8.3f}  {se:8.3f}  {interp:>20s}")
+    # # Diagnostic: early_burden vs late_spike
+    # if "late_decline" in results and "late_spike" in results:
+    #     eb = results["late_decline"]
+    #     ls = results["late_spike"]
+    #     diff = eb - ls
+    #     closest_diff = _closest_obs_per_subject(diff, masks, times, visit_times)
+    #     print(f"\n    Diagnostic: late_decline − late_spike")
+    #     print(f"    {'Time':>8s}  {'Diff':>8s}  {'SE':>8s}  {'Interp':>20s}")
+    #     for vt in visit_times:
+    #         d = closest_diff[vt]
+    #         if len(d) > 10:
+    #             m = d.mean()
+    #             se = d.std() / np.sqrt(len(d))
+    #             interp = ("cumulative ✓" if m < -0.1
+    #                       else "instantaneous" if abs(m) < 0.1
+    #                       else "unexpected (+)")
+    #             print(f"    {vt:8.0f}  {m:+8.3f}  {se:8.3f}  {interp:>20s}")
 
     return results, masks, times
 
@@ -739,7 +739,7 @@ def plot_trajectory_profile_pdp(results, masks, times,
 
     # ── Plot each profile ────────────────────────────────────────────────
     for pname, mu in results.items():
-        closest = _closest_obs_per_subject_2(mu, masks, times, visit_times)
+        closest = _closest_obs_per_subject(mu, masks, times, visit_times)
 
         t_plot, mean_plot, lo_plot, hi_plot = [], [], [], []
         for vt in visit_times:
@@ -757,8 +757,8 @@ def plot_trajectory_profile_pdp(results, masks, times,
         marker = profile_markers.get(pname, "o")
         label = profile_labels.get(pname, pname)
 
-        ax.fill_between(t_plot, lo_plot, hi_plot, color=color,
-                        alpha=0.10, zorder=1)
+        # ax.fill_between(t_plot, lo_plot, hi_plot, color=color,
+        #                 alpha=0.10, zorder=1)
         ax.plot(t_plot, mean_plot, linestyle=ls, marker=marker, color=color,
                 linewidth=1.3, markersize=5, label=label, zorder=2)
 
@@ -816,7 +816,7 @@ def plot_pdp(results, ages, masks, times, intervention_values,
             masks_group = masks[group_mask]
             times_group = times[group_mask]
 
-            closest = _closest_obs_per_subject_2(
+            closest = _closest_obs_per_subject(
                 mu_group, masks_group, times_group, visit_times)
             mean_pred, visit_t_plot = [], []
             for vt in visit_times:
@@ -884,7 +884,7 @@ def plot_pdp_marginal(results, masks, times, intervention_values,
 
     # PDP curves (colored)
     for v_idx, v in enumerate(intervention_values):
-        closest = _closest_obs_per_subject_2(
+        closest = _closest_obs_per_subject(
             results[v], masks, times, visit_times)
 
         mean_pred, visit_t_plot = [], []
@@ -921,7 +921,7 @@ def plot_delta_pdp(results, masks, times, val_lo, val_hi,
     if visit_times is None:
         visit_times = VISIT_TIMES_3C
 
-    closest = _closest_obs_per_subject_2(delta, masks, times, visit_times)
+    closest = _closest_obs_per_subject(delta, masks, times, visit_times)
 
     t_plot, mean_plot, lo_plot, hi_plot = [], [], [], []
     for vt in visit_times:
@@ -940,8 +940,8 @@ def plot_delta_pdp(results, masks, times, val_lo, val_hi,
     ax.fill_between(t_plot, lo_plot, hi_plot, color='firebrick', alpha=0.15)
     ax.axhline(0, color='grey', linestyle='--', alpha=0.5)
     ax.set_xlabel('Time (years)')
-    ax.set_ylabel(f'ΔPDP ({target_name} {val_lo} → {val_hi})')
-    ax.set_title(f'ΔPDP of {target_name} on ISA15 (3C)')
+    ax.set_ylabel(f'ΔPDP ({target_name} {np.round(val_lo, 3)} → {np.round(val_hi, 3)})')
+    ax.set_title(f'ΔPDP of {target_name} on IST (3C)')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
