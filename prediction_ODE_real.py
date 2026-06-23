@@ -334,8 +334,8 @@ def plot_individual_predictions(df_fit, n_subjects=25, ncols=5,
 
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper center", ncol=4, fontsize=9)
-    fig.suptitle("Individual BLUP predictions (fit mode) — Neural ODE-LMM",
-                 fontsize=13, y=1.02)
+    # fig.suptitle("Individual BLUP predictions (fit mode) — Neural ODE-LMM",
+    #              fontsize=13, y=1.02)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -366,8 +366,8 @@ def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
 
     ax.set_xlabel("Time (years)", fontsize=12)
     ax.set_ylabel("ISA15", fontsize=12)
-    ax.set_title(f"Population-averaged predictions ({mode}) — Neural ODE-LMM",
-                 fontsize=13)
+    # ax.set_title(f"Population-averaged predictions ({mode}) — Neural ODE-LMM",
+    #              fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
@@ -385,7 +385,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Prediction and evaluation for Neural ODE-LMM (3C cohort)")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_sepreg_reduced_H12.pt")
+                        default="checkpoints/cv_final_model.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--hlme_csv", type=str, default='results_3C/hlme/',
@@ -405,13 +405,13 @@ if __name__ == "__main__":
     ckpt_cfg = checkpoint['config']
     print(f"Loaded checkpoint: {args.checkpoint}")
     print(f"  Epoch: {checkpoint.get('epoch', '?')}")
-    print(f"  Best test loss: {checkpoint.get('best_test_loss', '?'):.4f}")
+    # print(f"  Best test loss: {checkpoint.get('best_test_loss', '?'):.4f}")
 
     # ── Feature definitions from checkpoint ─────────────────────────────
     id_col = "NUM_ID"
     target_col = "ISA15"
-    time_varying_features = ckpt_cfg['time_varying_features']
-    static_features = ckpt_cfg['static_features']
+    time_varying_features = ckpt_cfg.get('time_varying_features', ["BMI", "PAS", "PAD", "GLUC", "HDL"])
+    static_features = ckpt_cfg.get('static_features', ["SEX_code", "AGEc", "DIPNIV_2", "DIPNIV_3"])
     K = len(time_varying_features)
     Ks = len(static_features)
     interp_method = ckpt_cfg.get('interp_method', 'linear')
@@ -422,9 +422,15 @@ if __name__ == "__main__":
     test_df = pd.read_csv("3C_dataset/test_3C_data.csv")
 
     if "AGEc" not in df.columns:
+        # all_df = pd.read_csv("3C_dataset/data_3C.csv")
+        # baseline_age = all_df.groupby(id_col)["AGE0"].transform("first")
+        # baseline_age_mean = baseline_age.mean()
+        # df["AGEc"] = df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
+        # test_df["AGEc"] = test_df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
+
         all_df = pd.read_csv("3C_dataset/data_3C.csv")
-        baseline_age = all_df.groupby(id_col)["AGE0"].transform("first")
-        baseline_age_mean = baseline_age.mean()
+        baseline_age_mean = all_df.groupby(id_col)["AGE0"].first().mean()
+        print('baseline_age_mean', baseline_age_mean)
         df["AGEc"] = df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
         test_df["AGEc"] = test_df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
 
@@ -467,8 +473,8 @@ if __name__ == "__main__":
         dec_p=ckpt_cfg.get('dec_p', 4),
         dec_q=ckpt_cfg.get('dec_q', 3),
         depth=ckpt_cfg.get('depth', 2),
-        euler_steps_per_interval=ckpt_cfg['euler_steps'],
-        ode_solver=ckpt_cfg.get('ode_solver', 'euler'),
+        euler_steps_per_interval=4,
+        ode_solver=ckpt_cfg.get('ode_solver', 'rk4'),
         use_rho_norm=ckpt_cfg.get('use_rho_norm', True)
     )
 
@@ -483,8 +489,8 @@ if __name__ == "__main__":
         cov_means=checkpoint['cov_means'],
         cov_stds=checkpoint['cov_stds'],
         static_skip_dims=ckpt_cfg.get('static_skip_dims', list(range(Ks))),
-        use_dynamic_skip=ckpt_cfg.get('use_dynamic_skip', True),
-        reg_mode=ckpt_cfg.get('reg_mode', None),
+        use_dynamic_skip=True,
+        reg_mode='group_lasso',
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
@@ -559,24 +565,24 @@ if __name__ == "__main__":
     print(f"\n  Population-averaged (fit mode):")
     print(df_pop_test.to_string(index=False))
 
-    # # ================================================================
-    # # 3. FORECASTING MODE
-    # # ================================================================
-    # print(f"\n{'='*60}")
-    # print("3. FORECASTING MODE")
-    # print(f"{'='*60}")
+    # ================================================================
+    # 3. FORECASTING MODE
+    # ================================================================
+    print(f"\n{'='*60}")
+    print("3. FORECASTING MODE")
+    print(f"{'='*60}")
 
-    # for name, loader in [("train", train_loader), ("test", test_loader)]:
-    #     df_fc = predict_forecast_mode(model, loader, device)
-    #     if len(df_fc) > 0:
-    #         mse_pop = compute_mse(df_fc, y_col="y_true", pred_col="mu_pop")
-    #         mse_pred = compute_mse(df_fc, y_col="y_true", pred_col="y_blup")
-    #         print(f"  {name:6s}: MSE(pop) = {mse_pop:.4f}, "
-    #               f"MSE(pred) = {mse_pred:.4f}, n = {len(df_fc)}")
+    for name, loader in [("train", train_loader), ("test", test_loader)]:
+        df_fc = predict_forecast_mode(model, loader, device)
+        if len(df_fc) > 0:
+            mse_pop = compute_mse(df_fc, y_col="y_true", pred_col="mu_pop")
+            mse_pred = compute_mse(df_fc, y_col="y_true", pred_col="y_blup")
+            print(f"  {name:6s}: MSE(pop) = {mse_pop:.4f}, "
+                  f"MSE(pred) = {mse_pred:.4f}, n = {len(df_fc)}")
 
-    #         csv_path = os.path.join(args.output_dir,
-    #                                 f"forecast_{name.lower()}.csv")
-    #         df_fc.to_csv(csv_path, index=False)
+            csv_path = os.path.join(args.output_dir,
+                                    f"forecast_{name.lower()}.csv")
+            df_fc.to_csv(csv_path, index=False)
 
     # ================================================================
     # 4. PLOTS

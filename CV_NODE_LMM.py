@@ -45,7 +45,7 @@ from train_ODE_real import RealDataset, collate_real, compute_covariate_stats
 @dataclass
 class CVConfig:
     # Architecture
-    hidden_channels: int = 4
+    hidden_channels: int = 8
     enc_mlp_hidden: int = 16
     func_mlp_hidden: int = 16
     dec_rho_hidden: int = 16
@@ -109,12 +109,11 @@ def prepare_datasets(
 
     if "AGEc" not in df_train.columns:
         all_df = pd.read_csv(all_csv)
-        baseline_age = all_df.groupby(id_col)["AGE0"].transform("first")
-        mu_age = baseline_age.mean()
-        for df_ in (df_train, df_val, df_test):
-            df_["AGEc"] = (
-                df_.groupby(id_col)["AGE0"].transform("first") - mu_age)
-
+        baseline_age_mean = all_df.groupby(id_col)["AGE0"].first().mean()
+        print('baseline_age_mean', baseline_age_mean)
+        df_train["AGEc"] = df_train.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
+        df_test["AGEc"] = df_test.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
+    
     kwargs = dict(
         id_col=id_col,
         time_varying_features=list(time_varying_features),
@@ -204,7 +203,6 @@ def train_model(model, train_loader, val_loader, cfg: CVConfig, device,
         else:
             nn_weights.append(p)
 
-    print(gate_params, fe_params, var_params)
     opt = torch.optim.AdamW([
         {'params': nn_weights, 'weight_decay': cfg.weight_decay},
         {'params': gate_params, 'weight_decay': 0.0},
@@ -606,16 +604,18 @@ def compute_lcva_empirical_fisher(model, loader, device, ridge: float = 1e-3):
 def build_tier1_grid() -> list[CVConfig]:
     """Tier 1: reg_mode × lambda × use_dynamic_skip."""
     grid = []
-    for reg_mode in [None, "skip_gate"]:
-        lams = [0.0] if reg_mode is None else [0.1, 1.0]
+    for reg_mode in [None, "group_lasso"]:
+        lams = [0.0] if reg_mode is None else [0.001, 0.01, 0.1]
         for lam in lams:
             for use_skip in [True, False]:
+                if not use_skip and reg_mode == "group_lasso":
+                    continue  # no skip weights to penalise
                 grid.append(CVConfig(
                     reg_mode=reg_mode,
                     lambda_reg=lam,
                     use_dynamic_skip=use_skip,
                     use_rho_norm=True,
-                    static_skip_dims = 4
+                    static_skip_dims = [0,1,2,3]
                 ))
     return grid
 
@@ -624,7 +624,7 @@ def build_tier2_grid(best: CVConfig) -> list[CVConfig]:
     """Tier 2: around the winner, sweep rho_norm, latent dim, p."""
     grid = []
     for rho_norm in [False, True]:
-        for h in [4, 8, 16]:
+        for h in [16]:
             for p in [2, 4]:
                 cfg = CVConfig(**asdict(best))
                 cfg.use_rho_norm = rho_norm

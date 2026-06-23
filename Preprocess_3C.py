@@ -394,6 +394,10 @@ def process_data(
         # ── Static features ──────────────────────────────────────────────
         s_i = patient_df[static_features].iloc[0].values.astype(np.float32)
 
+        PRACTICE_EFFECT = -1.85
+        if target_mask[0] == 1.0:
+            y[0] = y[0] - PRACTICE_EFFECT
+
         # ── Build patient dict ────────────────────────────────────────────
         patient_dict = {
             "x_aug": torch.tensor(x_aug, dtype=torch.float32),

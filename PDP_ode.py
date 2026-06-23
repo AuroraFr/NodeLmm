@@ -151,7 +151,7 @@ if __name__ == "__main__":
     n_tv = 1
 
     # ── Build model ─────────────────────────────────────────────────────
-    from model_ODE_skipgate import NeuralODEModel, NeuralODEConfig
+    from model_ODE_baseline import NeuralODEModel, NeuralODEConfig
 
     cfg = NeuralODEConfig(
         hidden_channels=8,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -J baseline
+#SBATCH -J S2_2_sel
 # Asking for one node
 #SBATCH -w bora044 --time=2-10:00:00 --exclusive
 # Standard output
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python train_ODE.py
+python cumulative_model_selection.py --n_sims 3

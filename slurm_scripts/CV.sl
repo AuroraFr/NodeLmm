@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH -J CV_NODE_LMM
 # Asking for one node
-#SBATCH -w sirocco23 --time=2-10:00:00 --exclusive
+#SBATCH -w bora041 --time=2-10:00:00 --exclusive
 # Standard output
 #SBATCH -o slurm.sh%j.out
 # Standard error

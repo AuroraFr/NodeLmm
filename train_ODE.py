@@ -7,7 +7,6 @@ Architecture:
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural  ← BMI skip connection
   - RE:       Z = [1, rs1(t), rs2(t)] or g(z(t))          (classical spline basis/neural network)
 
-BMI is completely removed from the ODE dynamics.
 This guarantees PDP separation at all times.
 
 Data encoding (same as CDE version for compatibility):
@@ -21,7 +20,7 @@ import os
 import numpy as np
 import pyreadr
 from dataset import LongitudinalDataset, collate_pad
-from model_ODE_skipgate import NeuralODEModel, NeuralODEConfig
+from model_ODE_baseline import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
 import argparse
 
@@ -33,7 +32,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Neural ODE-LMM training")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_baseline_skip_noreg_seed42_norhonorm_diagoD")
+                        default="checkpoints/simulation_baseline_noreg_seed42_rhonorm_diagoD")
     parser.add_argument("--data", type=str,
                         default="simu_datasets/S2a_sims")
     args = parser.parse_args()
@@ -55,16 +54,21 @@ if __name__ == "__main__":
     time_col = "time"
     y_col = "ISA15_sim"
     id_col = "NUM_ID"
-    x_cols = ["BMI_t", "rs1", "rs2"]
+    x_cols = ["BMI_t"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
-    for i in range(42, 100):
+    for i in range(20, 21):
         path = args.data + f"/sim_{i+1:03d}.rds"
         df = next(iter(pyreadr.read_r(path).values()))
         df["SEX"] = df["SEX"].astype("category")
         df["SEX_code"] = df["SEX"].cat.codes.astype("float64")
         df["DIPNIV2"] = (df["DIPNIV"].astype(str) == "2").astype("float64")
         df["DIPNIV3"] = (df["DIPNIV"].astype(str) == "3").astype("float64")
+
+        # print(f"DIPNIV unique: {df['DIPNIV'].unique()}")
+        # print(f"DIPNIV3 sum: {df['DIPNIV3'].sum()}")
+        # print(f"DIPNIV3 mean: {df['DIPNIV3'].mean()}")
+        # break
 
         full_dataset = LongitudinalDataset(df, id_col, time_col, x_cols, y_col,
                                         static_cols=static_cols)
@@ -137,12 +141,13 @@ if __name__ == "__main__":
             bmi_mean=bmi_mean,
             bmi_std=bmi_std,
             use_bmi_skip=True,
-            static_skip_dims=[1],         # AGEc skip to decoder
-            reg_mode=None
+            static_skip_dims=[0,1,2,3],        
+            reg_mode=None,
+            use_learned_z0=False
         ).to(device)
 
-        LAMBDA_REG = 0.1
-        REG_MODE = "skip_gate"
+        LAMBDA_REG = 0.0
+        REG_MODE = None
 
         total_params = sum(p.numel() for p in model.parameters())
         print(f"\nTotal parameters: {total_params}")

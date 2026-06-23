@@ -1,13 +1,12 @@
 """
 Runner for continuous-time PDP analysis — Neural ODE-LMM on 3C cohort.
 
-v2: adds delta-method variance estimation (Section 3.2 of the paper).
+v3: supports Ledoit-Wolf variance mode by passing raw fisher + scores.
 
 Usage:
-    python PDP_ode_real_continuous.py
-    python PDP_ode_real_continuous.py --delta_method               # full CI
-    python PDP_ode_real_continuous.py --delta_method --fisher_max 2000  # faster
-    python PDP_ode_real_continuous.py --n_points 50                # finer grid
+    python PDP_ode_real_continuous.py --delta_method
+    python PDP_ode_real_continuous.py --delta_method --variance_mode ledoit_wolf
+    python PDP_ode_real_continuous.py --delta_method --variance_mode marquardt
 """
 
 import torch
@@ -17,19 +16,15 @@ import pandas as pd
 import argparse
 import os
 
-from Preprocess_3C import process_data, EXPECTED_TIMES
+from Preprocess_3C import process_data
 from train_ODE_real import RealDataset, collate_real
 from model_ODE_real import NeuralODEModel, NeuralODEConfig
-from PDP_analysis_ODE_real import VISIT_TIMES_3C, make_profiles
 from PDP_continuous_time import (
     make_eval_grid,
     make_profiles_continuous,
     compute_trajectory_profile_pdp_continuous,
-    compute_pdp_continuous,
     plot_trajectory_profile_pdp_continuous,
     plot_trajectory_profile_pdp_delta,
-    plot_pdp_continuous,
-    plot_delta_pdp_continuous,
 )
 
 import warnings
@@ -40,26 +35,29 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Continuous-time PDP analysis — Neural ODE-LMM on 3C")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real_3C_regnone_H8_seed42.pt")
+                        default="checkpoints/cv_final_model.pt")
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--n_points", type=int, default=15,
                         help="Number of grid points (default 15 = yearly 0..14)")
-    parser.add_argument("--t_max", type=float, default=14.0,
+    parser.add_argument("--t_max", type=float, default=12.0,
                         help="Maximum time (years)")
     parser.add_argument("--prefix", type=str,
-                        default="figures/pdp_real_noreg_H8_continuous")
+                        default="figures/test")
 
     # Delta-method options
     parser.add_argument("--delta_method", action="store_true",
                         help="Compute delta-method CI (requires Fisher)")
+    parser.add_argument("--variance_mode", type=str, default="ledoit_wolf",
+                        choices=["marquardt", "ledoit_wolf", "active_subspace"],
+                        help="Variance estimation method")
     parser.add_argument("--fisher_max", type=int, default=None,
                         help="Max subjects for Fisher (None = all)")
     parser.add_argument("--fisher_cache", type=str, default=None,
-                        help="Path to save/load cached Fisher inverse")
+                        help="Path to save/load cached raw Fisher + scores")
     parser.add_argument("--damping", type=float, default=1e-4,
-                        help="Marquardt damping for Fisher inversion")
+                        help="Marquardt damping (only for marquardt mode)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -71,14 +69,14 @@ if __name__ == "__main__":
     print(ckpt_cfg)
 
     print(f"Checkpoint: {args.checkpoint}")
-    # print(f"  epoch     = {checkpoint.get('epoch', '?')}")
-    # print(f"  test loss = {checkpoint.get('best_test_loss', '?'):.4f}")
 
     # ── Feature definitions ─────────────────────────────────────────────
     id_col = "NUM_ID"
     target_col = "ISA15"
-    time_varying_features = ckpt_cfg.get('time_varying_features', ["BMI", "PAS", "PAD", "GLUC", "HDL"])
-    static_features = ckpt_cfg.get('static_features', ["SEX_code", "AGEc", "DIPNIV_2", "DIPNIV_3"])
+    time_varying_features = ckpt_cfg.get('time_varying_features',
+                                         ["BMI", "PAS", "PAD", "GLUC", "HDL"])
+    static_features = ckpt_cfg.get('static_features',
+                                    ["SEX_code", "AGEc", "DIPNIV_2", "DIPNIV_3"])
     K = len(time_varying_features)
     Ks = len(static_features)
     interp_method = ckpt_cfg.get('interp_method', 'linear')
@@ -107,7 +105,6 @@ if __name__ == "__main__":
         mask_type=mask_type,
     )
     print(f"  Preprocessed {len(patient_data)} patients")
-    print(ckpt_cfg)
 
     dataset = RealDataset(patient_data)
     eval_loader = DataLoader(dataset, batch_size=args.batch_size,
@@ -133,10 +130,9 @@ if __name__ == "__main__":
         use_rho_net=True, use_neural_re=True,
         g_hidden=8, fullD=False,
         cov_means=cov_means, cov_stds=cov_stds,
-        use_dynamic_skip=False,
+        use_dynamic_skip=True,
         static_skip_dims=list(range(Ks)),
-        # reg_mode=ckpt_cfg.get('reg_mode', None),
-        reg_mode=None
+        reg_mode=ckpt_cfg.get('reg_mode', None),
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
@@ -148,8 +144,9 @@ if __name__ == "__main__":
     print(f"CONTINUOUS-TIME PDP ANALYSIS")
     print(f"  Grid: {args.n_points} points on [0, {args.t_max}]")
     print(f"  Grid points: {eval_grid}")
-    print(f"  (cf. canonical visit times: {VISIT_TIMES_3C})")
     print(f"  Delta-method CI: {'ON' if args.delta_method else 'OFF'}")
+    if args.delta_method:
+        print(f"  Variance mode: {args.variance_mode}")
     print(f"{'='*60}")
 
     bmi_vals = df["BMI"].dropna().values
@@ -178,48 +175,61 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(args.prefix) or ".", exist_ok=True)
 
     # ── Fisher computation (once, shared across covariates) ─────────────
-    fisher_inv = None
+    fisher = None       # raw Fisher matrix (P, P)
+    scores = None       # per-subject scores (N, P)
+    fisher_inv = None   # inverted Fisher (P, P)
+
     if args.delta_method:
         from PDP_variance import (
             compute_empirical_fisher, _regularise_and_invert,
         )
-        from train_ODE_real import collate_real
 
-        # Check for cached Fisher
-        if args.fisher_cache and os.path.exists(args.fisher_cache):
-            print(f"\n  Loading cached Fisher inverse from {args.fisher_cache}")
-            fisher_inv = torch.from_numpy(np.load(args.fisher_cache)).float()
+        # Check for cached Fisher + scores
+        cache_path = args.fisher_cache
+        if cache_path and os.path.exists(cache_path):
+            print(f"\n  Loading cached Fisher data from {cache_path}")
+            cached = np.load(cache_path)
+            fisher = torch.from_numpy(cached['fisher']).float()
+            scores = torch.from_numpy(cached['scores']).float()
+            print(f"  Fisher shape: {list(fisher.shape)}, "
+                  f"Scores shape: {list(scores.shape)}")
         else:
             print(f"\n{'='*60}")
             print(f"COMPUTING EMPIRICAL FISHER INFORMATION")
             print(f"{'='*60}")
 
-            lambda_reg = ckpt_cfg.get('lambda_gate', 0.1)
+            lambda_reg = ckpt_cfg.get('lambda_reg', 0.1)
             lambda_wd = ckpt_cfg.get('lambda_wd', 1e-5)
+            print(f"  lambda_reg = {lambda_reg}, lambda_wd = {lambda_wd}")
 
             fisher, scores = compute_empirical_fisher(
                 model, dataset, device, collate_fn=collate_real,
-                lambda_reg=0.1,
+                lambda_reg=lambda_reg,
                 weight_decay=lambda_wd,
                 max_subjects=args.fisher_max,
                 verbose=True,
             )
 
-            # Regularise and invert
-            _, fisher_inv = _regularise_and_invert(
-                fisher, "F", LAMBDA=args.damping, verbose=True,
-            )
+            # Stationarity check
+            mean_score = scores.mean(dim=0)
+            mean_indiv_norm = scores.norm(dim=1).mean().item()
+            print(f"\n  Stationarity diagnostics:")
+            print(f"    ||mean(phi)||   = {mean_score.norm().item():.4e}")
+            print(f"    mean(||phi_i||) = {mean_indiv_norm:.4e}")
+            print(f"    ratio           = "
+                  f"{mean_score.norm().item() / mean_indiv_norm:.4e}")
 
-            # Stationarity check: mean score should be ≈ 0
-            if scores.shape[0] > 0:
-                mean_score = scores.mean(dim=0)
-                print(f"  Stationarity check: ||mean(φ)|| = "
-                      f"{mean_score.norm().item():.4e}")
+            # Cache raw Fisher + scores for reuse
+            if cache_path:
+                np.savez(cache_path,
+                         fisher=fisher.numpy(),
+                         scores=scores.numpy())
+                print(f"  Cached Fisher + scores to {cache_path}")
 
-            # Cache for reuse
-            if args.fisher_cache:
-                np.save(args.fisher_cache, fisher_inv.numpy())
-                print(f"  Fisher inverse cached to {args.fisher_cache}")
+        # Pre-compute Marquardt inverse as fallback
+        _, fisher_inv = _regularise_and_invert(
+            fisher, "F", LAMBDA=args.damping, verbose=True,
+        )
 
     # ── Run analyses ────────────────────────────────────────────────────
     for col_idx, feat_name in enumerate(time_varying_features):
@@ -246,11 +256,11 @@ if __name__ == "__main__":
             traj_results, eval_grid,
             save_path=f"{args.prefix}_{feat_name}_traj_profile.png",
             target_name=feat_name,
-            visit_times=VISIT_TIMES_3C,
+            visit_times=None,
         )
 
         # ── 2. Delta-method CI (if requested) ──────────────────────────
-        if args.delta_method and fisher_inv is not None:
+        if args.delta_method and fisher is not None:
             from PDP_variance import compute_trajectory_profile_pdp_with_ci
             from PDP_continuous_time import (
                 plot_delta_profile_pdp_delta,
@@ -258,22 +268,18 @@ if __name__ == "__main__":
             )
 
             print(f"\n  Computing delta-method CI for {feat_name} ...")
+            print(f"  Variance mode: {args.variance_mode}")
 
             ci_results = compute_trajectory_profile_pdp_with_ci(
                 model, eval_loader, device, profiles, eval_grid,
-                fisher_inv=fisher_inv,
+                fisher_inv=fisher_inv,      # used by marquardt mode
+                fisher=fisher,              # used by ledoit_wolf mode
+                scores=scores,              # used by ledoit_wolf mode
                 target_col=col_idx, n_tv=K,
                 mask_type=mask_type,
                 target_name=feat_name,
                 verbose=True,
-            )
-
-            from pdp_real_wald_test import wald_test_all_pairs
-
-            wald_results = wald_test_all_pairs(
-                ci_results, eval_grid, fisher_inv,
-                late_cutoff=7.0,   # second half of follow-up
-                verbose=True,
+                variance_mode=args.variance_mode,
             )
 
             # Profile PDP with CI bands
@@ -281,39 +287,40 @@ if __name__ == "__main__":
                 ci_results, eval_grid,
                 save_path=f"{args.prefix}_{feat_name}_traj_profile_delta.png",
                 target_name=feat_name,
-                visit_times=VISIT_TIMES_3C,
+                visit_times=None,
                 n_subjects=n_subj,
             )
 
-            # ΔPDP: early_burden vs late_spike (path-dependence diagnostic)
-            if "late_decline" in ci_results and "late_spike" in ci_results:
-                plot_delta_profile_pdp_delta(
-                    ci_results, eval_grid,
-                    profile_a="late_decline", profile_b="late_spike",
-                    save_path=f"{args.prefix}_{feat_name}_delta_eb_vs_ls.png",
-                    target_name=feat_name,
-                    visit_times=VISIT_TIMES_3C,
-                    n_subjects=n_subj,
-                    fisher_inv=fisher_inv,
-                )
+            # # ΔPDP: late_decline vs late_spike (path-dependence diagnostic)
+            # if "late_decline" in ci_results and "late_spike" in ci_results:
+            #     plot_delta_profile_pdp_delta(
+            #         ci_results, eval_grid,
+            #         profile_a="late_decline", profile_b="late_spike",
+            #         save_path=f"{args.prefix}_{feat_name}_delta_eb_vs_ls.png",
+            #         target_name=feat_name,
+            #         visit_times=None,
+            #         n_subjects=n_subj,
+            #         fisher_inv=fisher_inv,
+            #     )
 
-            # All three diagnostic pairs side by side
+            # All pairwise ΔPDP
             plot_all_pairwise_delta_pdp(
                 ci_results, eval_grid,
                 save_path=f"{args.prefix}_{feat_name}_delta_all_pairs.png",
                 target_name=feat_name,
-                visit_times=VISIT_TIMES_3C,
+                visit_times=None,
                 n_subjects=n_subj,
                 fisher_inv=fisher_inv,
             )
 
-            # Print comparison of SE methods
+            # SE comparison
             print(f"\n    SE comparison: cross-subject vs delta-method")
             print(f"    {'Time':>8s}  {'cross-SE':>10s}  {'delta-SE':>10s}  "
                   f"{'ratio':>8s}")
             for ell in range(len(eval_grid)):
                 t = eval_grid[ell]
-                if "late_decline" in traj_results and "late_spike" in traj_results:
+                if ("late_decline" in traj_results
+                        and "late_spike" in traj_results):
                     diff_subj = (traj_results["late_decline"]
                                  - traj_results["late_spike"])
                     cross_se = diff_subj.std(axis=0)[ell] / np.sqrt(n_subj)
@@ -325,7 +332,8 @@ if __name__ == "__main__":
                 else:
                     delta_se = float('nan')
 
-                ratio = delta_se / cross_se if cross_se > 0 else float('nan')
+                ratio = (delta_se / cross_se
+                         if cross_se > 0 else float('nan'))
                 print(f"    {t:8.1f}  {cross_se:10.4f}  {delta_se:10.4f}  "
                       f"{ratio:8.2f}")
 

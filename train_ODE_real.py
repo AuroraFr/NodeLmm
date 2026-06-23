@@ -110,10 +110,10 @@ def compute_covariate_stats(dataset, train_idx, n_tv):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    SEEDS = [10, 200, 300, 400, 500, 600]
+    SEEDS = [3000, 4000, 5000]
     # ── Config ──────────────────────────────────────────────────────────
     for SEED  in SEEDS:
-        LR = 1e-3
+        LR = 5e-3
         WD = 1e-5
         EPOCHS = 1000
         BATCH_SIZE = 128
@@ -122,8 +122,8 @@ if __name__ == "__main__":
         LAMBDA_REG = 0.1
         INTERP_METHOD = "linear"      # "ffill", "linear", or "cubic"
         MASK_TYPE = "binary"           # "binary" or "cumulative"
-        REG_MODE = None        # None, "skip_gate", or "group_lasso"
-        use_dynamic_skip = False
+        REG_MODE = "group_lasso"       # None, "skip_gate", or "group_lasso"
+        use_dynamic_skip = True
 
         print("=" * 60)
         print("NEURAL ODE-LMM — REAL 3C DATASET")
@@ -146,8 +146,8 @@ if __name__ == "__main__":
 
         if "AGEc" not in df.columns:
             all_df = pd.read_csv("3C_dataset/data_3C.csv")
-            baseline_age = all_df.groupby(id_col)["AGE0"].transform("first")
-            baseline_age_mean = baseline_age.mean()
+            baseline_age_mean = all_df.groupby(id_col)["AGE0"].first().mean()
+            print('baseline_age_mean', baseline_age_mean)
             df["AGEc"] = df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
             test_df["AGEc"] = test_df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
 
@@ -214,7 +214,7 @@ if __name__ == "__main__":
             hidden_channels=8,
             enc_mlp_hidden=16,
             func_mlp_hidden=16,
-            dec_rho_hidden=16,
+            dec_rho_hidden=8,
             dec_p=4,
             dec_q=3,
             depth=2,
@@ -273,18 +273,26 @@ if __name__ == "__main__":
         ])
         # optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=50, verbose=True
+            optimizer, mode='min', factor=0.5, patience=150, verbose=True
         )
 
         # ── Checkpoint ──────────────────────────────────────────────────────
         os.makedirs("checkpoints", exist_ok=True)
-        ckpt_path = "checkpoints/best_model_ode_real_3C_regnone_H8_seed"+str(SEED)+".pt"
+        if REG_MODE is None:
+            reg = "noreg"
+        else:
+            reg = REG_MODE
+        ckpt_path = "checkpoints/best_model_ode_real3C_practice_lambda0.1"+reg+"_seed"+str(SEED)+".pt"
 
         # ── Training loop ───────────────────────────────────────────────────
         best_test_loss = float("inf")
         best_state = None
+        patiences = 150
 
         for epoch in range(1, EPOCHS + 1):
+
+            if patiences == 0:
+                break
 
             # ── Train ───────────────────────────────────────────────────────
             model.train()
@@ -345,8 +353,10 @@ if __name__ == "__main__":
             scheduler.step(avg_test)
 
             if avg_test < best_test_loss:
+                patiences = 150
                 best_test_loss = avg_test
                 best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
                 torch.save({
                     'model_state_dict': best_state,
                     'best_test_loss': best_test_loss,
@@ -375,6 +385,9 @@ if __name__ == "__main__":
                         'use_rho_norm': cfg.use_rho_norm
                     },
                 }, ckpt_path)
+                
+            else:
+                patiences = patiences - 1
 
             if epoch % PRINT_EVERY == 0 or epoch == 1:
                 beta = model.decoder.beta_neural.detach().cpu()
@@ -408,7 +421,7 @@ if __name__ == "__main__":
 
         # ── Restore best ────────────────────────────────────────────────────
         if best_state is not None:
-            model.load_state_dict(best_state, strict=False)
+            model.load_state_dict(best_state, strict=True)
 
         # ── Final summary ───────────────────────────────────────────────────
         print("\n" + "=" * 60)

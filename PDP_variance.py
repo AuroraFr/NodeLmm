@@ -86,6 +86,12 @@ def _per_subject_nll(mu, V, y_pad, mask, jitter=1e-4):
 # 2. Penalty gradient (data-independent constant)
 # ─────────────────────────────────────────────────────────
 
+def _is_nn_param(name):
+    """True for encoder/func/decoder network weights, False for β, D, σ², gates."""
+    excluded = ('beta', 'log_D_diag', 'log_sigma2', 'D_off_diag',
+                'skip_gate_logits', 'gate_logits')
+    return not any(ex in name for ex in excluded)
+
 def _compute_penalty_gradient(model, lambda_reg, weight_decay):
     """
     c = λ_reg · ∇_θ reg_term + λ_wd · θ
@@ -111,10 +117,16 @@ def _compute_penalty_gradient(model, lambda_reg, weight_decay):
                 c += lambda_reg * _cat_grads(grads).cpu()
                 has_penalty = True
 
+    # --- weight decay gradient: λ_wd · θ_nn only ---
     if weight_decay > 0:
-        theta_flat = torch.cat([p.detach().reshape(-1)
-                                for p in params]).cpu()
-        c += weight_decay * theta_flat
+        offset = 0
+        for name, p in model.named_parameters():
+            numel = p.numel()
+            is_nn = _is_nn_param(name)  # True for encoder/func/decoder weights
+            if is_nn:
+                c[offset:offset + numel] = weight_decay * p.detach().reshape(-1).cpu()
+            # else: leave zeros (no weight decay on β, D, σ², gate logits)
+            offset += numel
         has_penalty = True
 
     return c if has_penalty else None
@@ -295,8 +307,114 @@ def compute_empirical_fisher(model, dataset, device, collate_fn,
 
 
 # ─────────────────────────────────────────────────────────
-# 4. Regularise and invert
+# 4. Fisher regularisation: three modes
 # ─────────────────────────────────────────────────────────
+
+def _ledoit_wolf_shrink_fisher(fisher, scores, verbose=True):
+    """
+    Ledoit-Wolf shrinkage (Ledoit & Wolf, 2004) for the empirical Fisher.
+
+        F_shrunk = (1 - α) F  +  α · (tr(F)/P) · I
+
+    The optimal α minimises E[||F_shrunk/N - Σ_true||²_F].
+
+    Args:
+        fisher: (P, P) empirical Fisher  F = Σ φ_i φ_iᵀ
+        scores: (N, P) per-subject penalised scores φ_i
+
+    Returns:
+        F_shrunk: (P, P) shrunk Fisher
+        alpha:    optimal shrinkage intensity ∈ [0, 1]
+    """
+    N, P = scores.shape
+    S = fisher / N
+    mu = torch.trace(S).item() / P
+
+    delta_sq = (S - mu * torch.eye(P)).pow(2).sum().item()
+    if delta_sq < 1e-30:
+        if verbose:
+            print(f"  Ledoit-Wolf: δ² ≈ 0, no shrinkage needed")
+        return fisher.clone(), 0.0
+
+    norms_sq = (scores ** 2).sum(dim=1)
+    sum_norms_4 = (norms_sq ** 2).sum().item()
+    S_frob_sq = (S ** 2).sum().item()
+    beta = max((1.0 / N**2) * (sum_norms_4 - N * S_frob_sq), 0.0)
+
+    alpha = min(beta / delta_sq, 1.0)
+
+    trace_F = torch.trace(fisher).item()
+    F_shrunk = (1.0 - alpha) * fisher + alpha * (trace_F / P) * torch.eye(P)
+
+    if verbose:
+        eig_orig = torch.linalg.eigvalsh(fisher)
+        eig_shrunk = torch.linalg.eigvalsh(F_shrunk)
+        print(f"  Ledoit-Wolf shrinkage:")
+        print(f"    N/P = {N}/{P} = {N/P:.1f},  α* = {alpha:.4f}")
+        print(f"    F  eigenvalues: [{eig_orig.min().item():.2e}, "
+              f"{eig_orig.max().item():.2e}]")
+        print(f"    F* eigenvalues: [{eig_shrunk.min().item():.2e}, "
+              f"{eig_shrunk.max().item():.2e}]")
+
+    return F_shrunk, alpha
+
+
+def _active_subspace_decomp(fisher, threshold_ratio=1e-4, verbose=True):
+    """
+    Eigendecompose F and retain only the active subspace (λ_k > threshold).
+
+    Variance is computed as:
+        Var(h) = Σ_{k: λ_k > ε} (gᵀv_k)² / λ_k
+
+    This avoids amplifying noise from near-zero eigenvalues without
+    any shrinkage bias.
+
+    Args:
+        fisher:          (P, P) empirical Fisher
+        threshold_ratio: keep eigenvalues > threshold_ratio × λ_max
+
+    Returns:
+        eigvecs_active: (P, K) — columns are active eigenvectors
+        eigvals_active: (K,)   — active eigenvalues
+    """
+    eigvals, eigvecs = torch.linalg.eigh(fisher)
+    threshold = threshold_ratio * eigvals.max().item()
+    active = eigvals > threshold
+    K = active.sum().item()
+    P = fisher.shape[0]
+
+    eigvecs_active = eigvecs[:, active]   # (P, K)
+    eigvals_active = eigvals[active]      # (K,)
+
+    if verbose:
+        print(f"  Active subspace: {K}/{P} directions "
+              f"(threshold = {threshold:.2e})")
+        print(f"    Active eigenvalue range: [{eigvals_active.min().item():.2e}, "
+              f"{eigvals_active.max().item():.2e}]")
+        frac_trace = eigvals_active.sum().item() / max(eigvals.sum().item(), 1e-30)
+        print(f"    Captures {frac_trace*100:.1f}% of tr(F)")
+
+    return eigvecs_active, eigvals_active
+
+
+def _variance_projected(g, eigvecs_active, eigvals_active):
+    """
+    Compute gᵀ F⁻¹ g projected onto the active subspace.
+
+        Var = Σ_{k ∈ active} (gᵀ v_k)² / λ_k
+
+    Args:
+        g: (P,) gradient vector
+        eigvecs_active: (P, K)
+        eigvals_active: (K,)
+
+    Returns:
+        var: float
+    """
+    coeffs = eigvecs_active.T @ g        # (K,)
+    var = (coeffs ** 2 / eigvals_active).sum().item()
+    return var
+
 
 def _regularise_and_invert(M, label, LAMBDA=1e-4, verbose=True):
     """Marquardt-damp a PSD matrix and invert it."""
@@ -437,6 +555,9 @@ def compute_trajectory_profile_pdp_with_ci(
     fisher_inv, target_col, n_tv,
     mask_type="binary", alpha=0.05,
     target_name="covariate", verbose=True,
+    variance_mode="marquardt",
+    fisher=None, scores=None,
+    active_threshold=1e-4,
 ):
     """
     Compute trajectory-profile PDP with delta-method CI.
@@ -444,8 +565,14 @@ def compute_trajectory_profile_pdp_with_ci(
     Single pass over the data for all profiles (follows reference pattern).
 
     Args:
-        fisher_inv: (P, P) tensor — F⁻¹ (from _regularise_and_invert)
-        profiles:   dict {name: (L,) array} from make_profiles_continuous
+        fisher_inv:     (P, P) tensor — F⁻¹ (used when variance_mode="marquardt")
+        fisher:         (P, P) tensor — F   (needed for "ledoit_wolf" and "active_subspace")
+        scores:         (N, P) tensor — φ_i (needed for "ledoit_wolf")
+        variance_mode:  "marquardt"        — use pre-computed F⁻¹ with Marquardt damping
+                        "ledoit_wolf"      — shrink F, then invert
+                        "active_subspace"  — project onto active eigenvectors of F
+        active_threshold: eigenvalue threshold ratio for active_subspace mode
+        profiles:       dict {name: (L,) array} from make_profiles_continuous
 
     Returns:
         dict {profile_name: {'mean', 'se', 'ci_lo', 'ci_hi', 'grad'}}
@@ -453,10 +580,34 @@ def compute_trajectory_profile_pdp_with_ci(
     from scipy.stats import norm
     z_crit = norm.ppf(1 - alpha / 2)
 
-    if isinstance(fisher_inv, np.ndarray):
-        F_inv = torch.from_numpy(fisher_inv).float()
-    else:
-        F_inv = fisher_inv.float()
+    # --- Prepare variance computation based on mode ---
+    if variance_mode == "ledoit_wolf":
+        assert fisher is not None and scores is not None, \
+            "ledoit_wolf mode requires fisher and scores"
+        F_shrunk, lw_alpha = _ledoit_wolf_shrink_fisher(fisher, scores, verbose)
+        _, F_inv = _regularise_and_invert(F_shrunk, "Fisher (LW)", LAMBDA=1e-4,
+                                          verbose=verbose)
+        var_fn = lambda g: (g @ F_inv @ g).item()
+        if verbose:
+            print(f"  Variance mode: Ledoit-Wolf (α*={lw_alpha:.4f})")
+
+    elif variance_mode == "active_subspace":
+        assert fisher is not None, "active_subspace mode requires fisher"
+        eigvecs_active, eigvals_active = _active_subspace_decomp(
+            fisher, threshold_ratio=active_threshold, verbose=verbose)
+        var_fn = lambda g: _variance_projected(g, eigvecs_active, eigvals_active)
+        if verbose:
+            print(f"  Variance mode: active subspace "
+                  f"(threshold={active_threshold:.1e})")
+
+    else:  # "marquardt" — default
+        if isinstance(fisher_inv, np.ndarray):
+            F_inv = torch.from_numpy(fisher_inv).float()
+        else:
+            F_inv = fisher_inv.float()
+        var_fn = lambda g: (g @ F_inv @ g).item()
+        if verbose:
+            print(f"  Variance mode: Marquardt (pre-computed F⁻¹)")
 
     # All profiles in one data pass
     pdp_means, pdp_grads, N_total = compute_all_profile_pdp_gradients(
@@ -471,7 +622,7 @@ def compute_trajectory_profile_pdp_with_ci(
         se = np.zeros(L)
         for ell in range(L):
             g = torch.from_numpy(pdp_grads[pname][ell]).float()
-            var_ell = (g @ F_inv @ g).item()
+            var_ell = var_fn(g)
             se[ell] = np.sqrt(max(var_ell, 0.0))
 
         results[pname] = {
@@ -484,11 +635,11 @@ def compute_trajectory_profile_pdp_with_ci(
 
     # ── Diagnostic: pairwise ΔPDP with CI ─────────────────
     pairs = [
-        ("late_decline", "late_spike"),
-        ("stable_high", "stable_low"),
-        ("gradual_decline", "gradual_rise"),
+        # ("late_decline", "late_spike"),
+        # ("stable_high", "stable_low"),
+        # ("gradual_decline", "gradual_rise"),
         ("late_decline", "stable_low"),
-        ("late_decline", "gradual_decline"),
+        # ("late_decline", "gradual_decline"),
         ("stable_high", "late_spike"),
         ("stable_high", "gradual_rise"),
         ("gradual_decline", "stable_low"),
@@ -502,7 +653,7 @@ def compute_trajectory_profile_pdp_with_ci(
         delta_se = np.zeros(L)
         for ell in range(L):
             g = torch.from_numpy(delta_grad[ell]).float()
-            delta_se[ell] = np.sqrt(max((g @ F_inv @ g).item(), 0.0))
+            delta_se[ell] = np.sqrt(max(var_fn(g), 0.0))
 
         key = f'_delta_{pa}_vs_{pb}'
         results[key] = {

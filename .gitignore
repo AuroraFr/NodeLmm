@@ -12,3 +12,4 @@ results_3C/
 *.json
 *.err
 *.out
+diagnostics/

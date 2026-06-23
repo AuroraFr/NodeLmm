@@ -15,7 +15,7 @@ import argparse
 import os
 
 from dataset import LongitudinalDataset, collate_pad
-from model_ODE_torchdiff import NeuralODEModel, NeuralODEConfig
+from model_ODE_cumulative import NeuralODEModel, NeuralODEConfig
 from PDP_analysis_profiles_ODE import (
     compute_pdp_profiles,
     compute_profile_diagnostic,

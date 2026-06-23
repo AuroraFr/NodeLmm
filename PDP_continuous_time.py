@@ -202,7 +202,7 @@ def build_profile_xaug_continuous(x_aug_grid, target_col, profile_values,
 def compute_trajectory_profile_pdp_continuous(
     model, loader, device, profiles, eval_grid,
     target_col=0, n_tv=5, mask_type="binary",
-    target_name="covariate",
+    target_name="covariate",fisher=None, scores=None
 ):
     """
     Compute trajectory-profile PDP on a continuous regular time grid.
@@ -297,6 +297,65 @@ def compute_trajectory_profile_pdp_continuous(
     return results, eval_grid, n_total
 
 
+def build_counterfactual_xaug(x_aug, target_col, target_value, n_tv,
+                               mask_type="binary", mode="constant",
+                               slope=None):
+    """
+    Build counterfactual x_aug by intervening on a single covariate channel.
+
+    Args:
+        x_aug:        (N, T, 1+2K) original augmented input
+        target_col:   int, index in [0, K-1] of the target covariate
+        target_value: scalar, counterfactual value
+        n_tv:         K, number of time-varying covariates
+        mask_type:    "binary" or "cumulative"
+        mode:         "constant", "linear", or "shifted"
+        slope:        float, for linear mode
+
+    Returns:
+        x_aug_cf:     (N, T, 1+2K) counterfactual x_aug
+    """
+    K = n_tv
+    N, T, _ = x_aug.shape
+    x_aug_cf = x_aug.clone()
+
+    # Column indices in x_aug
+    cov_col = 1 + target_col              # x_interp column
+    mask_col = 1 + K + target_col         # mask column
+
+    # ── Intervene on covariate value ────────────────────────────────────
+    if mode == "constant":
+        x_aug_cf[:, :, cov_col] = target_value
+
+    elif mode == "linear":
+        if slope is None:
+            raise ValueError("slope required for linear mode")
+        t_pad = x_aug[:, :, 0]                                 # (N, T)
+        x_aug_cf[:, :, cov_col] = target_value + slope * t_pad
+
+    elif mode == "shifted":
+        # Shift each subject's trajectory to have mean = target_value
+        # (preserves individual dynamics, changes level)
+        real_vals = x_aug[:, :, cov_col]                        # (N, T)
+        real_mask = x_aug[:, :, mask_col]                       # (N, T)
+        n_obs = real_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        mean_subj = (real_vals * real_mask).sum(dim=1, keepdim=True) / n_obs
+        x_aug_cf[:, :, cov_col] = real_vals - mean_subj + target_value
+
+    else:
+        raise ValueError(f"Unknown mode: '{mode}'")
+
+    # ── Set mask to fully observed (the intervention is "known") ────────
+    if mask_type == "binary":
+        x_aug_cf[:, :, mask_col] = 1.0
+    else:  # "cumulative"
+        x_aug_cf[:, :, mask_col] = torch.arange(
+            1, T + 1, device=x_aug.device, dtype=x_aug.dtype
+        ).unsqueeze(0).expand(N, -1)
+
+    return x_aug_cf
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  Constant-intervention PDP (continuous time)
 # ═════════════════════════════════════════════════════════════════════
@@ -308,7 +367,7 @@ def compute_pdp_continuous(
     age_col=1, target_name="covariate",
 ):
     """Compute constant-value PDP on a regular time grid."""
-    from PDP_analysis_ODE_real import build_counterfactual_xaug
+    # from PDP_analysis_ODE_real import build_counterfactual_xaug
 
     model.eval()
     L = len(eval_grid)
@@ -584,13 +643,13 @@ def plot_delta_profile_pdp_delta(
     ax.axhline(0, color='#B71C1C', linestyle='--', linewidth=1, alpha=0.7,
                label='No difference')
 
-    # Mark significant time points
-    sig_times = []
-    for ell in range(len(eval_grid)):
-        if ci_hi[ell] < 0 or ci_lo[ell] > 0:
-            sig_times.append(eval_grid[ell])
-            ax.plot(eval_grid[ell], delta_mean[ell], 'o',
-                    color='#D32F2F', markersize=6, zorder=5)
+    # # Mark significant time points
+    # sig_times = []
+    # for ell in range(len(eval_grid)):
+    #     if ci_hi[ell] < 0 or ci_lo[ell] > 0:
+    #         sig_times.append(eval_grid[ell])
+    #         ax.plot(eval_grid[ell], delta_mean[ell], 'o',
+    #                 color='#D32F2F', markersize=6, zorder=5)
 
     if visit_times is not None:
         for vt in visit_times:
@@ -602,10 +661,10 @@ def plot_delta_profile_pdp_delta(
     subtitle_parts = [target_name, 'delta-method 95% CI']
     if n_subjects is not None:
         subtitle_parts.append(f'N={n_subjects}')
-    if sig_times:
-        subtitle_parts.append(f'significant at {len(sig_times)}/{len(eval_grid)} times')
-    else:
-        subtitle_parts.append('not significant at any time')
+    # if sig_times:
+    #     subtitle_parts.append(f'significant at {len(sig_times)}/{len(eval_grid)} times')
+    # else:
+    #     subtitle_parts.append('not significant at any time')
 
     ax.set_title(f'ΔPDP: {label_a} vs {label_b}\n({", ".join(subtitle_parts)})')
     ax.legend(loc='best', fontsize=9, framealpha=0.9)
@@ -632,11 +691,11 @@ def plot_all_pairwise_delta_pdp(
     import torch
 
     pairs = [
-        ("late_decline", "late_spike"),
-        ("stable_high", "stable_low"),
-        ("gradual_decline", "gradual_rise"),
+        # ("late_decline", "late_spike"),
+        # ("stable_high", "stable_low"),
+        # ("gradual_decline", "gradual_rise"),
         ("late_decline", "stable_low"),
-        ("late_decline", "gradual_decline"),
+        # ("late_decline", "gradual_decline"),
         ("stable_high", "late_spike"),
         ("stable_high", "gradual_rise"),
         ("gradual_decline", "stable_low"),
@@ -655,7 +714,7 @@ def plot_all_pairwise_delta_pdp(
     else:
         F_inv = None
 
-    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(24, 12))
     axes = axes.flatten()
     if len(pairs) == 1:
         axes = [axes]
@@ -705,12 +764,12 @@ def plot_all_pairwise_delta_pdp(
         ax.fill_between(eval_grid, ci_lo, ci_hi, color=color, alpha=0.15)
         ax.axhline(0, color='#B71C1C', linestyle='--', linewidth=1, alpha=0.7)
 
-        n_sig = 0
-        for ell in range(len(eval_grid)):
-            if ci_hi[ell] < 0 or ci_lo[ell] > 0:
-                ax.plot(eval_grid[ell], delta_mean[ell], 'o',
-                        color='#D32F2F', markersize=5, zorder=5)
-                n_sig += 1
+        # n_sig = 0
+        # for ell in range(len(eval_grid)):
+        #     if ci_hi[ell] < 0 or ci_lo[ell] > 0:
+        #         ax.plot(eval_grid[ell], delta_mean[ell], 'o',
+        #                 color='#D32F2F', markersize=5, zorder=5)
+        #         n_sig += 1
 
         if visit_times is not None:
             for vt in visit_times:
@@ -724,8 +783,8 @@ def plot_all_pairwise_delta_pdp(
 
         label_a = PROFILE_LABELS.get(pa, pa)
         label_b = PROFILE_LABELS.get(pb, pb)
-        sig_str = f'{n_sig}/{len(eval_grid)} sig.' if n_sig > 0 else 'n.s.'
-        ax.set_title(f'{label_a}\n− {label_b}\n({sig_str})', fontsize=10)
+        # sig_str = f'{n_sig}/{len(eval_grid)} sig.' if n_sig > 0 else 'n.s.'
+        ax.set_title(f'{label_a}\n− {label_b}', fontsize=10)
         ax.grid(True, alpha=0.3)
 
     # fig.suptitle(f'Pairwise ΔPDP for {target_name} (delta-method 95% CI)',

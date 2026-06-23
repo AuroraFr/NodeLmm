@@ -166,9 +166,9 @@ def _chi2_wald(delta, D, F_inv, reg, label=''):
 # ─────────────────────────────────────────────────────────
 
 DEFAULT_PAIRS = [
-    ("late_decline", "late_spike"),
+    ("gradual_rise", "late_spike"),
     ("stable_high", "stable_low"),
-    ("gradual_decline", "gradual_rise"),
+    ("gradual_decline", "late_decline"),
 ]
 
 PAIR_LABELS = {

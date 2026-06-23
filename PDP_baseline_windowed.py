@@ -989,6 +989,72 @@ def compute_delta_pdp_gradients(model, loader, device,
 # 4. Main: full-parameter delta method variance
 # ─────────────────────────────────────────────────────────
 
+def _ledoit_wolf_shrink_fisher(fisher, scores, verbose=True):
+    """
+    Ledoit-Wolf shrinkage: F_shrunk = (1-α)F + α·(tr(F)/P)·I
+    """
+    N, P = scores.shape
+    S = fisher / N
+    mu = torch.trace(S).item() / P
+    delta_sq = (S - mu * torch.eye(P)).pow(2).sum().item()
+    if delta_sq < 1e-30:
+        return fisher.clone(), 0.0
+
+    norms_sq = (scores ** 2).sum(dim=1)
+    sum_norms_4 = (norms_sq ** 2).sum().item()
+    S_frob_sq = (S ** 2).sum().item()
+    beta = max((1.0 / N**2) * (sum_norms_4 - N * S_frob_sq), 0.0)
+    alpha = min(beta / delta_sq, 1.0)
+
+    trace_F = torch.trace(fisher).item()
+    F_shrunk = (1.0 - alpha) * fisher + alpha * (trace_F / P) * torch.eye(P)
+
+    if verbose:
+        eig_orig = torch.linalg.eigvalsh(fisher)
+        eig_shrunk = torch.linalg.eigvalsh(F_shrunk)
+        print(f"  Ledoit-Wolf shrinkage:")
+        print(f"    N/P = {N}/{P} = {N/P:.1f},  α* = {alpha:.4f}")
+        print(f"    F  eigenvalues: [{eig_orig.min().item():.2e}, "
+              f"{eig_orig.max().item():.2e}]")
+        print(f"    F* eigenvalues: [{eig_shrunk.min().item():.2e}, "
+              f"{eig_shrunk.max().item():.2e}], "
+              f"cond = {eig_shrunk.max().item()/max(eig_shrunk.min().item(),1e-30):.2e}")
+    return F_shrunk, alpha
+
+
+def _active_subspace_setup(fisher, threshold_ratio=1e-4, verbose=True):
+    """
+    Eigendecompose F and retain only the active subspace (λ_k > threshold).
+
+    Returns eigvecs_active (P, K) and eigvals_active (K,) for projected
+    variance: Var(h) = Σ_{k ∈ active} (gᵀv_k)² / λ_k
+    """
+    eigvals, eigvecs = torch.linalg.eigh(fisher)
+    threshold = threshold_ratio * eigvals.max().item()
+    active = eigvals > threshold
+    K = active.sum().item()
+    P = fisher.shape[0]
+
+    eigvecs_active = eigvecs[:, active]
+    eigvals_active = eigvals[active]
+
+    if verbose:
+        print(f"  Active subspace: {K}/{P} directions "
+              f"(threshold = {threshold:.2e})")
+        print(f"    Active eigenvalue range: [{eigvals_active.min().item():.2e}, "
+              f"{eigvals_active.max().item():.2e}]")
+        frac_trace = eigvals_active.sum().item() / max(eigvals.sum().item(), 1e-30)
+        print(f"    Captures {frac_trace*100:.2f}% of tr(F)")
+        # Check how much of g is in the null space (computed later per time point)
+    return eigvecs_active, eigvals_active
+
+
+def _variance_projected(g, eigvecs_active, eigvals_active):
+    """Var = Σ_{k ∈ active} (gᵀv_k)² / λ_k"""
+    coeffs = eigvecs_active.T @ g
+    return (coeffs ** 2 / eigvals_active).sum().item()
+
+
 def _regularise_and_invert(M, label, LAMBDA=1e-4, verbose=True):
     """Marquardt-damp a PSD matrix and invert it."""
     diag_M = torch.diag(M)
@@ -1019,6 +1085,8 @@ def compute_full_delta_variance(
     lambda_reg=0.0,
     dense_step=1.0,
     use_dopri5=True,
+    variance_mode="marquardt",
+    active_threshold=1e-10,
 ):
     """
     Full-parameter delta method for ∆PDP variance.
@@ -1076,7 +1144,21 @@ def compute_full_delta_variance(
 
     # --- Regularise & invert Fisher ---
     LAMBDA = 1e-4
-    fisher_reg, fisher_inv = _regularise_and_invert(
+    use_active = (variance_mode == "active_subspace")
+    use_lw = (variance_mode == "ledoit_wolf")
+
+    if use_lw:
+        print(f"\n  Applying Ledoit-Wolf shrinkage to F ...")
+        fisher, lw_alpha = _ledoit_wolf_shrink_fisher(fisher, scores)
+
+    if use_active:
+        print(f"\n  Active subspace projection ...")
+        eigvecs_active, eigvals_active = _active_subspace_setup(
+            fisher, threshold_ratio=active_threshold)
+        # Still compute fisher_inv for diagnostics / sandwich
+        fisher_reg, fisher_inv = _regularise_and_invert(fisher, "Fisher", LAMBDA)
+    else:
+        fisher_reg, fisher_inv = _regularise_and_invert(
         fisher, "Fisher", LAMBDA)
 
     # --- Step 1b (optional): Sandwich ---
@@ -1149,7 +1231,10 @@ def compute_full_delta_variance(
         frac_null = (coeffs[null_mask] ** 2).sum() / (coeffs ** 2).sum()
         print(f"  t={int(vt)}: ||g_null||² / ||g||² = {frac_null.item():.4f}")
 
-        var_fisher = (g @ fisher_inv @ g).item()
+        if use_active:
+            var_fisher = _variance_projected(g, eigvecs_active, eigvals_active)
+        else:
+            var_fisher = (g @ fisher_inv @ g).item()
 
         if sandwich:
             var_sand = (g @ sandwich_cov @ g).item()
@@ -1272,7 +1357,7 @@ if __name__ == "__main__":
     parser.add_argument("--true_beta_bmi", type=float, default=-0.30)
     parser.add_argument("--true_beta_int", type=float, default=-0.05)
     parser.add_argument("--output_csv", type=str,
-                        default="results_simu/simulation_baseline_seed42_nonorm_diagD_summary_2328_noreg.csv")
+                        default="results_simu/simulation_baseline_seed42_norm_diagD_summary_2328_noreg.csv")
     parser.add_argument("--bmi_pairs", type=str, default=None)
     parser.add_argument("--sandwich", action="store_true",
                         help="Use sandwich variance J⁻¹FJ⁻¹ instead of F⁻¹")
@@ -1280,7 +1365,7 @@ if __name__ == "__main__":
                         help="Subsample N subjects for Hessian (e.g. 500).")
     parser.add_argument("--weight_decay", type=float, default=1e-5,
                         help="Weight decay used during training (added to J)")
-    parser.add_argument("--lambda_reg", type=float, default=0,
+    parser.add_argument("--lambda_reg", type=float, default=0.1,
                         help="Skip penalty coefficient (skip_gate or group_lasso)")
     parser.add_argument("--reg_mode", type=str, default=None,
                         choices=[None, "skip_gate", "group_lasso"],
@@ -1290,10 +1375,20 @@ if __name__ == "__main__":
                              "(only used when --no_dopri5)")
     parser.add_argument("--no_dopri5", action="store_true",
                         help="Use training solver + dense grid instead of adaptive dopri5")
+    parser.add_argument("--variance_mode", type=str, default="ledoit_wolf",
+                        choices=["marquardt", "ledoit_wolf", "active_subspace"],
+                        help="Variance estimation mode: "
+                             "marquardt (F⁻¹ with Marquardt damping), "
+                             "ledoit_wolf (Ledoit-Wolf shrinkage + invert), "
+                             "active_subspace (project onto active eigenvectors)")
+    parser.add_argument("--active_threshold", type=float, default=1e-8,
+                        help="Eigenvalue threshold ratio for active_subspace mode "
+                             "(keeps λ_k > ratio × λ_max; default 1e-10 keeps all "
+                             "non-zero eigenvalues)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    visit_times = np.array([0, 4, 8, 10])
+    visit_times = np.array([0, 2, 4, 8, 10])
 
     # BMI pairs
     if args.bmi_pairs:
@@ -1312,7 +1407,7 @@ if __name__ == "__main__":
 
     # --- Checkpoint: resume from last completed simulation ---
     ckpt_dir = os.path.dirname(args.output_csv) or '.'
-    ckpt_file = os.path.join(ckpt_dir, "delta_method_checkpoint_baseline.pt")
+    ckpt_file = os.path.join(ckpt_dir, "delta_method_checkpoint_baseline_configD.pt")
     start_sim = 0
 
     if os.path.exists(ckpt_file):
@@ -1326,13 +1421,13 @@ if __name__ == "__main__":
     for sim_idx in range(start_sim, args.n_sims):
         if args.n_sims > 1:
             data_path = f"simu_datasets/S2a_sims/sim_{sim_idx+1:03d}.rds"
-            ckpt_path = f"checkpoints/simulation_baseline_grouplasso_skipfull_seed42_norhonorm_diagoD/best_model_ode_{sim_idx}.pt"
+            ckpt_path = f"checkpoints/model_selection_S1/D_noskip_sim00{sim_idx}.pt"
             print(f"\n{'#'*60}")
             print(f"# SIMULATION {sim_idx}")
             print(f"{'#'*60}")
         else:
             data_path = "simu_datasets/S2a_sims/sim_001.rds"
-            ckpt_path = "checkpoints/simulation_baseline_grouplasso_skipfull_seed42_norhonorm_diagoD/best_model_ode_0.pt"
+            ckpt_path = "checkpoints/simulation_baseline_noreg_seed42_rhonorm_diagoD/best_model_ode_0.pt"
 
         # --- Data ---
         df = next(iter(pyreadr.read_r(data_path).values()))
@@ -1348,7 +1443,7 @@ if __name__ == "__main__":
 
         # --- Model ---
         cfg = NeuralODEConfig(
-            hidden_channels=8, enc_mlp_hidden=16, func_mlp_hidden=16,
+            hidden_channels=4, enc_mlp_hidden=16, func_mlp_hidden=16,
             dec_rho_hidden=16, dec_p=4, dec_q=3, depth=2, dropout=0.0,
             euler_steps_per_interval=4,
         )
@@ -1356,8 +1451,8 @@ if __name__ == "__main__":
             x_dim=len(x_cols), static_dim=len(static_cols), cfg=cfg,
             n_tv=1, use_rho_net=True, use_neural_re=True,
             re_spline_cols=None, g_hidden=8, fullD=False,
-            bmi_mean=0.0, bmi_std=1.0, static_skip_dims=[0,1,2,3], use_bmi_skip=True,
-            reg_mode=args.reg_mode,
+            bmi_mean=0.0, bmi_std=1.0, static_skip_dims=None, use_bmi_skip=False,
+            reg_mode=args.reg_mode, use_learned_z0=False, use_bmi_in_ode=True
         ).to(device)
 
         print(model)
@@ -1385,6 +1480,8 @@ if __name__ == "__main__":
                 lambda_reg=args.lambda_reg,
                 dense_step=args.dense_step,
                 use_dopri5=not args.no_dopri5,
+                variance_mode=args.variance_mode,
+                active_threshold=args.active_threshold,
             )
             all_pair_results[(bmi_lo, bmi_hi)].append(result)
 

@@ -66,11 +66,11 @@ PAIR_FILL_COLORS = [
 VISIT_TIMES_3C = [0, 2, 4, 7, 10, 12]
 
 DEFAULT_PAIRS = [
-        ("late_decline", "late_spike"),
-        ("stable_high", "stable_low"),
-        ("gradual_decline", "gradual_rise"),
+        # ("late_decline", "late_spike"),
+        # ("stable_high", "stable_low"),
+        # ("gradual_decline", "gradual_rise"),
         ("late_decline", "stable_low"),
-        ("late_decline", "gradual_decline"),
+        # ("late_decline", "gradual_decline"),
         ("stable_high", "late_spike"),
         ("stable_high", "gradual_rise"),
         ("gradual_decline", "stable_low"),
@@ -130,9 +130,9 @@ def plot_hlme_delta_pdp(csv_path, save_path, feat_name="covariate",
 
     # Layout: 2×4 if 8 pairs, else 1×n
     if n_pairs <= 4:
-        nrows, ncols = 1, n_pairs
+        nrows, ncols = 2, 2
     else:
-        nrows, ncols = 2, 4
+        nrows, ncols = 2, 2
 
     fig, axes = plt.subplots(nrows, ncols, figsize=(24, 12))
     axes = np.atleast_1d(axes).flatten()
@@ -167,11 +167,11 @@ def plot_hlme_delta_pdp(csv_path, save_path, feat_name="covariate",
         ax.plot(sub["time"], sub["delta"], '-', color=color, linewidth=2)
         ax.axhline(0, color='#B71C1C', linestyle='--', linewidth=1, alpha=0.7)
 
-        # Significant points
-        sig = sub[sub["sig"] == True]
-        if not sig.empty:
-            ax.scatter(sig["time"], sig["delta"], color='#D32F2F',
-                       s=40, zorder=5)
+        # # Significant points
+        # sig = sub[sub["sig"] == True]
+        # if not sig.empty:
+        #     ax.scatter(sig["time"], sig["delta"], color='#D32F2F',
+        #                s=40, zorder=5)
 
         for vt in VISIT_TIMES_3C:
             ax.axvline(vt, color='grey', linestyle=':', alpha=0.2, linewidth=0.5)
@@ -186,8 +186,8 @@ def plot_hlme_delta_pdp(csv_path, save_path, feat_name="covariate",
         label_b = PROFILE_LABELS.get(pb, pb)
         n_sig = int(sub["sig"].sum())
         L = len(sub)
-        sig_str = f'{n_sig}/{L} sig.' if n_sig > 0 else 'n.s.'
-        ax.set_title(f'{label_a}\n− {label_b}\n({sig_str})', fontsize=10)
+        # sig_str = f'{n_sig}/{L} sig.' if n_sig > 0 else 'n.s.'
+        ax.set_title(f'{label_a}\n− {label_b})', fontsize=10)
         ax.grid(True, alpha=0.3)
 
     # Hide unused panels
@@ -245,7 +245,7 @@ def plot_hlme_all(data_dir="hlme_pdp_exports", out_dir="figures",
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot HLME PDP from R exports")
-    parser.add_argument("--dir", type=str, default="hlme_pdp_exports")
+    parser.add_argument("--dir", type=str, default="results_3C/hlme_pdp_exports")
     parser.add_argument("--out", type=str, default="figures")
     parser.add_argument("--feat", nargs="+", default=["BMI", "GLUC", "HDL"])
     args = parser.parse_args()

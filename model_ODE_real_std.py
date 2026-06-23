@@ -314,9 +314,8 @@ class Decoder(nn.Module):
         parts = []
 
         if self.use_dynamic_skip:
-            # Standardize dynamic covariates
-            x_std = (x_interp - self.cov_means) / self.cov_stds  # (N, T, K)
-            parts.append(x_std)
+            # x_interp is already standardized in NeuralODEModel.forward()
+            parts.append(x_interp)
             parts.append(mask)                                     # (N, T, K)
 
         if self.static_skip_dims:
@@ -752,9 +751,11 @@ class NeuralODEModel(nn.Module):
 
         # ── Unpack x_aug ────────────────────────────────────────────────
         t_pad = x_aug[:, :, 0]                                 # (N, T)
-        x_interp = x_aug[:, :, 1:1+K]                          # (N, T, K)
+        x_interp_raw = x_aug[:, :, 1:1+K]                     # (N, T, K)
         mask = x_aug[:, :, 1+K:1+2*K]                          # (N, T, K)
-        # print(x_interp)
+
+        # ── Standardize covariates (shared across encoder, ODE, decoder) ──
+        x_interp = (x_interp_raw - self.decoder.cov_means) / self.decoder.cov_stds
 
         # ── Encoder ─────────────────────────────────────────────────────
         t0 = t_pad[:, 0:1]                                     # (N, 1)
@@ -762,7 +763,7 @@ class NeuralODEModel(nn.Module):
         encoder_in = torch.cat([t0, x_baseline, static_covariates], dim=-1)
         z0 = self.encoder(encoder_in)                           # (N, H)
 
-        # ── ODE integration ─────────────────────────────────────────────
+        # ── ODE integration (standardized inputs) ──────────────────────
         zt = self._integrate(z0, t_pad, x_interp, mask)
         zt = self.z_norm(zt)
 

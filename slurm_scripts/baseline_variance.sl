@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH -J baseline
+#SBATCH -J ODE_LMM
 # Asking for one node
-#SBATCH -w bora044 --time=2-10:00:00 --exclusive
+#SBATCH -w sirocco16 --time=2-10:00:00 --exclusive
 # Standard output
 #SBATCH -o slurm.sh%j.out
 # Standard error
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python train_ODE.py
+python PDP_baseline_windowed.py --variance_mode active_subspace --bmi_pairs 23:28 --reg_mode group_lasso --no_dopri5

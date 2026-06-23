@@ -2,7 +2,8 @@
 Neural ODE-LMM with BMI Skip Connection.
 
 Architecture:
-  - Encoder:  z(0) = Enc(t0, static)
+  - Encoder:  z(0) = Enc(t0, static)   [default]
+              z(0) = learned parameter  [use_learned_z0=True, for S1]
   - Dynamics: dz/dt = f(z, t, static, BMI(t))          ← Neural ODE
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural 
   - RE:       Z = g(z(t))
@@ -80,14 +81,17 @@ class ODEFunc(nn.Module):
     dz/dt = f(z, t, static, bmi(t))
     """
     def __init__(self, hidden_channels, static_dim,
-                 mlp_hidden=64, depth=2, dropout=0.0, activation=None):
+                 mlp_hidden=64, depth=2, dropout=0.0, activation=None, use_bmi_in_ode=False):
         super().__init__()
         self.hidden_channels = hidden_channels
+
+        self.use_bmi_in_ode = use_bmi_in_ode
+        in_dim = hidden_channels + 1 + (1 if use_bmi_in_ode else 0)
         
         self.net = MLP(
             # in_dim=hidden_channels + 1 + static_dim + 1,
             # in_dim=hidden_channels + 1 + 1,
-            in_dim=hidden_channels + 1,
+            in_dim=in_dim,
             hidden_dim=mlp_hidden,
             out_dim=hidden_channels,
             depth=depth, dropout=dropout, activation=activation,
@@ -110,10 +114,12 @@ class ODEFunc(nn.Module):
         else:
             t_expanded = t_scalar
 
-        # inp = torch.cat([z, t_expanded, static], dim=-1)
-        # inp = torch.cat([z, t_expanded, bmi_t, static], dim=-1)
-        inp = torch.cat([z, t_expanded], dim=-1)
-        # inp = torch.cat([z, t_expanded], dim=-1)
+        # In ODEFunc.forward:
+        if self.use_bmi_in_ode and bmi_t is not None:
+            inp = torch.cat([z, t_expanded, bmi_t], dim=-1)
+        else:
+            inp = torch.cat([z, t_expanded], dim=-1)
+
         return torch.tanh(self.net(inp))
 
 
@@ -200,7 +206,7 @@ class Decoder(nn.Module):
             # Single network: [z(t), skip (possibly gated)] → R^p → scalar
             self.rho_net = MLP(latent_dim + skip_dim, rho_hidden, p,
                                depth=2, dropout=0.0)
-            # self.rho_norm = nn.LayerNorm(p)
+            self.rho_norm = nn.LayerNorm(p)
             self.beta_neural = nn.Parameter(0.01 * torch.randn(p))
         else:
             self.rho_net = None
@@ -210,7 +216,7 @@ class Decoder(nn.Module):
         # --- Skip gate parameters (only for skip_gate mode) ---
         if reg_mode == "skip_gate" and skip_dim > 0:
             # alpha_k initialised at 2.0 → sigmoid(2) ≈ 0.88 (gate starts open)
-            self.skip_gate_logit = nn.Parameter(2.0 * torch.ones(skip_dim))
+            self.skip_gate_logit = nn.Parameter(5.0 * torch.ones(skip_dim))
         else:
             self.skip_gate_logit = None
 
@@ -276,20 +282,17 @@ class Decoder(nn.Module):
         Data-independent for both modes → clean M-estimator inference.
         """
         reg_dict = {}
+        n_bmi = 1 if self.use_bmi_skip else 0 
 
         if self.reg_mode == "skip_gate":
-            # Penalty = Σ_k sigmoid(α_k)
-            gate = torch.sigmoid(self.skip_gate_logit)        # (skip_dim,)
+            gate = torch.sigmoid(self.skip_gate_logit)
             reg_dict["reg_term"] = gate.sum()
             reg_dict["gate_values"] = gate.detach()
 
         elif self.reg_mode == "group_lasso":
-            # Penalty = Σ_k ||W_skip_k||_2
-            # W_skip columns are the last skip_dim columns of first layer
-            W = self.rho_net.net[0].weight                    # (h, latent_dim + skip_dim)
-            W_skip = W[:, self.latent_dim:]                   # (h, skip_dim)
-            # Per-channel L2 norm
-            channel_norms = W_skip.norm(p=2, dim=0)           # (skip_dim,)
+            W = self.rho_net.net[0].weight
+            W_bmi = W[:, self.latent_dim:self.latent_dim + n_bmi]  # only BMI columns
+            channel_norms = W_bmi.norm(p=2, dim=0)
             reg_dict["reg_term"] = channel_norms.sum()
             reg_dict["channel_norms"] = channel_norms.detach()
 
@@ -335,7 +338,7 @@ class Decoder(nn.Module):
 
         if self.use_rho_net:
             rho = self.rho_net(rho_input)
-            # rho = self.rho_norm(rho)
+            rho = self.rho_norm(rho)
             mu = (rho * self.beta_neural).sum(dim=-1)
         else:
             mu = (rho_input * self.w_neural).sum(dim=-1)
@@ -396,9 +399,16 @@ class NeuralODEModel(nn.Module):
     Neural ODE-LMM with BMI skip connection.
 
     Architecture:
-      Encoder:  z(0) = Enc(t0, BMI0, static)
-      ODE:      dz/dt = f(z, t, BMI(t))
+      Encoder:  z(0) = Enc(t0, static)   [default]
+                z(0) = learned constant   [use_learned_z0=True]
+      ODE:      dz/dt = f(z, t)          (population-level time basis)
       Decoder:  mu = rho(z(t), skip_input) @ beta_neural
+
+    When use_learned_z0=True, z(0) is a shared nn.Parameter:
+      - ODE learns a population-level trajectory z(t) as a time basis
+      - All subject-specific info flows through skip → decoder
+      - Eliminates ~300 unidentifiable encoder parameters from the Fisher
+      - Intended for S1 where BMI + statics go through skip only
 
     Regularisation modes (reg_mode):
       None:          no skip penalty
@@ -419,7 +429,9 @@ class NeuralODEModel(nn.Module):
                  bmi_mean=0.0, bmi_std=1.0,
                  static_skip_dims=None,
                  use_bmi_skip=True,
-                 reg_mode=None):
+                 reg_mode=None,
+                 use_learned_z0=False,
+                 use_bmi_in_ode=False):
         """
         Args:
             x_dim: total columns in x_pad (e.g. 3 for [BMI_t, rs1, rs2])
@@ -429,6 +441,8 @@ class NeuralODEModel(nn.Module):
                               e.g. [1] to pass AGEc directly. None = no static skip.
             use_bmi_skip: if False, decoder sees only z(t) — no direct BMI input.
             reg_mode: None, "skip_gate", or "group_lasso". See Decoder docstring.
+            use_learned_z0: if True, z(0) is a shared learned parameter (no encoder).
+                            Use for S1 where all subject-specific info goes through skip.
         """
         super().__init__()
         if cfg is None:
@@ -438,17 +452,25 @@ class NeuralODEModel(nn.Module):
         self.static_dim = static_dim
         self.n_tv = n_tv
         self.reg_mode = reg_mode
+        self.use_learned_z0 = use_learned_z0
 
-        # Encoder: sees [t0, BMI0] + static
-        encoder_input_dim = 1 + n_tv   # t0 + BMI0
-        self.encoder = BaselineEncoder(
-            input_dim=encoder_input_dim,
-            static_dim=static_dim,
-            hidden_dim=cfg.hidden_channels,
-            mlp_hidden=cfg.enc_mlp_hidden,
-            depth=1,
-            dropout=cfg.dropout,
-        )
+        # Encoder
+        if use_learned_z0:
+            # Shared initial state: ODE learns a population-level time basis
+            self.z0_param = nn.Parameter(torch.zeros(cfg.hidden_channels))
+            self.encoder = None
+        else:
+            self.z0_param = None
+            # encoder_input_dim = 1 + n_tv   # t0 + BMI0
+            encoder_input_dim = 1   # t0
+            self.encoder = BaselineEncoder(
+                input_dim=encoder_input_dim,
+                static_dim=static_dim,
+                hidden_dim=cfg.hidden_channels,
+                mlp_hidden=cfg.enc_mlp_hidden,
+                depth=1,
+                dropout=cfg.dropout,
+            )
 
         # ODE dynamics: f(z, t, BMI(t)) → dz/dt
         self.func = ODEFunc(
@@ -457,7 +479,8 @@ class NeuralODEModel(nn.Module):
             mlp_hidden=cfg.func_mlp_hidden,
             depth=cfg.depth,
             dropout=cfg.dropout,
-            activation=nn.SiLU()
+            activation=nn.SiLU(),
+            use_bmi_in_ode = use_bmi_in_ode
         )
 
         self.z_norm = nn.LayerNorm(cfg.hidden_channels)
@@ -537,10 +560,14 @@ class NeuralODEModel(nn.Module):
         device, dtype = t_pad.device, t_pad.dtype
 
         # --- Encoder ---
-        t0 = t_pad[:, 0:1]                                  # (N, 1)
-        bmi0 = x_pad[:, 0, 0:self.n_tv]                     # (N, n_tv)
-        encoder_in = torch.cat([t0, bmi0, static_covariates], dim=-1)
-        z0 = self.encoder(encoder_in)                        # (N, H)
+        if self.use_learned_z0:
+            z0 = self.z0_param.unsqueeze(0).expand(N, -1)    # (N, H)
+        else:
+            t0 = t_pad[:, 0:1]                               # (N, 1)
+            bmi0 = x_pad[:, 0, 0:self.n_tv]                  # (N, n_tv)
+            encoder_in = torch.cat([t0, static_covariates], dim=-1)
+            # encoder_in = torch.cat([t0, bmi0, static_covariates], dim=-1)
+            z0 = self.encoder(encoder_in)                     # (N, H)
 
         # --- ODE integration ---
         zt = self._euler_integrate(z0, t_pad, static_covariates, bmi_t)

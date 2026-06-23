@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#SBATCH -J baseline
+#SBATCH -J CUMU_ODELMM
 # Asking for one node
-#SBATCH -w bora044 --time=2-10:00:00 --exclusive
+#SBATCH -w bora040 --time=2-10:00:00 --exclusive
 # Standard output
 #SBATCH -o slurm.sh%j.out
 # Standard error
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python train_ODE.py
+python train_ODE_cumulative.py

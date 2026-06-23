@@ -23,7 +23,7 @@ import numpy as np
 import pyreadr
 import pandas as pd
 from dataset import LongitudinalDataset, collate_pad
-from model_ODE_torchdiff import NeuralODEModel, NeuralODEConfig
+from model_ODE_cumulative import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
 import argparse
 
@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Neural ODE-LMM training")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_cumulative_effect_diagoD_noBMIInEncoder_norhonorm")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_grouplasso_norhonorm")
     parser.add_argument("--data", type=str,
                         default="simu_datasets/S5_sims")
     args = parser.parse_args()
@@ -60,7 +60,7 @@ if __name__ == "__main__":
     x_cols = ["BMI_t", "rs1", "rs2"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
-    for i in range(68, 100):
+    for i in range(50, 100):
         path = args.data + f"/sim_{i+1:03d}.rds"
         df = next(iter(pyreadr.read_r(path).values()))
         df["SEX"] = df["SEX"].astype("category")
@@ -114,8 +114,8 @@ if __name__ == "__main__":
         # ---- Model ----
         cfg = NeuralODEConfig(
             hidden_channels=8,
-            enc_mlp_hidden=32,
-            func_mlp_hidden=32,
+            enc_mlp_hidden=16,
+            func_mlp_hidden=16,
             dec_rho_hidden=16,
             dec_p=4,
             dec_q=3,                      # q=3: intercept + rs1 + rs2
@@ -135,13 +135,13 @@ if __name__ == "__main__":
             use_rho_net=True,
             use_neural_re=True,
             re_spline_cols=None,
-            g_hidden=16,
+            g_hidden=8,
             fullD=False,
             bmi_mean=bmi_mean,
             bmi_std=bmi_std,
-            use_bmi_skip=False,
-            static_skip_dims=None,         # AGEc skip to decoder
-            reg_mode=None
+            use_bmi_skip=True,
+            static_skip_dims=[0,1,2,3],         # AGEc skip to decoder
+            reg_mode='group_lasso'
         ).to(device)
 
         LAMBDA_REG = 0.5
