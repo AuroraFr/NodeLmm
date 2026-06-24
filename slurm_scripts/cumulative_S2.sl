@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH -J CUMU_ODELMM
 # Asking for one node
-#SBATCH -w bora040 --time=2-10:00:00 --exclusive
+#SBATCH -w bora019 --time=2-10:00:00 --exclusive
 # Standard output
 #SBATCH -o slurm.sh%j.out
 # Standard error

@@ -35,7 +35,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Neural ODE-LMM training")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_cumulative_effect_diagoD_grouplasso_norhonorm")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_grouplasso_norhonorm_2")
     parser.add_argument("--data", type=str,
                         default="simu_datasets/S5_sims")
     args = parser.parse_args()
@@ -113,7 +113,7 @@ if __name__ == "__main__":
 
         # ---- Model ----
         cfg = NeuralODEConfig(
-            hidden_channels=8,
+            hidden_channels=4,
             enc_mlp_hidden=16,
             func_mlp_hidden=16,
             dec_rho_hidden=16,
@@ -144,7 +144,7 @@ if __name__ == "__main__":
             reg_mode='group_lasso'
         ).to(device)
 
-        LAMBDA_REG = 0.5
+        LAMBDA_REG = 0.1
 
         total_params = sum(p.numel() for p in model.parameters())
         print(f"\nTotal parameters: {total_params}")
@@ -155,8 +155,28 @@ if __name__ == "__main__":
         print(f"  RE:       g(z(t))")
         print(f"  Euler sub-steps: {cfg.euler_steps_per_interval}")
 
-        # ---- Optimizer ----
-        optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
+        # ── Optimiser ───────────────────────────────────────────────────────
+        nn_weights, var_params, fe_params = [], [], []
+        gl_param_set = {id(model.decoder.rho_net.net[0].weight)}
+
+        for n, p in model.named_parameters():
+            if id(p) in gl_param_set:
+                continue
+            elif 'log_residual_var' in n or 'log_std' in n:
+                var_params.append(p)
+            elif 'beta_neural' in n:
+                fe_params.append(p)
+            else:
+                nn_weights.append(p)
+
+        gl_params = [model.decoder.rho_net.net[0].weight]
+
+        optimizer = torch.optim.AdamW([
+            {'params': nn_weights, 'weight_decay': WD},
+            {'params': gl_params,  'weight_decay': 0.0},
+            {'params': var_params, 'weight_decay': 0.0},
+            {'params': fe_params,  'weight_decay': 0.0},
+        ])
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=50, verbose=True
         )
@@ -245,7 +265,7 @@ if __name__ == "__main__":
                         'euler_steps': cfg.euler_steps_per_interval,
                         'use_rho_net': True,
                         'use_neural_re': True,
-                        'static_skip_dims': [1],
+                        'static_skip_dims': [0,1,2,3],
                         'approach': 'ode_bmi_skip',
                     },
                 }, ckpt_path)
@@ -265,79 +285,3 @@ if __name__ == "__main__":
                 for i in range(D.shape[0]):
                     print(f"      [{', '.join(f'{D[i,j]:.4f}' for j in range(D.shape[1]))}]")
                 print(f"    beta_neural = [{', '.join(f'{v:.4f}' for v in beta_neural)}]")
-
-        # # ---- Restore best ----
-        # if best_state is not None:
-        #     model.load_state_dict(best_state, strict=False)
- 
-        # # ============================================================
-        # # Fine-tuning: converge to MLE (no regularization)
-        # # ============================================================
-        # FT_LR = 1e-5
-        # FT_EPOCHS = 200
-        # FT_PRINT_EVERY = 25
- 
-        # print(f"\n{'='*60}")
-        # print(f"FINE-TUNING: LR={FT_LR}, WD=0, L1=0, {FT_EPOCHS} epochs")
-        # print(f"{'='*60}")
- 
-        # optimizer_ft = torch.optim.Adam(model.parameters(), lr=FT_LR,
-        #                                 weight_decay=0.0)
- 
-        # # Use FULL dataset (train+test) for MLE — no early stopping
-        # full_loader = DataLoader(full_dataset, batch_size=BATCH_SIZE,
-        #                          shuffle=True, collate_fn=collate_pad)
- 
-        # for epoch in range(1, FT_EPOCHS + 1):
-        #     model.train()
-        #     total_nll = 0.0
-        #     count = 0
- 
-        #     for batch in full_loader:
-        #         _, t_pad, x_pad, y_pad, c_mask, mask, s = batch
-        #         t_pad = t_pad.to(device)
-        #         x_pad = x_pad.to(device)
-        #         y_pad = y_pad.to(device)
-        #         mask = mask.to(device)
-        #         s = s.to(device)
- 
-        #         mu, V, _, _, _, reg_dict = model(
-        #             t_pad, x_pad, masks=None,
-        #             static_covariates=s, bmi_t=x_pad[:, :, 0:1],
-        #             obs_mask=mask
-        #         )
-        #         # Pure NLL — NO regularization
-        #         loss = masked_NLL(mu, y_pad, V, mask)
- 
-        #         optimizer_ft.zero_grad(set_to_none=True)
-        #         loss.backward()
-        #         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        #         optimizer_ft.step()
- 
-        #         total_nll += loss.item()
-        #         count += 1
- 
-        #     avg_nll = total_nll / max(count, 1)
- 
-        #     if epoch % FT_PRINT_EVERY == 0 or epoch == 1:
-        #         print(f"  FT epoch {epoch:4d} | NLL = {avg_nll:.4f}")
- 
-        # # Save fine-tuned (MLE) checkpoint
-        # ft_ckpt_path = ckpt_path.replace(".pt", "_mle.pt")
-        # torch.save({
-        #     'model_state_dict': {k: v.clone()
-        #                          for k, v in model.state_dict().items()},
-        #     'ft_epochs': FT_EPOCHS,
-        #     'ft_lr': FT_LR,
-        #     'bmi_mean': bmi_mean,
-        #     'bmi_std': bmi_std,
-        #     'config': {
-        #         'hidden_channels': cfg.hidden_channels,
-        #         'euler_steps': cfg.euler_steps_per_interval,
-        #         'use_rho_net': True,
-        #         'use_neural_re': True,
-        #         'static_skip_dims': [1],
-        #         'approach': 'ode_bmi_skip_mle',
-        #     },
-        # }, ft_ckpt_path)
-        # print(f"  MLE checkpoint saved → {ft_ckpt_path}")

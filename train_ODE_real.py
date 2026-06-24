@@ -252,11 +252,12 @@ if __name__ == "__main__":
         print(f"  Reg mode: {REG_MODE}, lambda: {LAMBDA_REG}")
 
         # ── Optimiser ───────────────────────────────────────────────────────
-        nn_weights, gate_params, var_params, fe_params = [], [], [], []
+        nn_weights, var_params, fe_params = [], [], []
+        gl_param_set = {id(model.rho_net.net[0].weight)}
+
         for n, p in model.named_parameters():
-            print(n)
-            if 'skip_gate_logit' in n:
-                gate_params.append(p)
+            if id(p) in gl_param_set:
+                continue
             elif 'log_residual_var' in n or 'log_std' in n:
                 var_params.append(p)
             elif 'beta_neural' in n:
@@ -264,14 +265,15 @@ if __name__ == "__main__":
             else:
                 nn_weights.append(p)
 
-        print(gate_params, fe_params, var_params)
+        gl_params = [model.rho_net.net[0].weight]
+
         optimizer = torch.optim.AdamW([
             {'params': nn_weights, 'weight_decay': WD},
-            {'params': gate_params, 'weight_decay': 0.0},
+            {'params': gl_params,  'weight_decay': 0.0},
             {'params': var_params, 'weight_decay': 0.0},
-            {'params': fe_params,  'weight_decay': 0.0},  # or a small value if desired
+            {'params': fe_params,  'weight_decay': 0.0},
         ])
-        # optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
+        
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=150, verbose=True
         )
