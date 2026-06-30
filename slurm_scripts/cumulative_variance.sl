@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH -J ODE_LMM
 # Asking for one node
-#SBATCH -w sirocco24 --time=2-10:00:00 --exclusive
+#SBATCH -w sirocco23 --time=2-10:00:00 --exclusive
 # Standard output
 #SBATCH -o slurm.sh%j.out
 # Standard error
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python PDP_delta_cumulative_effect.py --bmi_pairs 23:28 --ledoit_wolf
+python DPDP_cumulative_effect.py --bmi_pairs 23:28 --ledoit_wolf

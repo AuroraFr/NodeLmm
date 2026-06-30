@@ -134,7 +134,7 @@ def plot_hlme_delta_pdp(csv_path, save_path, feat_name="covariate",
     else:
         nrows, ncols = 2, 2
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(24, 12))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(18, 12))
     axes = np.atleast_1d(axes).flatten()
 
     # First pass: find global y range
@@ -187,7 +187,7 @@ def plot_hlme_delta_pdp(csv_path, save_path, feat_name="covariate",
         n_sig = int(sub["sig"].sum())
         L = len(sub)
         # sig_str = f'{n_sig}/{L} sig.' if n_sig > 0 else 'n.s.'
-        ax.set_title(f'{label_a}\n− {label_b})', fontsize=10)
+        ax.set_title(f'{label_a}− {label_b})', fontsize=18)
         ax.grid(True, alpha=0.3)
 
     # Hide unused panels

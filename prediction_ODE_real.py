@@ -362,7 +362,7 @@ def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
 
     if hlme_pop is not None and "mean_y_blup" in hlme_pop.columns:
         ax.plot(hlme_pop["time"], hlme_pop["mean_y_blup"], "o--",
-                color="black", linewidth=2, markersize=6, label="HLME BLUP")
+                color="black", linewidth=2, markersize=6, label="LMM BLUP")
 
     ax.set_xlabel("Time (years)", fontsize=12)
     ax.set_ylabel("ISA15", fontsize=12)

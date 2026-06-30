@@ -12,8 +12,10 @@ Usage:
         make_profiles_continuous,
         resample_xaug_to_grid,
         compute_trajectory_profile_pdp_continuous,
+        compute_trajectory_profile_pdp_with_ci,   # delta-method CI
         plot_trajectory_profile_pdp_continuous,
-        plot_trajectory_profile_pdp_delta,       # NEW
+        plot_trajectory_profile_pdp_delta,
+        plot_all_pairwise_delta_pdp,
     )
 """
 
@@ -295,6 +297,229 @@ def compute_trajectory_profile_pdp_continuous(
                   f"[{ci_lo:+.3f}, {ci_hi:+.3f}]  {interp:>20s}")
 
     return results, eval_grid, n_total
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Core: continuous-time trajectory-profile PDP  WITH  delta-method CI
+# ═════════════════════════════════════════════════════════════════════
+
+def _flatten_grad(params):
+    """Collect .grad from each parameter into a single 1-D numpy array."""
+    pieces = []
+    for p in params:
+        if p.grad is not None:
+            pieces.append(p.grad.detach().cpu().reshape(-1).numpy())
+        else:
+            pieces.append(np.zeros(p.numel()))
+    return np.concatenate(pieces)
+
+
+def compute_trajectory_profile_pdp_with_ci(
+    model, loader, device, profiles, eval_grid,
+    target_col=0, n_tv=5, mask_type="binary",
+    target_name="covariate", fisher_inv=None,
+):
+    """
+    Compute trajectory-profile PDP **with delta-method CI**.
+
+    For each profile p and grid point ℓ, computes:
+        PDP_p(t_ℓ) = (1/N) Σ_i  μ_i(t_ℓ ; x^cf_p)
+        g_pℓ       = (1/N) Σ_i  ∂μ_i(t_ℓ)/∂θ          (via backprop)
+        SE_pℓ      = sqrt( g_pℓ^T  F^{-1}  g_pℓ )
+
+    Gradient computation uses batch_size=1 with independent forward/backward
+    per subject to avoid retain_graph errors from the ODE solver.
+
+    Args:
+        model:      trained Neural ODE-LMM
+        loader:     DataLoader (any batch size — subjects processed one-by-one)
+        device:     torch device
+        profiles:   dict {name: (L,) array of profile values}
+        eval_grid:  (L,) numpy array
+        target_col: covariate index
+        n_tv:       number of time-varying covariates
+        mask_type:  "binary" or "cumulative"
+        target_name: label for printing
+        fisher_inv: (P, P) numpy array or torch tensor, F^{-1}
+
+    Returns:
+        ci_results: dict {profile_name: {'mean': (L,), 'grad': (L,P),
+                          'se': (L,), 'ci_lo': (L,), 'ci_hi': (L,)}}
+        eval_grid:  (L,) numpy array
+        n_subjects: int
+    """
+    model.eval()
+    L = len(eval_grid)
+
+    # Identify parameters for gradient collection
+    params = [p for p in model.parameters() if p.requires_grad]
+    P = sum(p.numel() for p in params)
+
+    print(f"  Computing trajectory-profile PDP with CI for {target_name}")
+    print(f"    Grid: {L} points on [{eval_grid[0]:.1f}, {eval_grid[-1]:.1f}]")
+    print(f"    Profiles: {list(profiles.keys())}")
+    print(f"    Total parameters: {P}")
+
+    # ── Step 1: compute means (no grad, fast) ──────────────────────
+    with torch.no_grad():
+        all_mus = {pname: [] for pname in profiles}
+        n_total = 0
+        for pname, prof_values in profiles.items():
+            for batch in loader:
+                pids, x_aug, y_pad, target_mask, static = batch
+                x_aug = x_aug.to(device)
+                target_mask = target_mask.to(device)
+                static = static.to(device)
+
+                x_aug_grid, obs_mask_grid = resample_xaug_to_grid(
+                    x_aug, target_mask, eval_grid, n_tv)
+                x_aug_cf = build_profile_xaug_continuous(
+                    x_aug_grid, target_col=target_col,
+                    profile_values=prof_values, n_tv=n_tv,
+                    mask_type=mask_type)
+                mu, *_ = model(
+                    x_aug_cf, static_covariates=static,
+                    obs_mask=obs_mask_grid)
+                all_mus[pname].append(mu.cpu().numpy())
+
+                if pname == list(profiles.keys())[0]:
+                    n_total += x_aug.shape[0]
+
+        for pname in profiles:
+            all_mus[pname] = np.concatenate(all_mus[pname], axis=0)  # (N, L)
+
+    print(f"    N subjects = {n_total}")
+
+    # ── Step 2: compute gradients (with grad, subject-by-subject) ──
+    #    For each profile p:  g_p[ℓ] = (1/N) Σ_i  ∂μ_i(t_ℓ)/∂θ
+    #
+    #    Uses retain_graph to get all L gradients from a single forward pass.
+    #    Falls back to L separate forward passes if retain_graph fails.
+
+    grad_all = {}  # {pname: (L, P)}
+
+    for pname, prof_values in profiles.items():
+        g_accum = np.zeros((L, P), dtype=np.float64)
+        subj_idx = 0
+
+        print(f"    Gradients for {pname}:", end=" ", flush=True)
+
+        for batch in loader:
+            pids, x_aug, y_pad, target_mask, static = batch
+            x_aug = x_aug.to(device)
+            target_mask = target_mask.to(device)
+            static = static.to(device)
+            N_batch = x_aug.shape[0]
+
+            x_aug_grid, obs_mask_grid = resample_xaug_to_grid(
+                x_aug, target_mask, eval_grid, n_tv)
+            x_aug_cf = build_profile_xaug_continuous(
+                x_aug_grid, target_col=target_col,
+                profile_values=prof_values, n_tv=n_tv,
+                mask_type=mask_type)
+
+            for i in range(N_batch):
+                # -- Try retain_graph approach first (1 forward, L backward) --
+                try:
+                    model.zero_grad()
+                    mu_i, *_ = model(
+                        x_aug_cf[i:i+1],
+                        static_covariates=static[i:i+1],
+                        obs_mask=obs_mask_grid[i:i+1],
+                    )
+                    for ell in range(L):
+                        model.zero_grad()
+                        mu_i[0, ell].backward(
+                            retain_graph=(ell < L - 1))
+                        g_accum[ell] += _flatten_grad(params) / n_total
+                except RuntimeError:
+                    # -- Fallback: L separate forward passes per subject --
+                    for ell in range(L):
+                        model.zero_grad()
+                        mu_i, *_ = model(
+                            x_aug_cf[i:i+1],
+                            static_covariates=static[i:i+1],
+                            obs_mask=obs_mask_grid[i:i+1],
+                        )
+                        mu_i[0, ell].backward()
+                        g_accum[ell] += _flatten_grad(params) / n_total
+
+                subj_idx += 1
+                if subj_idx % 200 == 0:
+                    print(f"{subj_idx}", end=" ", flush=True)
+
+        grad_all[pname] = g_accum.astype(np.float64)
+        print(f"done ({subj_idx})")
+
+    # ── Step 3: assemble ci_results ────────────────────────────────
+    if fisher_inv is not None:
+        if isinstance(fisher_inv, np.ndarray):
+            F_inv = torch.from_numpy(fisher_inv).float()
+        else:
+            F_inv = fisher_inv.float()
+    else:
+        F_inv = None
+
+    ci_results = {}
+    for pname in profiles:
+        mu_mean = all_mus[pname].mean(axis=0)   # (L,)
+        g = grad_all[pname]                      # (L, P)
+
+        if F_inv is not None:
+            se = np.zeros(L)
+            for ell in range(L):
+                gvec = torch.from_numpy(g[ell]).float()
+                se[ell] = np.sqrt(max((gvec @ F_inv @ gvec).item(), 0.0))
+        else:
+            se = np.full(L, np.nan)
+
+        ci_results[pname] = {
+            'mean':  mu_mean,
+            'grad':  g,
+            'se':    se,
+            'ci_lo': mu_mean - 1.96 * se,
+            'ci_hi': mu_mean + 1.96 * se,
+        }
+
+    # ── Step 4: pre-compute pairwise ΔPDP SE ──────────────────────
+    pnames = list(profiles.keys())
+    for ia in range(len(pnames)):
+        for ib in range(ia + 1, len(pnames)):
+            pa, pb = pnames[ia], pnames[ib]
+            delta_grad = grad_all[pa] - grad_all[pb]  # (L, P)
+            delta_mean = ci_results[pa]['mean'] - ci_results[pb]['mean']
+
+            if F_inv is not None:
+                delta_se = np.zeros(L)
+                for ell in range(L):
+                    gvec = torch.from_numpy(delta_grad[ell]).float()
+                    delta_se[ell] = np.sqrt(
+                        max((gvec @ F_inv @ gvec).item(), 0.0))
+            else:
+                delta_se = np.full(L, np.nan)
+
+            key = f'_delta_{pa}_vs_{pb}'
+            ci_results[key] = {
+                'mean': delta_mean,
+                'se':   delta_se,
+                'ci_lo': delta_mean - 1.96 * delta_se,
+                'ci_hi': delta_mean + 1.96 * delta_se,
+            }
+
+    # ── Print SE comparison ───────────────────────────────────────
+    if "late_decline" in profiles and "stable_low" in profiles:
+        pa, pb = "late_decline", "stable_low"
+        cross_se = (all_mus[pa] - all_mus[pb]).std(axis=0) / np.sqrt(n_total)
+        dkey = f'_delta_{pa}_vs_{pb}'
+        delta_se = ci_results[dkey]['se'] if dkey in ci_results else np.full(L, np.nan)
+        print(f"\n  SE comparison: cross-subject vs delta-method")
+        print(f"    {'Time':>8s}  {'cross-SE':>10s}  {'delta-SE':>10s}  {'ratio':>10s}")
+        for ell in range(L):
+            r = delta_se[ell] / cross_se[ell] if cross_se[ell] > 0 else np.nan
+            print(f"    {eval_grid[ell]:8.1f}  {cross_se[ell]:10.4f}  "
+                  f"{delta_se[ell]:10.4f}  {r:10.2f}")
+
+    return ci_results, eval_grid, n_total
 
 
 def build_counterfactual_xaug(x_aug, target_col, target_value, n_tv,
@@ -714,7 +939,7 @@ def plot_all_pairwise_delta_pdp(
     else:
         F_inv = None
 
-    fig, axes = plt.subplots(2, 2, figsize=(24, 12))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
     axes = axes.flatten()
     if len(pairs) == 1:
         axes = [axes]
@@ -775,16 +1000,17 @@ def plot_all_pairwise_delta_pdp(
             for vt in visit_times:
                 ax.axvline(vt, color='grey', linestyle=':', alpha=0.2, linewidth=0.5)
 
-        ax.set_xlabel('Time (years)')
+        ax.set_xlabel('Time (years)', fontsize=13)
         if idx % int(len(pairs)/4) == 0:
-            ax.set_ylabel('ΔPDP')
+            ax.set_ylabel('ΔPDP', fontsize=13)
+        ax.tick_params(labelsize=11)
 
         ax.set_ylim(shared_ylim)
 
         label_a = PROFILE_LABELS.get(pa, pa)
         label_b = PROFILE_LABELS.get(pb, pb)
         # sig_str = f'{n_sig}/{len(eval_grid)} sig.' if n_sig > 0 else 'n.s.'
-        ax.set_title(f'{label_a}\n− {label_b}', fontsize=10)
+        ax.set_title(f'{label_a}− {label_b}', fontsize=18)
         ax.grid(True, alpha=0.3)
 
     # fig.suptitle(f'Pairwise ΔPDP for {target_name} (delta-method 95% CI)',

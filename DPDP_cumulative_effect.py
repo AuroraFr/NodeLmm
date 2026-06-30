@@ -931,16 +931,16 @@ if __name__ == "__main__":
     parser.add_argument("--oracle_mode", type=str, default="cumulative",
                         choices=["cumulative", "instantaneous"])
     parser.add_argument("--output_csv", type=str,
-                        default="results_simu/simulation_cumulative_noreg_summary_configB.csv")
+                        default="results_simu/simulation_cumulative_grouplasso_summary_2.csv")
     parser.add_argument("--data_dir", type=str, default="simu_datasets/S5_sims")
     parser.add_argument("--ckpt_dir", type=str,
-                        default="checkpoints/model_selection_S2")
+                        default="checkpoints/simulation_cumulative_effect_diagoD_grouplasso_norhonorm_2")
     parser.add_argument("--bmi_pairs", type=str, default=None)
     parser.add_argument("--sandwich", action="store_true")
     parser.add_argument("--n_hessian_subsample", type=int, default=None)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--lambda_reg", type=float, default=0.5)
-    parser.add_argument("--reg_mode", type=str, default=None,
+    parser.add_argument("--lambda_reg", type=float, default=0.1)
+    parser.add_argument("--reg_mode", type=str, default='group_lasso',
                         choices=[None, "skip_gate", "group_lasso"])
     parser.add_argument("--t_eval", type=str, default="0, 2, 4, 6, 8, 10, 12",
                         help="Comma-separated eval times")
@@ -981,7 +981,7 @@ if __name__ == "__main__":
     all_pair_results = {pair: [] for pair in bmi_pairs}
 
     ckpt_dir = os.path.dirname(args.output_csv) or '.'
-    ckpt_file = os.path.join(ckpt_dir, "delta_cumulative_checkpoint_sel.pt")
+    ckpt_file = os.path.join(ckpt_dir, "delta_cumulative_checkpoint.pt")
     start_sim = 0
 
     if os.path.exists(ckpt_file):
@@ -994,7 +994,7 @@ if __name__ == "__main__":
     for sim_idx in range(start_sim, args.n_sims):
         if args.n_sims > 1:
             data_path = f"{args.data_dir}/sim_{sim_idx+1:03d}.rds"
-            ckpt_path = f"{args.ckpt_dir}/B_both_no_reg_sim00{sim_idx}.pt"
+            ckpt_path = f"{args.ckpt_dir}/best_model_ode_{sim_idx}.pt"
             print(f"\n{'#'*60}")
             print(f"# SIMULATION {sim_idx}")
             print(f"{'#'*60}")

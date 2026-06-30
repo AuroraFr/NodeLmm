@@ -44,7 +44,7 @@ if __name__ == "__main__":
     parser.add_argument("--t_max", type=float, default=12.0,
                         help="Maximum time (years)")
     parser.add_argument("--prefix", type=str,
-                        default="figures/test")
+                        default="figures/CV")
 
     # Delta-method options
     parser.add_argument("--delta_method", action="store_true",
@@ -313,22 +313,38 @@ if __name__ == "__main__":
                 fisher_inv=fisher_inv,
             )
 
-            # SE comparison
-            print(f"\n    SE comparison: cross-subject vs delta-method")
+            # SE comparison: pick a diagnostic pair
+            pa_diag, pb_diag = "late_decline", "stable_low"
+            delta_key_diag = f'_delta_{pa_diag}_vs_{pb_diag}'
+
+            print(f"\n    SE comparison: cross-subject vs delta-method "
+                  f"({pa_diag} vs {pb_diag})")
             print(f"    {'Time':>8s}  {'cross-SE':>10s}  {'delta-SE':>10s}  "
                   f"{'ratio':>8s}")
             for ell in range(len(eval_grid)):
                 t = eval_grid[ell]
-                if ("late_decline" in traj_results
-                        and "late_spike" in traj_results):
-                    diff_subj = (traj_results["late_decline"]
-                                 - traj_results["late_spike"])
+
+                # Cross-subject SE
+                if (pa_diag in traj_results
+                        and pb_diag in traj_results):
+                    diff_subj = (traj_results[pa_diag]
+                                 - traj_results[pb_diag])
                     cross_se = diff_subj.std(axis=0)[ell] / np.sqrt(n_subj)
                 else:
                     cross_se = float('nan')
 
-                if '_delta_eb_ls' in ci_results:
-                    delta_se = ci_results['_delta_eb_ls']['se'][ell]
+                # Delta-method SE (from pre-computed key or recompute)
+                if delta_key_diag in ci_results:
+                    delta_se = ci_results[delta_key_diag]['se'][ell]
+                elif (pa_diag in ci_results and pb_diag in ci_results
+                      and fisher_inv is not None):
+                    g = (ci_results[pa_diag]['grad'][ell]
+                         - ci_results[pb_diag]['grad'][ell])
+                    g_t = torch.from_numpy(g).float()
+                    F_inv = (torch.from_numpy(fisher_inv).float()
+                             if isinstance(fisher_inv, np.ndarray)
+                             else fisher_inv.float())
+                    delta_se = np.sqrt(max((g_t @ F_inv @ g_t).item(), 0.0))
                 else:
                     delta_se = float('nan')
 
