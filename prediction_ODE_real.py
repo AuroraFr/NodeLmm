@@ -290,7 +290,339 @@ def population_averaged_predictions(df_fit, visit_times=None, max_dist=1.5):
 
 
 # ====================================================================
-# 6. PLOTS
+# 6. MONTE-CARLO CONFIDENCE INTERVALS  (via empirical Fisher)
+# ====================================================================
+
+# ====================================================================
+# 6a. DIFFERENTIABLE BLUP (for delta method)
+# ====================================================================
+
+def _blup_differentiable(mu, V, y_pad, target_mask, Z, D, sig2, jitter=1e-6):
+    """
+    Same as compute_blup but WITHOUT @torch.no_grad(),
+    so gradients flow through for the delta method.
+    Only supports batch_size=1 (N=1).
+    """
+    N, T = mu.shape
+    q = Z.shape[2]
+    device, dtype = mu.device, mu.dtype
+
+    b_hat = torch.zeros(N, q, device=device, dtype=dtype)
+    y_blup = mu.clone()
+
+    for i in range(N):
+        obs = target_mask[i].bool()
+        n_i = obs.sum()
+        if n_i < 1:
+            continue
+
+        mu_i = mu[i, obs]
+        y_i = y_pad[i, obs]
+        V_i = V[i][obs][:, obs]
+        Z_i = Z[i, obs]
+        r_i = y_i - mu_i
+
+        L_i = torch.linalg.cholesky(
+            V_i + jitter * torch.eye(n_i, device=device, dtype=dtype))
+        Vinv_r = torch.cholesky_solve(
+            r_i.unsqueeze(-1), L_i).squeeze(-1)
+
+        b_hat[i] = D @ Z_i.t() @ Vinv_r
+        y_blup[i] = mu[i] + Z[i] @ b_hat[i]
+
+    return b_hat, y_blup
+
+
+# ====================================================================
+# 6b. DELTA METHOD CI FOR POPULATION-AVERAGED PREDICTIONS
+# ====================================================================
+
+def delta_method_prediction_ci(model, dataset, collate_fn, device, fisher_inv,
+                                visit_times=None, max_dist=1.5, verbose=True):
+    """
+    Delta method 95% CI for population-averaged BLUP predictions.
+
+    Var(μ̄_BLUP(t)) = ∇_θ μ̄_BLUP(t)ᵀ · F⁻¹ · ∇_θ μ̄_BLUP(t)
+
+    where ∇_θ μ̄_BLUP(t) = (1/nₜ) Σᵢ ∇_θ ŷᵢ_BLUP(t)
+
+    One forward+backward per subject per visit time.
+    Exact (no MC noise), much faster than MC with 500 draws.
+    """
+    if visit_times is None:
+        visit_times = EXPECTED_TIMES.tolist()
+    n_times = len(visit_times)
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    P = sum(p.numel() for p in trainable_params)
+
+    # Accumulators per visit time
+    grad_accum = torch.zeros(n_times, P)
+    pred_accum = np.zeros(n_times)
+    counts = np.zeros(n_times, dtype=int)
+
+    model.eval()
+    loader_1 = DataLoader(dataset, batch_size=1, shuffle=False,
+                          collate_fn=collate_fn)
+
+    for s_idx, batch in enumerate(loader_1):
+        pids, x_aug, y_pad, target_mask, static = batch
+        x_aug = x_aug.to(device)
+        y_pad = y_pad.to(device)
+        target_mask = target_mask.to(device)
+        static = static.to(device)
+
+        # ── Forward WITH gradients ──────────────────────────────────
+        mu, V, Z, D, sig2, _ = model(
+            x_aug, static_covariates=static, obs_mask=target_mask)
+
+        # ── Differentiable BLUP ─────────────────────────────────────
+        _, y_blup = _blup_differentiable(
+            mu, V, y_pad, target_mask, Z, D, sig2)
+
+        # ── Find which visit times this subject contributes to ──────
+        t_pad = x_aug[0, :, 0].detach()
+        obs_idx = torch.where(target_mask[0] > 0.5)[0]
+        obs_times = t_pad[obs_idx]
+
+        # Collect (visit_time_index, obs_index) pairs
+        vt_hits = []
+        for k, vt in enumerate(visit_times):
+            if len(obs_times) == 0:
+                continue
+            dists = (obs_times - vt).abs()
+            min_dist, min_pos = dists.min(0)
+            if min_dist.item() <= max_dist:
+                j = obs_idx[min_pos.item()].item()
+                vt_hits.append((k, j))
+
+        if len(vt_hits) == 0:
+            continue
+
+        # ── Backward for each visit time ────────────────────────────
+        for hit_idx, (k, j) in enumerate(vt_hits):
+            model.zero_grad()
+            is_last = (hit_idx == len(vt_hits) - 1)
+            y_blup[0, j].backward(retain_graph=not is_last)
+
+            # Collect gradient
+            grad_i = torch.cat([
+                p.grad.detach().reshape(-1) if p.grad is not None
+                else torch.zeros(p.numel(), device=device)
+                for p in trainable_params
+            ]).cpu()
+
+            grad_accum[k] += grad_i
+            pred_accum[k] += y_blup[0, j].item()
+            counts[k] += 1
+
+        if verbose and (s_idx + 1) % 500 == 0:
+            print(f"    Subject {s_idx+1}/{len(dataset)}")
+
+    # ── Compute pointwise CI ────────────────────────────────────────
+    fisher_inv_cpu = fisher_inv.cpu()
+
+    results = {
+        "time": np.array(visit_times),
+        "mean_blup": np.zeros(n_times),
+        "se_blup": np.zeros(n_times),
+        "ci_lo_blup": np.zeros(n_times),
+        "ci_hi_blup": np.zeros(n_times),
+    }
+
+    if verbose:
+        print(f"\n  Delta method CI (averaged BLUP predictions):")
+        print(f"  {'Time':>6s}  {'Mean':>8s}  {'nₜ':>5s}  "
+              f"{'SE':>8s}  {'95% CI':>20s}")
+
+    for k in range(n_times):
+        if counts[k] == 0:
+            continue
+
+        n_k = counts[k]
+        mean_pred = pred_accum[k] / n_k
+        mean_grad = grad_accum[k] / n_k     # ∇_θ μ̄(t)
+
+        # Var(μ̄(t)) = ∇ᵀ F⁻¹ ∇
+        var_k = (mean_grad @ fisher_inv_cpu @ mean_grad).item()
+        se_k = np.sqrt(max(var_k, 0.0))
+
+        results["mean_blup"][k] = mean_pred
+        results["se_blup"][k] = se_k
+        results["ci_lo_blup"][k] = mean_pred - 1.96 * se_k
+        results["ci_hi_blup"][k] = mean_pred + 1.96 * se_k
+
+        if verbose:
+            print(f"  {visit_times[k]:6.1f}  {mean_pred:8.3f}  {n_k:5d}  "
+                  f"{se_k:8.4f}  "
+                  f"[{results['ci_lo_blup'][k]:.3f}, "
+                  f"{results['ci_hi_blup'][k]:.3f}]")
+
+    return results
+
+
+def compute_fisher_for_ci(model, dataset, collate_fn, device,
+                           lambda_reg=0.0, weight_decay=0.0,
+                           variance_mode="ledoit_wolf",
+                           fisher_cache=None, verbose=True):
+    """
+    Compute (or load cached) Fisher inverse for CI computation.
+    Shared between prediction CI and ΔPDP CI.
+    """
+    from PDP_variance import (
+        compute_empirical_fisher,
+        _ledoit_wolf_shrink_fisher,
+        _regularise_and_invert,
+    )
+
+    if fisher_cache and os.path.exists(fisher_cache):
+        if verbose:
+            print(f"  Loading cached Fisher inverse from {fisher_cache}")
+        return torch.from_numpy(np.load(fisher_cache)).float()
+
+    if verbose:
+        print(f"\n  Computing empirical Fisher (N={len(dataset)}) ...")
+        print(f"  Variance mode: {variance_mode}")
+
+    fisher, scores = compute_empirical_fisher(
+        model, dataset, device, collate_fn=collate_fn,
+        lambda_reg=lambda_reg, weight_decay=weight_decay,
+        verbose=verbose,
+    )
+
+    if variance_mode == "ledoit_wolf":
+        F_shrunk, lw_alpha = _ledoit_wolf_shrink_fisher(
+            fisher, scores, verbose=verbose)
+        _, fisher_inv = _regularise_and_invert(
+            F_shrunk, "Fisher (LW)", LAMBDA=1e-6, verbose=verbose)
+    elif variance_mode == "marquardt":
+        _, fisher_inv = _regularise_and_invert(
+            fisher, "Fisher (Marquardt)", LAMBDA=1e-4, verbose=verbose)
+    else:
+        raise ValueError(f"Unknown variance_mode: {variance_mode}")
+
+    if fisher_cache:
+        np.save(fisher_cache, fisher_inv.numpy())
+        if verbose:
+            print(f"  Fisher inverse cached to {fisher_cache}")
+
+    return fisher_inv
+
+
+# ====================================================================
+# 6c. MONTE-CARLO CI (alternative to delta method)
+# ====================================================================
+ 
+@torch.no_grad()
+def mc_population_ci(model, loader, device, fisher_inv,
+                     visit_times=None, n_mc=500, seed=42,
+                     max_dist=1.5, verbose=True):
+    """
+    Monte Carlo 95% CI for population-averaged BLUP predictions.
+ 
+    Method:
+      1. Draw θ⁽ᵐ⁾ ~ N(θ̂, F⁻¹),  m = 1, ..., M
+      2. For each draw, load θ⁽ᵐ⁾, run predict_fit_mode → pop-avg curve
+      3. Pointwise quantiles [2.5%, 97.5%]
+ 
+    Should give same width as delta method if linearization is accurate.
+    """
+    if visit_times is None:
+        visit_times = EXPECTED_TIMES.tolist()
+    n_times = len(visit_times)
+ 
+    theta_hat = torch.nn.utils.parameters_to_vector(
+        [p for p in model.parameters() if p.requires_grad]
+    ).detach().cpu()
+    P = len(theta_hat)
+ 
+    if verbose:
+        print(f"\n  MC sampling: {n_mc} draws from N(θ̂, F⁻¹), P = {P}")
+ 
+    # ------------------------------------------------------------------
+    # Cholesky of F⁻¹ for efficient sampling
+    # Work in float64 throughout to avoid numerical non-PD artifacts
+    # ------------------------------------------------------------------
+    F_cpu = fisher_inv.cpu().double()
+    F_cpu = (F_cpu + F_cpu.T) / 2                # enforce exact symmetry
+ 
+    try:
+        L_cov = torch.linalg.cholesky(F_cpu)
+    except torch.linalg.LinAlgError:
+        # F⁻¹ has negative eigenvalues from float32 inversion artifacts
+        # Project onto PD cone via eigenvalue clipping
+        eigvals, eigvecs = torch.linalg.eigh(F_cpu)
+        n_neg = (eigvals < 0).sum().item()
+        if verbose:
+            print(f"  Fisher⁻¹ not PD: {n_neg}/{P} negative eigenvalues")
+            print(f"  eigenvalue range: [{eigvals.min().item():.2e}, "
+                  f"{eigvals.max().item():.2e}]")
+        # Relative floor: preserve structure, clamp only degenerate directions
+        floor = eigvals.max().item() * 1e-10
+        eigvals = eigvals.clamp(min=floor)
+        F_pd = eigvecs @ torch.diag(eigvals) @ eigvecs.T
+        F_pd = (F_pd + F_pd.T) / 2
+        L_cov = torch.linalg.cholesky(F_pd)
+        if verbose:
+            print(f"  Projected onto PD cone (floor = {floor:.2e})")
+ 
+    L_cov = L_cov.float()                        # back to float32 for sampling
+ 
+    curves_blup = np.zeros((n_mc, n_times))
+    curves_pop = np.zeros((n_mc, n_times))
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+ 
+    torch.manual_seed(seed)
+    for m in range(n_mc):
+        z = torch.randn(P)
+        theta_m = theta_hat + L_cov @ z
+ 
+        torch.nn.utils.vector_to_parameters(theta_m, trainable_params)
+ 
+        df_fit_m = predict_fit_mode(model, loader, device)
+        df_pop_m = population_averaged_predictions(
+            df_fit_m, visit_times=visit_times, max_dist=max_dist)
+ 
+        curves_blup[m] = df_pop_m["mean_y_blup"].values
+        curves_pop[m] = df_pop_m["mean_mu_pop"].values
+ 
+        if verbose and (m + 1) % 100 == 0:
+            print(f"    MC draw {m+1}/{n_mc}")
+ 
+    # Restore original parameters
+    torch.nn.utils.vector_to_parameters(theta_hat, trainable_params)
+    model.eval()
+ 
+    results = {
+        "time": np.array(visit_times),
+        "mean_blup": np.mean(curves_blup, axis=0),
+        "se_blup": np.std(curves_blup, axis=0),
+        "ci_lo_blup": np.percentile(curves_blup, 2.5, axis=0),
+        "ci_hi_blup": np.percentile(curves_blup, 97.5, axis=0),
+        "mean_pop": np.mean(curves_pop, axis=0),
+        "se_pop": np.std(curves_pop, axis=0),
+        "ci_lo_pop": np.percentile(curves_pop, 2.5, axis=0),
+        "ci_hi_pop": np.percentile(curves_pop, 97.5, axis=0),
+    }
+ 
+    if verbose:
+        print(f"\n  MC CI results (averaged BLUP):")
+        print(f"  {'Time':>6s}   {'Mean':>8s}   {'SE':>8s}   {'95% CI':>20s}")
+        for i, t in enumerate(visit_times):
+            print(f"  {t:6.1f}   {results['mean_blup'][i]:8.3f}   "
+                  f"{results['se_blup'][i]:8.3f}   "
+                  f"[{results['ci_lo_blup'][i]:.3f}, "
+                  f"{results['ci_hi_blup'][i]:.3f}]")
+        print(f"\n  MC CI results (population μ):")
+        for i, t in enumerate(visit_times):
+            print(f"  {t:6.1f}   [{results['ci_lo_pop'][i]:.3f}, "
+                  f"{results['ci_hi_pop'][i]:.3f}]")
+ 
+    return results
+
+
+# ====================================================================
+# 7. PLOTS
 # ====================================================================
 
 def plot_individual_predictions(df_fit, n_subjects=25, ncols=5,
@@ -313,7 +645,7 @@ def plot_individual_predictions(df_fit, n_subjects=25, ncols=5,
         ax.scatter(df_s["time"], df_s["y_true"], c="blue", s=20, zorder=3,
                    label="Observed")
         ax.plot(df_s["time"], df_s["y_blup"], "g--", linewidth=1.5,
-                label="ODE BLUP")
+                label="Neural ODE-LMM")
         ax.plot(df_s["time"], df_s["mu_pop"], "r:", linewidth=1, alpha=0.6,
                 label="ODE pop")
 
@@ -325,7 +657,7 @@ def plot_individual_predictions(df_fit, n_subjects=25, ncols=5,
 
         ax.set_title(f"ID {sid} (n={len(df_s)})", fontsize=9)
         if p_idx % ncols == 0:
-            ax.set_ylabel("ISA15")
+            ax.set_ylabel("IST")
         if p_idx >= (nrows - 1) * ncols:
             ax.set_xlabel("Time (years)")
 
@@ -343,36 +675,62 @@ def plot_individual_predictions(df_fit, n_subjects=25, ncols=5,
 
 
 def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
-                             save_path="predictions_population.png"):
+                             ci_dict=None, hlme_ci_dict=None,
+                             save_path="predictions_population_mc.png"):
+    """
+    Population-averaged prediction plot with optional 95% CI as error bars.
+
+    Args:
+        df_pop:       DataFrame with observed means/SE and model predictions
+        hlme_pop:     DataFrame with HLME predictions (optional)
+        mode:         "fit" or "forecast"
+        ci_dict:      dict from delta_method_prediction_ci() (optional)
+        hlme_ci_dict: dict with keys 'time', 'ci_lo', 'ci_hi' — HLME CI (optional)
+        save_path:    output path
+    """
     fig, ax = plt.subplots(figsize=(8, 5))
 
+    # ── Observed: mean ± 1.96 SE (95% CI) ───────────────────────────
     ax.errorbar(df_pop["time"], df_pop["mean_y_true"],
-                yerr=df_pop["se_y_true"],
+                yerr=1.96 * df_pop["se_y_true"],
                 fmt="o-", color="blue", linewidth=2, markersize=6,
-                capsize=3, label="Observed (mean ± SE)")
+                capsize=4, label="Observed (mean, 95% CI)")
 
-    pred_col = "mean_y_blup" if mode == "fit" else "mean_y_pred"
-    label = "ODE BLUP" if mode == "fit" else "ODE forecast"
-    if pred_col in df_pop.columns:
-        ax.plot(df_pop["time"], df_pop[pred_col], "o--", color="green",
+    # ── ODE BLUP with delta method CI error bars ────────────────────
+    label = "Neural ODE-LMM (95% CI)" if mode == "fit" else "Neural ODE-LMM (forecast)"
+    print(df_pop["mean_y_blup"].values)
+    if ci_dict is not None:
+        y_ode = df_pop["mean_y_blup"].values 
+        yerr_lo = y_ode - ci_dict["ci_lo_blup"]
+        yerr_hi = ci_dict["ci_hi_blup"] - y_ode
+        print(yerr_hi, yerr_lo)
+        print(df_pop["mean_y_blup"].values, ci_dict['mean_blup'])
+        ax.errorbar(ci_dict["time"], y_ode,
+                    yerr=[yerr_lo, yerr_hi],
+                    fmt="o--", color="green", linewidth=2, markersize=6,
+                    capsize=4, label=label)
+    else:
+        ax.plot(df_pop["time"], df_pop["mean_y_blup"], "o--", color="green",
                 linewidth=2, markersize=6, label=label)
 
-    # ax.plot(df_pop["time"], df_pop["mean_mu_pop"], "o:", color="red",
-    #         linewidth=1.5, markersize=5, alpha=0.7, label="ODE pop mean")
+    # ── HLME with CI error bars ─────────────────────────────────────
+    if hlme_pop is not None:
+        y_hlme = hlme_pop["mean_pred"].values
+        yerr_lo = y_hlme - hlme_pop["ci_lo_delta"]
+        yerr_hi = hlme_pop["ci_hi_delta"] - y_hlme
+        print(yerr_hi, yerr_lo)
+        ax.errorbar(hlme_pop["time"], y_hlme,
+                    yerr=[yerr_lo, yerr_hi],
+                    fmt="o--", color="black", linewidth=2, markersize=6,
+                    capsize=4, label="LMM (95% CI)")
 
-    if hlme_pop is not None and "mean_y_blup" in hlme_pop.columns:
-        ax.plot(hlme_pop["time"], hlme_pop["mean_y_blup"], "o--",
-                color="black", linewidth=2, markersize=6, label="LMM BLUP")
-
-    ax.set_xlabel("Time (years)", fontsize=12)
-    ax.set_ylabel("ISA15", fontsize=12)
-    # ax.set_title(f"Population-averaged predictions ({mode}) — Neural ODE-LMM",
-    #              fontsize=13)
+    ax.set_xlabel("Time since inclusion (years)", fontsize=12)
+    ax.set_ylabel("IST", fontsize=12)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
     print(f"  → {save_path}")
 
@@ -394,6 +752,24 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="results_3C")
     parser.add_argument("--test_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
+    # ── CI arguments ──
+    parser.add_argument("--compute_ci", action="store_true",
+                        help="Compute 95%% CI for population-averaged predictions")
+    parser.add_argument("--ci_method", type=str, default="delta",
+                        choices=["delta", "mc", "both"],
+                        help="CI method: delta (exact, fast), mc (no linearization), "
+                             "both (cross-check)")
+    parser.add_argument("--n_mc", type=int, default=500,
+                        help="Number of MC draws (only for mc/both)")
+    parser.add_argument("--fisher_cache", type=str, default=None,
+                        help="Path to cached F⁻¹ (.npy); computed if absent")
+    parser.add_argument("--lambda_reg", type=float, default=0.1,
+                        help="Group lasso λ (default: read from checkpoint)")
+    parser.add_argument("--weight_decay", type=float, default=1e-5,
+                        help="AdamW weight decay (default: read from checkpoint)")
+    parser.add_argument("--variance_mode", type=str, default="ledoit_wolf",
+                        choices=["ledoit_wolf", "marquardt"],
+                        help="Variance estimation mode (default: ledoit_wolf)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -503,13 +879,6 @@ if __name__ == "__main__":
     print(f"  D diag = {D.diag().tolist()}")
     print(f"  β = {model.decoder.beta_neural.detach().cpu().tolist()}")
 
-    if model.decoder.skip_gate_logit is not None:
-        gates = torch.sigmoid(model.decoder.skip_gate_logit).detach().cpu()
-        names = time_varying_features + static_features
-        print(f"  Skip gates:")
-        for g, name in enumerate(names):
-            print(f"    {name:>8s}: {gates[g]:.4f}")
-
     # ── HLME predictions ────────────────────────────────────────────────
     hlme_train_fit = None
     hlme_train_pred = None
@@ -557,8 +926,8 @@ if __name__ == "__main__":
 
     # Population-averaged
     df_fit_train = predict_fit_mode(model, train_loader, device)
-    df_fit_test = predict_fit_mode(model, train_loader, device)
-    df_pred_train = predict_forecast_mode(model, test_loader, device)
+    df_fit_test = predict_fit_mode(model, test_loader, device)
+    df_pred_train = predict_forecast_mode(model, train_loader, device)
     df_pred_test = predict_forecast_mode(model, test_loader, device)
     df_pop_test = population_averaged_predictions(df_fit_test)
     df_pop_train = population_averaged_predictions(df_fit_train)
@@ -585,10 +954,82 @@ if __name__ == "__main__":
             df_fc.to_csv(csv_path, index=False)
 
     # ================================================================
-    # 4. PLOTS
+    # 4. CONFIDENCE INTERVALS (optional)
+    # ================================================================
+    ci_ode = None
+    if args.compute_ci:
+        print(f"\n{'='*60}")
+        print(f"4. CONFIDENCE INTERVALS (method={args.ci_method})")
+        print(f"{'='*60}")
+
+        # Read regularisation from checkpoint if not overridden
+        lam_reg = (args.lambda_reg if args.lambda_reg is not None
+                   else ckpt_cfg.get('lambda_reg', 0.0))
+        lam_wd = (args.weight_decay if args.weight_decay is not None
+                  else ckpt_cfg.get('lambda_wd', 0.0))
+        print(f"  λ_reg = {lam_reg},  λ_wd = {lam_wd}")
+
+        fisher_cache_path = (args.fisher_cache or
+                             os.path.join(args.output_dir,
+                                          f"fisher_inv_pred_{args.variance_mode}.npy"))
+
+        # Step 1: Fisher inverse (from TRAINING data — Var(θ̂))
+        fisher_inv = compute_fisher_for_ci(
+            model, full_dataset, collate_real, device,
+            lambda_reg=lam_reg, weight_decay=lam_wd,
+            variance_mode=args.variance_mode,
+            fisher_cache=fisher_cache_path,
+            verbose=True,
+        )
+
+        # Step 2a: Delta method
+        if args.ci_method in ("delta", "both"):
+            print(f"\n  ── Delta method CI ──")
+            print(f"  Computing gradients on test data (N={len(test_dataset)}) ...")
+            delta_ci = delta_method_prediction_ci(
+                model, test_dataset, collate_real, device,
+                fisher_inv=fisher_inv,
+                visit_times=EXPECTED_TIMES.tolist(),
+                verbose=True,
+            )
+            ci_df = pd.DataFrame(delta_ci)
+            ci_df.to_csv(os.path.join(args.output_dir, "delta_ci_ode.csv"),
+                         index=False)
+            ci_ode = delta_ci  # use delta for plotting by default
+
+        # Step 2b: Monte Carlo
+        if args.ci_method in ("mc", "both"):
+            print(f"\n  ── Monte Carlo CI (M={args.n_mc}) ──")
+            mc_ci = mc_population_ci(
+                model, test_loader, device,
+                fisher_inv=fisher_inv,
+                visit_times=EXPECTED_TIMES.tolist(),
+                n_mc=args.n_mc, seed=args.seed,
+                verbose=True,
+            )
+            mc_df = pd.DataFrame(mc_ci)
+            mc_df.to_csv(os.path.join(args.output_dir, "mc_ci_ode.csv"),
+                         index=False)
+            if args.ci_method == "mc":
+                ci_ode = mc_ci  # use MC for plotting
+
+        # Step 2c: Compare if both
+        if args.ci_method == "both":
+            print(f"\n  ── Comparison: Delta vs MC ──")
+            print(f"  {'Time':>6s}  {'Delta SE':>10s}  {'MC SE':>10s}  "
+                  f"{'Ratio':>8s}")
+            for i, t in enumerate(EXPECTED_TIMES.tolist()):
+                d_se = delta_ci["se_blup"][i]
+                m_se = mc_ci["se_blup"][i]
+                ratio = d_se / m_se if m_se > 0 else float('nan')
+                print(f"  {t:6.1f}  {d_se:10.4f}  {m_se:10.4f}  "
+                      f"{ratio:8.3f}")
+
+    # ================================================================
+    # 5. PLOTS
     # ================================================================
     print(f"\n{'='*60}")
-    print("4. PLOTS")
+    print("5. PLOTS")
     print(f"{'='*60}")
 
     plot_individual_predictions(
@@ -605,9 +1046,12 @@ if __name__ == "__main__":
     if hlme_val_fit is not None:
         hlme_pop = population_averaged_predictions(
             hlme_val_fit)
-
+    hlme_pop = pd.read_csv('results_3C/pop_ci_hlme_val.csv', delimiter=",")
+    print(hlme_pop)
+    print(ci_ode)
     plot_population_averaged(
         df_pop_test, hlme_pop=hlme_pop, mode="fit",
+        ci_dict=ci_ode,
         save_path=os.path.join(args.output_dir, "population_average.png"))
 
     print("\nDone.")

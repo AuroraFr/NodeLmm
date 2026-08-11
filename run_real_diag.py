@@ -214,9 +214,9 @@ def plot_latent_pdp(zt_dict, visit_times, covariate_name,
         if col == 0:
             ax.legend(fontsize=7, loc='best')
 
-    fig.suptitle(
-        f"Latent PDP — top {top_k} dimensions responding to "
-        f"{covariate_name}", fontsize=13, y=1.02)
+    # fig.suptitle(
+    #     f"Latent PDP — top {top_k} dimensions responding to "
+    #     f"{covariate_name}", fontsize=13, y=1.02)
     plt.tight_layout()
     if save_path:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -457,7 +457,7 @@ def main():
     parser.add_argument("--data", type=str,
                         default="3C_dataset/train_3C_data_1.csv")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/best_model_ode_real3C_practice_group_lasso_seed3000.pt")
+                        default="checkpoints/cv_final_model.pt")
     parser.add_argument("--covariate", type=str, default="BMI",
                         choices=list(COVARIATE_CONFIG.keys()))
     parser.add_argument("--q25", type=float, default=None)
@@ -592,7 +592,7 @@ def main():
             continue
         cum_vals, z_vals = [], []
         for name, cov_vals in profiles.items():
-            cum = np.trapz(cov_vals[:ell + 1], t[:ell + 1])
+            cum = np.trapezoid(cov_vals[:ell + 1], t[:ell + 1])
             cum_vals.append(cum)
             z_vals.append(zt_dict[name][:, ell, :].mean(axis=0))
 

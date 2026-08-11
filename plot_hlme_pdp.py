@@ -97,7 +97,7 @@ def plot_hlme_traj_pdp(csv_path, save_path, feat_name="covariate"):
 
     ax.set_xlabel('Time (years)', fontsize=13)
     ax.set_ylabel('E[IST]', fontsize=13)
-    ax.set_title(f'Trajectory-profile PDP of {feat_name} — HLME', fontsize=14)
+    # ax.set_title(f'Trajectory-profile PDP of {feat_name} — HLME', fontsize=14)
     ax.grid(True, alpha=0.3)
 
     add_profile_legend(ax, profiles_in_plot, PROFILE_COLOURS, PROFILE_LABELS,
@@ -197,7 +197,7 @@ def plot_hlme_delta_pdp(csv_path, save_path, feat_name="covariate",
     # fig.suptitle(f'Pairwise ΔPDP for {feat_name} (delta-method 95% CI) — HLME',
     #              fontsize=13, y=1.02)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.savefig(save_path, dpi=300, format='eps')
     plt.close()
     print(f"  → {save_path}")
 
@@ -230,14 +230,14 @@ def plot_hlme_all(data_dir="hlme_pdp_exports", out_dir="figures",
         if os.path.exists(traj_csv):
             plot_hlme_traj_pdp(
                 traj_csv,
-                save_path=os.path.join(out_dir, f"hlme_traj_pdp_{feat}.png"),
+                save_path=os.path.join(out_dir, f"hlme_traj_pdp_{feat}.eps"),
                 feat_name=feat,
             )
 
         if os.path.exists(delta_csv):
             plot_hlme_delta_pdp(
                 delta_csv,
-                save_path=os.path.join(out_dir, f"hlme_delta_pdp_{feat}.png"),
+                save_path=os.path.join(out_dir, f"hlme_delta_pdp_{feat}.eps"),
                 feat_name=feat,
                 wald_csv=wald_csv if os.path.exists(wald_csv) else None,
             )
@@ -246,7 +246,7 @@ def plot_hlme_all(data_dir="hlme_pdp_exports", out_dir="figures",
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot HLME PDP from R exports")
     parser.add_argument("--dir", type=str, default="results_3C/hlme_pdp_exports")
-    parser.add_argument("--out", type=str, default="figures")
+    parser.add_argument("--out", type=str, default="figure_eps")
     parser.add_argument("--feat", nargs="+", default=["BMI", "GLUC", "HDL"])
     args = parser.parse_args()
 

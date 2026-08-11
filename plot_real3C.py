@@ -1,89 +1,133 @@
 """
 Plot longitudinal trajectories of 20 randomly selected subjects from the 3C cohort.
-Panels: BMI, GLUC (glucose), PAS, PAD, HDL, ISA15.
-
+Top two rows (5 panels): time-varying exposures (blue).
+Bottom row (1 panel): cognitive outcome IST (red).
 Usage:
     python plot_3C_subjects.py --data path/to/3C_data.csv --n_subjects 20 --seed 42
-
-Adjust COLUMN NAMES below to match your dataset.
 """
-
 import argparse
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 
-# ── Column name mapping — adjust to match your CSV ───────────────────────────
-COL_ID    = "NUM_ID"          # subject identifier
-COL_TIME  = "time"        # visit time (years from baseline, or age, etc.)
+# ── Column name mapping ──────────────────────────────────────────────────────
+COL_ID   = "NUM_ID"
+COL_TIME = "time"
 COVARIATES = {
     "BMI":  "BMI",
     "PAS":  "PAS",
     "PAD":  "PAD",
     "GLUC": "GLUC",
     "HDL":  "HDL",
-    "IST": "ISA15",
+    "IST":  "ISA15",
 }
 
-# ── Plotting configuration ────────────────────────────────────────────────────
-PANEL_ORDER = ["BMI", "GLUC", "PAS", "PAD", "HDL", "IST"]
+# ── Panel layout: exposures first, then outcome ──────────────────────────────
+EXPOSURE_PANELS = ["BMI", "GLUC", "PAS", "PAD", "HDL"]
+OUTCOME_PANELS  = ["IST"]
+
 YLABELS = {
     "BMI":  "BMI (kg/m²)",
-    "GLUC": "Glucose (g/L)",
+    "GLUC": "Glucose (mmol/L)",
     "PAS":  "Systolic BP (mmHg)",
     "PAD":  "Diastolic BP (mmHg)",
-    "HDL":  "HDL (g/L)",
-    "IST": "IST",
+    "HDL":  "HDL (mmol/L)",
+    "IST":  "IST",
 }
-COLORS = plt.cm.tab20(np.linspace(0, 1, 20))
+
+COLOR_EXPOSURE = "#1f77b4"   # blue
+COLOR_OUTCOME  = "#d62728"   # red
 
 
 def load_data(path: str) -> pd.DataFrame:
-    """Load dataset — handles csv / tsv / parquet."""
     if path.endswith(".parquet"):
         return pd.read_parquet(path)
     sep = "\t" if path.endswith(".tsv") else ","
     return pd.read_csv(path, sep=sep)
 
 
-def plot_subjects(df: pd.DataFrame, ids: np.ndarray, seed: int):
-    """Create a 3×2 panel figure with individual trajectories."""
-    fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
-    axes = axes.ravel()
+def plot_subjects(df: pd.DataFrame, ids: np.ndarray):
+    """
+    3-row figure:
+      Row 1: BMI, GLUC          (exposures, blue)
+      Row 2: PAS, PAD, HDL      (exposures, blue)  — 3 columns
+      Row 3: IST                (outcome, red)      — centered single panel
+    """
+    fig = plt.figure(figsize=(18, 15))
 
-    for ax, var in zip(axes, PANEL_ORDER):
+    # Row 1: 2 panels
+    ax_bmi  = fig.add_subplot(3, 3, 1)
+    ax_gluc = fig.add_subplot(3, 3, 2)
+    # Row 2: 3 panels
+    ax_pas  = fig.add_subplot(3, 3, 4)
+    ax_pad  = fig.add_subplot(3, 3, 5)
+    ax_hdl  = fig.add_subplot(3, 3, 6)
+    # Row 3: centered outcome panel
+    ax_ist  = fig.add_subplot(3, 3, 8)  # middle of bottom row
+
+    panel_map = {
+        "BMI": ax_bmi, "GLUC": ax_gluc,
+        "PAS": ax_pas, "PAD": ax_pad, "HDL": ax_hdl,
+        "IST": ax_ist,
+    }
+
+    all_panels = EXPOSURE_PANELS + OUTCOME_PANELS
+    for var in all_panels:
+        ax = panel_map[var]
         col = COVARIATES[var]
-        for i, sid in enumerate(ids):
+        color = COLOR_OUTCOME if var in OUTCOME_PANELS else COLOR_EXPOSURE
+
+        for sid in ids:
             sub = df[df[COL_ID] == sid].sort_values(COL_TIME)
             t = sub[COL_TIME].values
             y = sub[col].values
-            # Drop NaN for this variable (sparse observation pattern)
             mask = ~np.isnan(y)
             if mask.sum() == 0:
                 continue
-            ax.plot(t[mask], y[mask], "-o", color=COLORS[i % 20],
-                    alpha=0.7, markersize=3, linewidth=1)
-        ax.set_ylabel(YLABELS.get(var, var), fontsize=11)
-        ax.set_title(var, fontsize=12, fontweight="bold")
+            ax.plot(t[mask], y[mask], "-o", color=color,
+                    alpha=0.35, markersize=4, linewidth=1.2)
+
+        ax.set_ylabel(YLABELS[var], fontsize=14)
+        ax.tick_params(labelsize=12)
         ax.grid(True, alpha=0.3)
 
-    for ax in axes[-2:]:
-        ax.set_xlabel("Time", fontsize=11)
+    # X-axis label only on bottom-row panels
+    for var in ["PAS", "PAD", "HDL", "IST"]:
+        panel_map[var].set_xlabel("Time since inclusion (years)", fontsize=14)
 
-    fig.suptitle(f"3C Cohort — {len(ids)} randomly selected subjects (seed={seed})",
-                 fontsize=14, fontweight="bold", y=0.98)
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    # Panel labels (a)–(f)
+    labels = list("abcdef")
+    for lab, var in zip(labels, ["BMI", "GLUC", "PAS", "PAD", "HDL", "IST"]):
+        ax = panel_map[var]
+        ax.set_title(f"({lab})", fontsize=15, fontweight="bold", loc="left")
+
+    plt.tight_layout()
+    # # Add caption-style text below the figure
+    # caption = (
+    #     "Fig. 3: Observed individual trajectories for a random subset of participants "
+    #     "in the 3C cohort. "
+    #     "Panels (a)–(e) (blue): time-varying exposures; "
+    #     "panel (f) (red): cognitive outcome. "
+    #     "BMI = body mass index (kg/m²); "
+    #     "PAS = systolic blood pressure (mmHg); "
+    #     "PAD = diastolic blood pressure (mmHg); "
+    #     "HDL = high-density lipoprotein cholesterol (mmol/L); "
+    #     "IST = Isaacs Set Test score. "
+    #     "Time is measured in years since cohort inclusion."
+    # )
+    # fig.text(0.5, -0.02, caption, ha="center", fontsize=9,
+    #          wrap=True,
+    #          bbox=dict(boxstyle="square,pad=0.3", fc="white", ec="none"))
+
     return fig
 
 
 def main():
     parser = argparse.ArgumentParser(description="Plot 3C subject trajectories")
-    parser.add_argument("--data", type=str, required=True,
-                        help="Path to 3C dataset (CSV/TSV/Parquet)")
+    parser.add_argument("--data", type=str, required=True)
     parser.add_argument("--n_subjects", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=str, default="3C_subject_trajectories.png")
+    parser.add_argument("--output", type=str, default="3C_subject_trajectories.eps")
     args = parser.parse_args()
 
     df = load_data(args.data)
@@ -92,20 +136,19 @@ def main():
         df["time"] = df.groupby(COL_ID)["SUIVI"].transform(
             lambda s: (s - s.min()).dt.total_seconds() / (365.25 * 24 * 3600)
         )
-    print(f"Loaded {len(df)} rows, {df[COL_ID].nunique()} unique subjects")
-    print(f"Columns: {list(df.columns)}")
 
-    # Select random subjects
+    print(f"Loaded {len(df)} rows, {df[COL_ID].nunique()} unique subjects")
+
     rng = np.random.default_rng(args.seed)
     all_ids = df[COL_ID].unique()
     selected = rng.choice(all_ids, size=min(args.n_subjects, len(all_ids)),
                           replace=False)
-    print(f"Selected {len(selected)} subjects: {selected[:5]}...")
+    print(f"Selected {len(selected)} subjects")
 
-    fig = plot_subjects(df, selected, args.seed)
-    fig.savefig(args.output, dpi=150, bbox_inches="tight")
+    fig = plot_subjects(df, selected)
+    fig.savefig(args.output, dpi=300, format='eps')
     print(f"Saved to {args.output}")
-    plt.show()
+    # plt.show()
 
 
 if __name__ == "__main__":

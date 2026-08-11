@@ -254,7 +254,7 @@ if __name__ == "__main__":
 
         plot_trajectory_profile_pdp_continuous(
             traj_results, eval_grid,
-            save_path=f"{args.prefix}_{feat_name}_traj_profile.png",
+            save_path=f"{args.prefix}_{feat_name}_traj_profile.eps",
             target_name=feat_name,
             visit_times=None,
         )
@@ -285,7 +285,7 @@ if __name__ == "__main__":
             # Profile PDP with CI bands
             plot_trajectory_profile_pdp_delta(
                 ci_results, eval_grid,
-                save_path=f"{args.prefix}_{feat_name}_traj_profile_delta.png",
+                save_path=f"{args.prefix}_{feat_name}_traj_profile_delta.eps",
                 target_name=feat_name,
                 visit_times=None,
                 n_subjects=n_subj,
@@ -306,7 +306,7 @@ if __name__ == "__main__":
             # All pairwise ΔPDP
             plot_all_pairwise_delta_pdp(
                 ci_results, eval_grid,
-                save_path=f"{args.prefix}_{feat_name}_delta_all_pairs.png",
+                save_path=f"{args.prefix}_{feat_name}_delta_all_pairs.eps",
                 target_name=feat_name,
                 visit_times=None,
                 n_subjects=n_subj,

@@ -160,7 +160,7 @@ if __name__ == "__main__":
 
         # ── Optimiser ───────────────────────────────────────────────────────
         nn_weights, var_params, fe_params = [], [], []
-        gl_param_set = {id(model.rho_net.net[0].weight)}
+        gl_param_set = {id(model.decoder.rho_net.net[0].weight)}
 
         for n, p in model.named_parameters():
             if id(p) in gl_param_set:
@@ -172,7 +172,7 @@ if __name__ == "__main__":
             else:
                 nn_weights.append(p)
 
-        gl_params = [model.rho_net.net[0].weight]
+        gl_params = [model.decoder.rho_net.net[0].weight]
 
         optimizer = torch.optim.AdamW([
             {'params': nn_weights, 'weight_decay': WD},
@@ -184,7 +184,7 @@ if __name__ == "__main__":
         # ---- Optimizer ----
         # optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=50, verbose=True
+            optimizer, mode='min', factor=0.5, patience=50
         )
 
         # ---- Checkpoint dir ----

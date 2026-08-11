@@ -674,7 +674,7 @@ def plot_trajectory_profile_pdp_continuous(
 
     ax.set_xlabel('Time (years)')
     ax.set_ylabel('E[IST]')
-    ax.set_title(f'Trajectory-profile PDP of {target_name}')
+    # ax.set_title(f'Trajectory-profile PDP of {target_name}')
     # ax.legend(loc='best', fontsize=9, framealpha=0.9)
     from profile_legend import add_profile_legend
     profiles_in_plot = [p for p in PROFILE_ORDER if p in results]
@@ -683,13 +683,13 @@ def plot_trajectory_profile_pdp_continuous(
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=150, format='eps')
     print(f"  → {save_path}")
     plt.close()
 
 
 # ═════════════════════════════════════════════════════════════════════
-#  Plotting — trajectory-profile PDP (delta-method CI)       [NEW]
+#  Plotting — trajectory-profile PDP (delta-method CI)
 # ═════════════════════════════════════════════════════════════════════
 
 def plot_trajectory_profile_pdp_delta(
@@ -733,12 +733,12 @@ def plot_trajectory_profile_pdp_delta(
     subtitle = 'delta-method 95% CI'
     if n_subjects is not None:
         subtitle += f', N={n_subjects}'
-    ax.set_title(f'Trajectory-profile PDP of {target_name}\n({subtitle})')
+    # ax.set_title(f'Trajectory-profile PDP of {target_name}\n({subtitle})')
     ax.legend(loc='best', fontsize=9, framealpha=0.9)
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=300, format='eps')
     print(f"  → {save_path}")
     plt.close()
 
@@ -903,7 +903,7 @@ def plot_delta_profile_pdp_delta(
 
 def plot_all_pairwise_delta_pdp(
     ci_results, eval_grid,
-    save_path="delta_all_pairs.png",
+    save_path="delta_all_pairs.eps",
     target_name="covariate", visit_times=None,
     n_subjects=None, fisher_inv=None,
 ):
@@ -945,6 +945,9 @@ def plot_all_pairwise_delta_pdp(
         axes = [axes]
 
     pair_colors = ['#37474F', '#1B5E20', '#4A148C', "#C62828", "#E64A19", "#F57C00"]
+    pair_fill_colors = [
+    '#B0BEC5', '#C8E6C9', '#E1BEE7',
+    '#FFCDD2']
 
     # First pass: compute all CIs to find global y range
     all_ci_lo = []
@@ -984,9 +987,10 @@ def plot_all_pairwise_delta_pdp(
         ax = axes[idx]
         delta_mean, delta_se, ci_lo, ci_hi = all_data[idx]
         color = pair_colors[idx % len(pair_colors)]
+        fill  = pair_fill_colors[idx % len(pair_fill_colors)]
 
         ax.plot(eval_grid, delta_mean, '-', color=color, linewidth=2)
-        ax.fill_between(eval_grid, ci_lo, ci_hi, color=color, alpha=0.15)
+        ax.fill_between(eval_grid, ci_lo, ci_hi, color=fill, alpha=0.4)
         ax.axhline(0, color='#B71C1C', linestyle='--', linewidth=1, alpha=0.7)
 
         # n_sig = 0
@@ -1016,6 +1020,6 @@ def plot_all_pairwise_delta_pdp(
     # fig.suptitle(f'Pairwise ΔPDP for {target_name} (delta-method 95% CI)',
     #              fontsize=12, y=1.02)
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=300, format='eps')
     print(f"  → {save_path}")
     plt.close()
