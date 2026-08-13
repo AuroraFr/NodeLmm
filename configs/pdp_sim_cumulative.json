@@ -1,0 +1,35 @@
+{
+  "name": "sim_cumulative",
+  "setting": "simulation",
+  "checkpoint": "checkpoints/simulation_cumulative/best_model_ode_*.pt",
+  "target_feature": "BMI_t",
+  "v_lo": 20.0,
+  "v_hi": 35.0,
+  "ci_grid": [
+    2.0,
+    4.0,
+    8.0,
+    10.0
+  ],
+  "plot_t_max": 14.0,
+  "plot_n_points": 15,
+  "profile_set": "lohi",
+  "pairs": [
+    [
+      "stable_high",
+      "stable_low"
+    ]
+  ],
+  "mask_type": "binary",
+  "variance_mode": "fisher",
+  "n_hessian_subsample": null,
+  "fisher_max_subjects": null,
+  "active_threshold": 0.0001,
+  "oracle": {
+    "kind": "linear_effect",
+    "beta": 1.0
+  },
+  "output_dir": "pdp_out/sim_S5",
+  "make_plots": false,
+  "verbose": true
+}

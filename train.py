@@ -1,7 +1,7 @@
 """
 Run:
-    python train_ODE.py --config my_dataset.json
-    python train_ODE.py --config config_real.yaml          # YAML needs pyyaml
+    python train_ODE.py --config configs/my_dataset.json
+    python train_ODE.py --config configs/config_basic.json          # YAML needs pyyaml
 
 Config-driven model flags (see the model docstring for what they do):
     include_mask, use_dynamic_in_ode, encode_baseline_cov, reg_mode, ...
