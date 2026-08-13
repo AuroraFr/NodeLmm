@@ -187,7 +187,6 @@ class Decoder(nn.Module):
                  include_mask=True,
                  reg_mode=None,
                  use_rho_norm=True,
-                 skip_gate_init=2.0,
                  beta_init_scale=0.01):
         super().__init__()
         self.p, self.q = p, q
@@ -238,13 +237,6 @@ class Decoder(nn.Module):
         for j in range(n_static_skip):
             self._group_col_indices.append([col_offset + j])
 
-        # Column → group map for skip_gate (autograd-safe, no in-place)
-        col_to_group = torch.zeros(max(self.skip_dim, 1), dtype=torch.long)
-        for g, cols in enumerate(self._group_col_indices):
-            for c in cols:
-                col_to_group[c] = g
-        self.register_buffer('_gate_col_to_group', col_to_group)
-
         # ── Neural fixed effects ────────────────────────────────────────
         self.use_rho_net = use_rho_net
         if use_rho_net:
@@ -258,13 +250,6 @@ class Decoder(nn.Module):
             self.w_neural = nn.Parameter(
                 0.01 * torch.randn(latent_dim + self.skip_dim))
             self.beta_neural = None
-
-        # ── Skip gate (one gate per group) ──────────────────────────────
-        if reg_mode == "skip_gate" and self.n_groups > 0:
-            self.skip_gate_logit = nn.Parameter(
-                skip_gate_init * torch.ones(self.n_groups))
-        else:
-            self.skip_gate_logit = None
 
         # ── Random effects ──────────────────────────────────────────────
         # Two options: neural RE (g_net) or intercept-only.
@@ -320,23 +305,10 @@ class Decoder(nn.Module):
             return torch.cat(parts, dim=-1)
         return None
 
-    def _apply_gate(self, skip_input):
-        """Per-group sigmoid gate, broadcast over columns (autograd-safe)."""
-        if self.skip_gate_logit is None or skip_input is None:
-            return skip_input
-        gate_per_group = torch.sigmoid(self.skip_gate_logit)      # (n_groups,)
-        gate_expanded = gate_per_group[self._gate_col_to_group]   # (skip_dim,)
-        return skip_input * gate_expanded
-
     def _compute_reg(self):
         """Data-independent regularisation term (+ diagnostics)."""
         reg_dict = {}
-        if self.reg_mode == "skip_gate" and self.skip_gate_logit is not None:
-            gate = torch.sigmoid(self.skip_gate_logit)
-            reg_dict["reg_term"] = gate.sum()
-            reg_dict["gate_values"] = gate.detach()
-
-        elif self.reg_mode == "group_lasso" and self.use_rho_net \
+        if self.reg_mode == "group_lasso" and self.use_rho_net \
                 and self.n_groups > 0:
             W = self.rho_net.net[0].weight                        # (h_out, h_in)
             offset = self.latent_dim
@@ -366,8 +338,6 @@ class Decoder(nn.Module):
         device, dtype = z_t.device, z_t.dtype
 
         skip_input = self._build_skip_input(x_interp, mask, static, N, T)
-        if self.reg_mode == "skip_gate":
-            skip_input = self._apply_gate(skip_input)
 
         # Fixed effects
         rho_input = torch.cat([z_t, skip_input], dim=-1) \
@@ -507,7 +477,6 @@ class NeuralODEModel(nn.Module):
             include_mask=include_mask,
             reg_mode=reg_mode,
             use_rho_norm=cfg.use_rho_norm,
-            skip_gate_init=cfg.skip_gate_init,
             beta_init_scale=cfg.beta_init_scale,
         )
 
