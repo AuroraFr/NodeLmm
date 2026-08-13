@@ -676,11 +676,11 @@ def plot_trajectory_profile_pdp_continuous(
     ax.set_ylabel('E[IST]')
     # ax.set_title(f'Trajectory-profile PDP of {target_name}')
     # ax.legend(loc='best', fontsize=9, framealpha=0.9)
-    from profile_legend import add_profile_legend
+    from diags.profile_legend import add_profile_legend
     profiles_in_plot = [p for p in PROFILE_ORDER if p in results]
     add_profile_legend(ax, profiles_in_plot, PROFILE_COLOURS, PROFILE_LABELS,
                     loc='best')
-    ax.grid(True, alpha=0.3)
+    # ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, format='eps')
@@ -735,7 +735,7 @@ def plot_trajectory_profile_pdp_delta(
         subtitle += f', N={n_subjects}'
     # ax.set_title(f'Trajectory-profile PDP of {target_name}\n({subtitle})')
     ax.legend(loc='best', fontsize=9, framealpha=0.9)
-    ax.grid(True, alpha=0.3)
+    # ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, format='eps')
@@ -772,7 +772,7 @@ def plot_pdp_continuous(results, eval_grid, intervention_values,
     ax.set_ylabel('Predicted IST')
     ax.set_title(f'Marginal PDP of {target_name} on IST (continuous time)')
     ax.legend()
-    ax.grid(True, alpha=0.3)
+    # ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -801,7 +801,7 @@ def plot_delta_pdp_continuous(results, eval_grid, val_lo, val_hi,
     ax.set_xlabel('Time (years)')
     ax.set_ylabel(f'ΔPDP ({target_name} {val_lo} → {val_hi})')
     ax.set_title(f'ΔPDP of {target_name} on IST (continuous time, N={N})')
-    ax.grid(True, alpha=0.3)
+    # ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -893,7 +893,7 @@ def plot_delta_profile_pdp_delta(
 
     ax.set_title(f'ΔPDP: {label_a} vs {label_b}\n({", ".join(subtitle_parts)})')
     ax.legend(loc='best', fontsize=9, framealpha=0.9)
-    ax.grid(True, alpha=0.3)
+    # ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -1015,7 +1015,7 @@ def plot_all_pairwise_delta_pdp(
         label_b = PROFILE_LABELS.get(pb, pb)
         # sig_str = f'{n_sig}/{len(eval_grid)} sig.' if n_sig > 0 else 'n.s.'
         ax.set_title(f'{label_a}− {label_b}', fontsize=18)
-        ax.grid(True, alpha=0.3)
+        # ax.grid(True, alpha=0.3)
 
     # fig.suptitle(f'Pairwise ΔPDP for {target_name} (delta-method 95% CI)',
     #              fontsize=12, y=1.02)

@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 
-from profile_legend import add_profile_legend
+from diags.profile_legend import add_profile_legend
 
 # ── Same style as Neural ODE-LMM ────────────────────────────────────
 

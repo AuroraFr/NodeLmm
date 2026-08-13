@@ -727,10 +727,10 @@ def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
     ax.set_xlabel("Time since inclusion (years)", fontsize=12)
     ax.set_ylabel("IST", fontsize=12)
     ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
+    # ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.savefig(save_path, dpi=300, format='eps')
     plt.close()
     print(f"  → {save_path}")
 
@@ -934,24 +934,24 @@ if __name__ == "__main__":
     print(f"\n  Population-averaged (fit mode):")
     print(df_pop_test.to_string(index=False))
 
-    # ================================================================
-    # 3. FORECASTING MODE
-    # ================================================================
-    print(f"\n{'='*60}")
-    print("3. FORECASTING MODE")
-    print(f"{'='*60}")
+    # # ================================================================
+    # # 3. FORECASTING MODE
+    # # ================================================================
+    # print(f"\n{'='*60}")
+    # print("3. FORECASTING MODE")
+    # print(f"{'='*60}")
 
-    for name, loader in [("train", train_loader), ("test", test_loader)]:
-        df_fc = predict_forecast_mode(model, loader, device)
-        if len(df_fc) > 0:
-            mse_pop = compute_mse(df_fc, y_col="y_true", pred_col="mu_pop")
-            mse_pred = compute_mse(df_fc, y_col="y_true", pred_col="y_blup")
-            print(f"  {name:6s}: MSE(pop) = {mse_pop:.4f}, "
-                  f"MSE(pred) = {mse_pred:.4f}, n = {len(df_fc)}")
+    # for name, loader in [("train", train_loader), ("test", test_loader)]:
+    #     df_fc = predict_forecast_mode(model, loader, device)
+    #     if len(df_fc) > 0:
+    #         mse_pop = compute_mse(df_fc, y_col="y_true", pred_col="mu_pop")
+    #         mse_pred = compute_mse(df_fc, y_col="y_true", pred_col="y_blup")
+    #         print(f"  {name:6s}: MSE(pop) = {mse_pop:.4f}, "
+    #               f"MSE(pred) = {mse_pred:.4f}, n = {len(df_fc)}")
 
-            csv_path = os.path.join(args.output_dir,
-                                    f"forecast_{name.lower()}.csv")
-            df_fc.to_csv(csv_path, index=False)
+    #         csv_path = os.path.join(args.output_dir,
+    #                                 f"forecast_{name.lower()}.csv")
+    #         df_fc.to_csv(csv_path, index=False)
 
     # ================================================================
     # 4. CONFIDENCE INTERVALS (optional)
@@ -1047,11 +1047,9 @@ if __name__ == "__main__":
         hlme_pop = population_averaged_predictions(
             hlme_val_fit)
     hlme_pop = pd.read_csv('results_3C/pop_ci_hlme_val.csv', delimiter=",")
-    print(hlme_pop)
-    print(ci_ode)
     plot_population_averaged(
         df_pop_test, hlme_pop=hlme_pop, mode="fit",
         ci_dict=ci_ode,
-        save_path=os.path.join(args.output_dir, "population_average.png"))
+        save_path=os.path.join(args.output_dir, "population_average.eps"))
 
     print("\nDone.")

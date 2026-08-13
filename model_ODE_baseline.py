@@ -4,16 +4,14 @@ Neural ODE-LMM with BMI Skip Connection.
 Architecture:
   - Encoder:  z(0) = Enc(t0, static)   [default]
               z(0) = learned parameter  [use_learned_z0=True, for S1]
-  - Dynamics: dz/dt = f(z, t, static, BMI(t))          ← Neural ODE
+  - Dynamics: dz/dt = f(z, t, BMI(t))          ← Neural ODE
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural 
   - RE:       Z = g(z(t))
 
 Regularisation modes for skip connections:
   - None:          standard single rho network, no penalty.
-  - "skip_gate":   learnable sigmoid gate on skip inputs.
-                   Penalty: λ · Σ sigmoid(α_k)  (data-independent, smooth).
   - "group_lasso": group lasso on first-layer weights connecting to skip inputs.
-                   Penalty: λ · Σ_k ||W_skip_k||_F  (data-independent, smooth when >0).
+                   Penalty: λ · Σ_k ||W_skip_k||_F.
 """
 from __future__ import annotations
 from dataclasses import dataclass

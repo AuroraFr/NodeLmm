@@ -89,7 +89,7 @@ def plot_subjects(df: pd.DataFrame, ids: np.ndarray):
 
         ax.set_ylabel(YLABELS[var], fontsize=14)
         ax.tick_params(labelsize=12)
-        ax.grid(True, alpha=0.3)
+        # ax.grid(True, alpha=0.3)
 
     # X-axis label only on bottom-row panels
     for var in ["PAS", "PAD", "HDL", "IST"]:

@@ -5,7 +5,7 @@ Architecture:
   - Encoder:  z(0) = Enc(t0, BMI0, static)
   - Dynamics: dz/dt = f(z, t, static)          ← Neural ODE
   - Decoder:  mu(t) = rho(z(t), BMI_std(t)) @ beta_neural  ← BMI skip connection
-  - RE:       Z = [1, rs1(t), rs2(t)] or g(z(t))          (classical spline basis/neural network)
+  - RE:       Z = g(z(t))          (classical spline basis/neural network)
 
 This guarantees PDP separation at all times.
 
@@ -32,7 +32,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Neural ODE-LMM training")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/simulation_baseline_noreg_seed42_rhonorm_diagoD")
+                        default="checkpoints/simulation_baseline")
     parser.add_argument("--data", type=str,
                         default="simu_datasets/S2a_sims")
     args = parser.parse_args()
@@ -57,7 +57,7 @@ if __name__ == "__main__":
     x_cols = ["BMI_t"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
-    for i in range(20, 21):
+    for i in range(0, 100):
         path = args.data + f"/sim_{i+1:03d}.rds"
         df = next(iter(pyreadr.read_r(path).values()))
         df["SEX"] = df["SEX"].astype("category")
