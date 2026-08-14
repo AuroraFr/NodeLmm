@@ -192,28 +192,46 @@ def load_training_dataset(tc: dict, sim_index: Optional[int] = None):
 # ══════════════════════════════════════════════════════════════════════════
 # Oracle (true ΔPDP) for simulation validation
 # ══════════════════════════════════════════════════════════════════════════
-
-def build_oracle(spec: dict, v_lo, v_hi):
-    """Return a callable(t) -> true ΔPDP, or None.
-
-    Supported kinds:
-      {"kind": "none"}                     -> None
-      {"kind": "constant", "value": x}     -> lambda t: x
-      {"kind": "linear_effect", "beta": b} -> lambda t: b * (v_hi - v_lo)
-                                              (contemporaneous linear LMM)
-    Extend here for other data-generating processes.
+ 
+def _mean_agec(dataset, agec_static_col):
+    """Mean of AGEc over the evaluation sample (the term `a` in the oracle).
+    AGEc is a static covariate; static[:, agec_static_col] is per subject."""
+    vals = []
+    for i in range(len(dataset)):
+        static = dataset[i][4]                      # (Ks,)  s_i
+        vals.append(float(static[agec_static_col]))
+    return float(np.mean(vals))
+ 
+ 
+def build_oracle(spec: dict, v_lo, v_hi, dataset):
+    """Return a callable(t) -> true ΔPDP for a constant-BMI contrast
+    (v_hi vs v_lo), marginalised over the evaluation sample's AGEc.
+ 
+    Δv = v_hi - v_lo,  a = mean(AGEc) over `dataset`.
+ 
+    kinds (DGP coefficients supplied in the config):
+      {"kind": "linear",     "beta_bmi": .., "beta_int": .., "agec_col": j}
+          contemporaneous LMM with a BMI×AGEc interaction:
+            ΔPDP(t) = Δv · (β_BMI + a·β_int)          [constant in t]
+      {"kind": "cumulative", "beta_bmi": .., "beta_int": .., "alpha": ..,
+                             "agec_col": j}
+          adds α ∫₀ᵗ BMI dτ; under constant v this is α·v·t, so
+            ΔPDP(t) = Δv · (β_BMI + a·β_int + α·t)     [linear in t]
     """
-    kind = spec.get("kind", "none")
-    if kind == "none":
-        return None
-    if kind == "constant":
-        val = float(spec["value"])
+    kind = spec["kind"]
+    dv = v_hi - v_lo
+    beta_bmi = float(spec["beta_bmi"])
+    beta_int = float(spec["beta_int"])
+    a = _mean_agec(dataset, int(spec["agec_col"]))
+    base = beta_bmi + a * beta_int
+ 
+    if kind == "linear":
+        val = dv * base
         return lambda t: val
-    if kind == "linear_effect":
-        beta = float(spec["beta"])
-        delta = beta * (v_hi - v_lo)
-        return lambda t: delta
-    raise ValueError(f"Unknown oracle kind: {kind!r}")
+    if kind == "cumulative":
+        alpha = float(spec["alpha"])
+        return lambda t: dv * (base + alpha * float(t))
+    raise ValueError(f"Unknown oracle kind: {kind!r} (linear | cumulative)")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -255,7 +273,7 @@ def run_real(cfg: PDPConfig, device):
                         collate_fn=collate_xaug)
     ci_grid = np.asarray(cfg.ci_grid, dtype=float)
 
-    # PDP means on a fine grid (for smooth plots)
+    # PDP on a fine grid (for smooth plots)
     plot_grid = PDP.make_eval_grid(cfg.plot_t_max, cfg.plot_n_points)
     plot_profiles = PDP.make_profiles(plot_grid, cfg.v_lo, cfg.v_hi)
     PDP.compute_pdp_by_profile(
@@ -289,7 +307,7 @@ def run_real(cfg: PDPConfig, device):
     np.savez(os.path.join(cfg.output_dir, f"{cfg.name}_results.npz"),
              ci_grid=ci_grid,
              **{k: v for k, v in _flatten_ci(ci_results).items()})
-    print(f"  ✓ real ΔPDP done → {cfg.output_dir}")
+    print(f"  real ΔPDP done: {cfg.output_dir}")
     return ci_results
 
 
@@ -325,7 +343,6 @@ def run_simulation(cfg: PDPConfig, device):
         raise FileNotFoundError(f"No checkpoints match {cfg.checkpoint!r}")
     ci_grid = np.asarray(cfg.ci_grid, dtype=float)
     L = len(ci_grid)
-    oracle = build_oracle(cfg.oracle, cfg.v_lo, cfg.v_hi)
     pair = ("hi", "lo")
     pair_key = "_delta_hi_vs_lo"
 
@@ -341,7 +358,7 @@ def run_simulation(cfg: PDPConfig, device):
         dataset = load_training_dataset(tc, sim_index=sim_index)
         loader = DataLoader(dataset, batch_size=64, shuffle=False,
                             collate_fn=collate_xaug)
-
+        oracle = build_oracle(cfg.oracle, cfg.v_lo, cfg.v_hi, dataset)
         profiles = {"lo": [cfg.v_lo] * L, "hi": [cfg.v_hi] * L}
         true_fns = {pair: oracle} if oracle is not None else None
 
@@ -366,8 +383,8 @@ def run_simulation(cfg: PDPConfig, device):
                                              "var_mc", "mean_var_est",
                                              "coverage95")])
                 for t in ci_grid if float(t) in summary})
-    print(f"\n  ✓ simulation validation done ({len(ckpts)} replicates) "
-          f"→ {cfg.output_dir}")
+    print(f"\n  simulation validation done ({len(ckpts)} replicates) "
+          f" {cfg.output_dir}")
     return summary
 
 

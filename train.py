@@ -3,13 +3,6 @@ Run:
     python train_ODE.py --config configs/my_dataset.json
     python train_ODE.py --config configs/config_basic.json          # YAML needs pyyaml
 
-Config-driven model flags (see the model docstring for what they do):
-    include_mask, use_dynamic_in_ode, encode_baseline_cov, reg_mode, ...
-
-All sources deliver the SAME batch format — the unified 5-tuple
-(pids, x_aug, y, obs_mask, static) with x_aug = [time(1), x(K), mask(K)] —
-so a single adapter feeds the training core.
-
 Data sources (config field `data_kind`):
     "rds_sim"  : .rds replicate files → XAugDataset.from_long_df,
                  subject-level split done internally with `split_seed`. The
@@ -19,17 +12,15 @@ Data sources (config field `data_kind`):
                  sim_start..sim_end.
     "csv_real" : pre-split CSVs → process_data → XAugDataset.from_processed;
                  x_aug already carries [time, x(K), mask(K)]. collate_xaug
-                 pads nothing (fixed grid). The trainer loops over `seeds`.
-
-Whether the model *uses* the mask block is the separate `include_mask` flag:
-sims default to include_mask=False (block present but unread), real to True.
+                 pads nothing (fixed grid).
 
 To add a new data source, write a prepare_*() that returns a Bundle whose
 loaders emit the unified 5-tuple (use collate_xaug); the core is unchanged.
 
 Example configs for the three original setups are provided as
-config_basic.json / config_cumulative.json / config_real.json — copy one
-and edit it for your dataset. Regenerate them with:  python make_configs.py
+configs/config_basic.json or configs/config_cumulative.json / config_real.json — copy one
+and edit it for your dataset. 
+Regenerate them with:  python make_configs.py
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, fields, asdict
@@ -41,7 +32,7 @@ import warnings
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import DataLoader, Subset
 
 from model import NeuralODEModel, NeuralODEConfig
 from Dataset import XAugDataset, collate_xaug
@@ -152,7 +143,7 @@ def load_config(path: str) -> TrainConfig:
 # ══════════════════════════════════════════════════════════════════════════
 
 def compute_cov_stats(dataset, train_idx, K):
-    """Per-channel mean/std from *observed* covariate values in the training
+    """Per-channel mean/std from observed covariate values in the training
     set. Reads x_aug = [time, x(K), mask(K)] and uses the covariate mask block,
     so it works for both sources: sims have an all-ones mask (all values used),
     real data uses only truly observed values."""
@@ -173,7 +164,7 @@ def compute_cov_stats(dataset, train_idx, K):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Data preparation → common bundle
+# Data preparation to get common bundle
 # ══════════════════════════════════════════════════════════════════════════
 
 class Bundle:
@@ -288,7 +279,7 @@ _REAL_KINDS = {"csv_real"}
 
 def build_model(cfg: TrainConfig, bundle: Bundle, device):
     skip_dims = (cfg.static_skip_dims if cfg.static_skip_dims is not None
-                 else list(range(bundle.Ks)))          # None ⇒ all statics
+                 else list(range(bundle.Ks)))
     model = NeuralODEModel(
         n_tv=bundle.K,
         static_dim=bundle.Ks,

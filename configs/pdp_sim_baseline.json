@@ -1,0 +1,37 @@
+{
+  "name": "sim_baseline",
+  "setting": "simulation",
+  "checkpoint": "checkpoints2/simulation_baseline/best_model_ode_*.pt",
+  "target_feature": "BMI_t",
+  "v_lo": 23.0,
+  "v_hi": 28.0,
+  "ci_grid": [
+    0.0,
+    4.0,
+    8.0,
+    10.0
+  ],
+  "plot_t_max": 12.0,
+  "plot_n_points": 15,
+  "profile_set": "lohi",
+  "pairs": [
+    [
+      "stable_high",
+      "stable_low"
+    ]
+  ],
+  "mask_type": "binary",
+  "variance_mode": "ledoit_wolf",
+  "n_hessian_subsample": null,
+  "fisher_max_subjects": null,
+  "active_threshold": 0.0001,
+  "oracle": {
+    "kind": "linear",
+    "beta_bmi": -0.3,
+    "beta_int": 0.05,
+    "agec_col": 1
+  },
+  "output_dir": "pdp_out/sim_baseline",
+  "make_plots": true,
+  "verbose": true
+}
