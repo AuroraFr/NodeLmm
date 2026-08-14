@@ -21,7 +21,7 @@
     ]
   ],
   "mask_type": "binary",
-  "variance_mode": "fisher",
+  "variance_mode": "ledoit_wolf",
   "n_hessian_subsample": null,
   "fisher_max_subjects": null,
   "active_threshold": 0.0001,
