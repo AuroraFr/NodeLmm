@@ -19,8 +19,8 @@ Standalone: it rebuilds the model from the checkpoint's embedded `train_config`
     - aggregate across replicates → Var_est vs Var_MC + 95% coverage table
 
 Run:
-    python pdp_run.py --config pdp_real.json
-    python pdp_run.py --config pdp_sim.json
+    python pdp_run.py --config configs/pdp_real.json
+    python pdp_run.py --config configs/pdp_sim.json
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, fields
@@ -34,7 +34,7 @@ import numpy as np
 import torch
 
 from model import NeuralODEModel, NeuralODEConfig
-from dataset import XAugDataset, collate_xaug
+from Dataset import XAugDataset, collate_xaug
 import PDP
 import DPDP_variance as DV
 
