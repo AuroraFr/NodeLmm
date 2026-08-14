@@ -194,12 +194,11 @@ def load_training_dataset(tc: dict, sim_index: Optional[int] = None):
 # ══════════════════════════════════════════════════════════════════════════
  
 def _mean_agec(dataset, agec_static_col):
-    print(dataset)
     """Mean of AGEc over the evaluation sample (the term `a` in the oracle).
     AGEc is a static covariate; static[:, agec_static_col] is per subject."""
     vals = []
     for i in range(len(dataset)):
-        static = dataset[i][4]                      # (Ks,)  s_i
+        static = dataset[i][4]      # (Ks,)  s_i
         vals.append(float(static[agec_static_col]))
     return float(np.mean(vals))
  
@@ -373,7 +372,6 @@ def run_simulation(cfg: PDPConfig, device):
             true_contrast_fns=true_fns,
             active_threshold=cfg.active_threshold, verbose=cfg.verbose)
         all_results.append(res)
-        break
 
     summary = DV.aggregate_simulations(all_results, ci_grid, pair_key=pair_key)
     _print_sim_summary(summary, ci_grid)
