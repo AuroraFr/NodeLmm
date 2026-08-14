@@ -433,12 +433,7 @@ def _log_epoch(model, cfg, epoch, avg_train, avg_test, best_test,
     print(f"      sigma2 = {sig2:.4f}")
     print(f"      D diag = {[round(v, 4) for v in D.diag().tolist()]}")
     print(f"      beta   = {[f'{v:.4f}' for v in beta.tolist()]}")
-    if cfg.reg_mode == "skip_gate" and "gate_values" in reg_dict:
-        gv = reg_dict["gate_values"]
-        print("      gates:")
-        for g, name in enumerate(feat_names[:len(gv)]):
-            print(f"        {name:>8s}: {gv[g]:.4f}")
-    elif cfg.reg_mode == "group_lasso" and "group_norms" in reg_dict:
+    if cfg.reg_mode == "group_lasso" and "group_norms" in reg_dict:
         gn = reg_dict["group_norms"]
         print("      group norms:")
         for g, name in enumerate(feat_names[:len(gn)]):
