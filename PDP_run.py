@@ -58,6 +58,14 @@ class PDPConfig:
 
     # ── evaluation grids ────────────────────────────────────────────────
     ci_grid: List[float] = field(default_factory=lambda: [2.0, 4.0, 8.0, 10.0])
+    grid_mode: str = "none"               # "none" | "anchor0" | "dense"
+                                          #  anchor0: cumulative — integrate on
+                                          #    sorted([0] ∪ ci_grid) (zero anchor
+                                          #    only; exact for constant ∫₀ᵗ v dτ).
+                                          #  dense:   baseline — integrate on a
+                                          #    fine mesh (spacing ≤ dense_step).
+    dense_step: Optional[float] = None    # spacing for grid_mode="dense"
+
     plot_t_max: float = 14.0              # fine grid for smooth PDP-mean plots
     plot_n_points: int = 15
 
