@@ -220,17 +220,17 @@ def build_oracle(spec: dict, v_lo, v_hi, dataset):
     """
     kind = spec["kind"]
     dv = v_hi - v_lo
-    beta_bmi = float(spec["beta_bmi"])
-    beta_int = float(spec["beta_int"])
+    
     a = _mean_agec(dataset, int(spec["agec_col"]))
-    base = beta_bmi + a * beta_int
- 
     if kind == "linear":
+        beta_bmi = float(spec["beta_bmi"])
+        beta_int = float(spec["beta_int"])
+        base = beta_bmi + a * beta_int
         val = dv * base
         return lambda t: val
     if kind == "cumulative":
         alpha = float(spec["alpha"])
-        return lambda t: dv * (base + alpha * float(t))
+        return lambda t: dv * alpha * float(t)
     raise ValueError(f"Unknown oracle kind: {kind!r} (linear | cumulative)")
 
 
@@ -276,7 +276,7 @@ def run_real(cfg: PDPConfig, device):
     # PDP on a fine grid (for smooth plots)
     plot_grid = PDP.make_eval_grid(cfg.plot_t_max, cfg.plot_n_points)
     plot_profiles = PDP.make_profiles(plot_grid, cfg.v_lo, cfg.v_hi)
-    PDP.compute_pdp_by_profile(
+    pdp_by_profile, _, _ = PDP.compute_pdp_by_profile(
         model, loader, device, plot_profiles, plot_grid,
         target_col=target_col, n_tv=n_tv, mask_type=cfg.mask_type,
         target_name=cfg.target_feature)
@@ -303,6 +303,12 @@ def run_real(cfg: PDPConfig, device):
             ci_results, ci_grid,
             save_path=os.path.join(cfg.output_dir, f"{cfg.name}_delta_pairs.eps"),
             target_name=cfg.target_feature, fisher_inv=fisher_inv)
+        
+        PDP.plot_trajectory_profile_pdp_continuous(
+            pdp_by_profile, plot_grid,
+            save_path=os.path.join(cfg.output_dir, f"{cfg.name}_profiles.eps"),
+            target_name=cfg.target_feature)
+
 
     np.savez(os.path.join(cfg.output_dir, f"{cfg.name}_results.npz"),
              ci_grid=ci_grid,

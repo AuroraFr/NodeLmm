@@ -27,7 +27,7 @@
     42
   ],
   "include_mask": false,
-  "use_dynamic_in_ode": false,
+  "use_dynamic_in_ode": true,
   "encode_baseline_cov": false,
   "use_neural_re": true,
   "g_hidden": 8,
@@ -49,7 +49,7 @@
     "euler_steps_per_interval": 4,
     "ode_solver": "rk4",
     "use_rho_norm": false,
-    "beta_init_scale": 0.01
+    "beta_init_scale": 0.1
   },
   "lr": 0.001,
   "wd": 1e-05,

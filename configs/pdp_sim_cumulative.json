@@ -1,7 +1,7 @@
 {
   "name": "sim_cumulative",
   "setting": "simulation",
-  "checkpoint": "checkpoints/simulation_cumulative/best_model_ode_*.pt",
+  "checkpoint": "checkpoints2/simulation_cumulative/best_model_ode_*.pt",
   "target_feature": "BMI_t",
   "v_lo": 23.0,
   "v_hi": 28.0,

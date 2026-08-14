@@ -33,9 +33,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from Preprocess_3C import process_data
-from model_ODE_real import NeuralODEModel, NeuralODEConfig
+from model import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
-from train_ODE_real import RealDataset, collate_real, compute_covariate_stats
+from train import compute_covariate_stats
+from Dataset import XAugDataset, collate_xaug
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -123,9 +124,9 @@ def prepare_datasets(
         mask_type=mask_type,
     )
     return (
-        RealDataset(process_data(df=df_train, **kwargs)),
-        RealDataset(process_data(df=df_val, **kwargs)),
-        RealDataset(process_data(df=df_test, **kwargs)),
+        XAugDataset(process_data(df=df_train, **kwargs)),
+        XAugDataset(process_data(df=df_val, **kwargs)),
+        XAugDataset(process_data(df=df_test, **kwargs)),
         {
             "n_tv": len(time_varying_features),
             "static_dim": len(static_features),
@@ -423,10 +424,10 @@ def grid_search(
 
     train_loader = DataLoader(
         train_dataset, batch_size=configs[0].batch_size,
-        shuffle=True, collate_fn=collate_real)
+        shuffle=True, collate_fn=collate_xaug)
     val_loader = DataLoader(
         val_dataset, batch_size=configs[0].batch_size,
-        shuffle=False, collate_fn=collate_real)
+        shuffle=False, collate_fn=collate_xaug)
 
     all_results = []
     best_val_nll = float("inf")
@@ -522,10 +523,10 @@ def evaluate_winner_on_test(
         print("Retraining winner from scratch...")
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.batch_size,
-            shuffle=True, collate_fn=collate_real)
+            shuffle=True, collate_fn=collate_xaug)
         val_loader = DataLoader(
             val_dataset, batch_size=cfg.batch_size,
-            shuffle=False, collate_fn=collate_real)
+            shuffle=False, collate_fn=collate_xaug)
         model, val_metrics = run_config(
             cfg, train_loader, val_loader,
             cov_means, cov_stds, info, device, verbose=True)
@@ -538,7 +539,7 @@ def evaluate_winner_on_test(
 
     test_loader = DataLoader(
         test_dataset, batch_size=cfg.batch_size,
-        shuffle=False, collate_fn=collate_real)
+        shuffle=False, collate_fn=collate_xaug)
     test_metrics = evaluate_loader(model, test_loader, device)
 
     print("\nVAL (from selection):")
@@ -690,7 +691,7 @@ if __name__ == "__main__":
     # ---- 5. Optional: LCVa diagnostic on the winner ----
     full_train_loader = DataLoader(
         train_ds, batch_size=final_cfg.batch_size,
-        shuffle=False, collate_fn=collate_real)
+        shuffle=False, collate_fn=collate_xaug)
     lcva = compute_lcva_empirical_fisher(
         model_final, full_train_loader, device=str(device))
     print(f"\nLCVa: {lcva}")

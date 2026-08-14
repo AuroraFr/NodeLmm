@@ -250,35 +250,49 @@ def compute_pdp_by_profile(
 
     return results, eval_grid, n_total
 
-def plot_pdp(results, eval_grid, intervention_values,
-                        save_path="pdp_continuous.png",
-                        target_name="covariate", visit_times=None):
-    """Plot constant-intervention PDP with warm/cold colormap."""
+# ═════════════════════════════════════════════════════════════════════
+#  Plotting — trajectory-profile PDP (cross-subject SE)
+# ═════════════════════════════════════════════════════════════════════
+def plot_profile_pdp(
+    results, eval_grid, save_path="traj_profile_pdp.png", visit_times=None,
+):
+    """
+    Plot trajectory-profile PDP (warm/cold scheme, cross-subject SE).
+    Single panel with all 6 profiles and full legend.
+    """
     fig, ax = plt.subplots(figsize=(10, 6))
-    colors = plt.cm.RdYlBu_r(np.linspace(0.15, 0.85, len(intervention_values)))
 
-    for v_idx, v in enumerate(intervention_values):
-        mu_all = results[v]
+    for pname in PROFILE_ORDER:
+        if pname not in results:
+            continue
+        mu_all = results[pname]
+        N = mu_all.shape[0]
         mean = mu_all.mean(axis=0)
-        se = mu_all.std(axis=0) / np.sqrt(mu_all.shape[0])
+        se = mu_all.std(axis=0) / np.sqrt(N)
 
-        ax.plot(eval_grid, mean, '-', color=colors[v_idx],
-                label=f'{target_name}={v:.1f}', linewidth=2)
-        ax.fill_between(eval_grid, mean - 1.96 * se, mean + 1.96 * se,
-                         color=colors[v_idx], alpha=0.1)
+        color = PROFILE_COLOURS.get(pname, "grey")
+        label = PROFILE_LABELS.get(pname, pname)
+
+        ax.plot(eval_grid, mean, '-', color=color, linewidth=1.8, label=label)
+        # ax.fill_between(eval_grid, mean - 1.96 * se, mean + 1.96 * se,
+        #                  color=color, alpha=0.12)
 
     if visit_times is not None:
         for vt in visit_times:
             ax.axvline(vt, color='grey', linestyle=':', alpha=0.3, linewidth=0.5)
 
     ax.set_xlabel('Time (years)')
-    ax.set_ylabel('Predicted IST')
-    ax.set_title(f'Marginal PDP of {target_name} on IST (continuous time)')
-    ax.legend()
+    ax.set_ylabel('E[IST]')
+    # ax.set_title(f'Trajectory-profile PDP of {target_name}')
+    # ax.legend(loc='best', fontsize=9, framealpha=0.9)
+    from utils import add_profile_legend
+    profiles_in_plot = [p for p in PROFILE_ORDER if p in results]
+    add_profile_legend(ax, profiles_in_plot, PROFILE_COLOURS, PROFILE_LABELS,
+                    loc='best')
     # ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=150, format='eps')
     print(f"  → {save_path}")
     plt.close()
 

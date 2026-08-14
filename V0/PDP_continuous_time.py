@@ -676,7 +676,7 @@ def plot_trajectory_profile_pdp_continuous(
     ax.set_ylabel('E[IST]')
     # ax.set_title(f'Trajectory-profile PDP of {target_name}')
     # ax.legend(loc='best', fontsize=9, framealpha=0.9)
-    from diags.profile_legend import add_profile_legend
+    from utils import add_profile_legend
     profiles_in_plot = [p for p in PROFILE_ORDER if p in results]
     add_profile_legend(ax, profiles_in_plot, PROFILE_COLOURS, PROFILE_LABELS,
                     loc='best')

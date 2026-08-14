@@ -11,6 +11,6 @@ results_3C/
 *.pt
 *.err
 *.out
-diagnostics/
+diagnostics_results/
 figure_eps/
 logs/
