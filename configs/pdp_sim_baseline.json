@@ -28,7 +28,7 @@
   "oracle": {
     "kind": "linear",
     "beta_bmi": -0.3,
-    "beta_int": 0.05,
+    "beta_int": -0.05,
     "agec_col": 1
   },
   "output_dir": "pdp_out/sim_baseline",

@@ -1,7 +1,7 @@
 """
 Run:
-    python train_ODE.py --config configs/my_dataset.json
-    python train_ODE.py --config configs/config_basic.json          # YAML needs pyyaml
+    python train.py --config configs/my_dataset.json
+    python train.py --config configs/config_basic.json          # YAML needs pyyaml
 
 Data sources (config field `data_kind`):
     "rds_sim"  : .rds replicate files → XAugDataset.from_long_df,
