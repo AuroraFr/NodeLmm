@@ -1,71 +1,42 @@
 {
-  "name": "real",
-  "data_kind": "csv_real",
-  "time_varying_features": [
-    "BMI",
-    "PAS",
-    "PAD",
-    "GLUC",
-    "HDL"
+  "name": "real3C",
+  "setting": "real",
+  "checkpoint": "checkpoints/best_model_ode_real3C_lambda0.1group_lasso_seed3000.pt",
+  "target_feature": "BMI",
+  "v_lo": 24.0,
+  "v_hi": 30.0,
+  "ci_grid": [
+    2.0,
+    4.0,
+    8.0,
+    10.0
   ],
-  "static_features": [
-    "SEX_code",
-    "AGEc",
-    "DIPNIV_2",
-    "DIPNIV_3"
+  "plot_t_max": 14.0,
+  "plot_n_points": 15,
+  "profile_set": "named",
+  "pairs": [
+    [
+      "stable_high",
+      "stable_low"
+    ],
+    [
+      "late_decline",
+      "late_spike"
+    ],
+    [
+      "gradual_decline",
+      "gradual_rise"
+    ]
   ],
-  "target_col": "ISA15",
-  "id_col": "NUM_ID",
-  "time_col": "time",
-  "data_dir": "",
-  "sim_start": 0,
-  "sim_end": 0,
-  "split_seed": 42,
-  "test_ratio": 0.2,
-  "train_csv": "3C_dataset/train_3C_data_1.csv",
-  "val_csv": "3C_dataset/val_3C_data_1.csv",
-  "all_csv": "3C_dataset/data_3C.csv",
-  "interp_method": "linear",
   "mask_type": "binary",
-  "seeds": [
-    3000,
-    4000,
-    5000
-  ],
-  "include_mask": true,
-  "use_dynamic_in_ode": true,
-  "encode_baseline_cov": true,
-  "use_neural_re": true,
-  "g_hidden": 8,
-  "fullD": false,
-  "use_rho_net": true,
-  "use_dynamic_skip": true,
-  "static_skip_dims": null,
-  "reg_mode": "group_lasso",
-  "lambda_reg": 0.1,
-  "cfg": {
-    "hidden_channels": 8,
-    "enc_mlp_hidden": 16,
-    "func_mlp_hidden": 16,
-    "dec_rho_hidden": 8,
-    "dec_p": 4,
-    "dec_q": 3,
-    "depth": 2,
-    "dropout": 0.0,
-    "euler_steps_per_interval": 4,
-    "ode_solver": "rk4",
-    "use_rho_norm": true,
-    "skip_gate_init": 2.0,
-    "beta_init_scale": 0.01
+  "variance_mode": "marquardt",
+  "n_hessian_subsample": null,
+  "fisher_max_subjects": null,
+  "active_threshold": 0.0001,
+  "oracle": {
+    "kind": "none"
   },
-  "lr": 0.001,
-  "wd": 1e-05,
-  "epochs": 1000,
-  "batch_size": 128,
-  "print_every": 25,
-  "patience_init": 150,
-  "patience_reset": 150,
-  "sched_patience": 150,
-  "ckpt_dir": "checkpoints",
-  "ckpt_template": "best_model_ode_real3C_lambda{lam}{reg}_seed{tag}.pt"
+  "output_dir": "pdp_out/real3C",
+  "make_plots": true,
+  "verbose": true
 }
