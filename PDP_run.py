@@ -316,6 +316,32 @@ def run_real(cfg: PDPConfig, device):
     print(f"  real ΔPDP done: {cfg.output_dir}")
     return ci_results
 
+def _grids(cfg):
+    """Return (integrate_grid, report_grid, eval_indices), matching the two
+    original discretizations:
+ 
+      grid_mode="anchor0" (cumulative): integrate on sorted(set([0] ∪ ci_grid)).
+          The constant-intervention integral ∫₀ᵗ v dτ = v·t is exact on ANY grid
+          that includes 0, so only the zero anchor matters — no densification.
+      grid_mode="dense"   (baseline):   integrate on a dense mesh (⊇ ci_grid,
+          spacing ≤ dense_step); report at ci_grid.
+      grid_mode="none":                 integrate and report on ci_grid as-is.
+    """
+    report = np.asarray(cfg.ci_grid, dtype=float)
+    mode = cfg.grid_mode
+    if mode == "none":
+        return report, report, list(range(len(report)))
+    if mode == "anchor0":
+        t_grid = np.array(sorted(set([0.0] + [float(t) for t in report])),
+                          dtype=float)
+        eval_idx = [int(np.argmin(np.abs(t_grid - float(te)))) for te in report]
+        return t_grid, report, eval_idx
+    if mode == "dense":
+        step = cfg.dense_step if cfg.dense_step is not None else 1.0
+        t_dense, eval_idx = PDP._build_dense_grid(report, step)
+        return t_dense, report, eval_idx
+    raise ValueError(f"Unknown grid_mode {mode!r} (none|anchor0|dense)")
+
 
 def _flatten_ci(ci_results):
     """Flatten the nested result dict into npz-friendly arrays."""
@@ -347,8 +373,9 @@ def run_simulation(cfg: PDPConfig, device):
     ckpts = sorted(glob.glob(cfg.checkpoint))
     if not ckpts:
         raise FileNotFoundError(f"No checkpoints match {cfg.checkpoint!r}")
-    ci_grid = np.asarray(cfg.ci_grid, dtype=float)
-    L = len(ci_grid)
+    # ci_grid = np.asarray(cfg.ci_grid, dtype=float)
+    integrate_grid, report_grid, eval_idx = _grids(cfg)
+    L = len(integrate_grid)
     pair = ("hi", "lo")
     pair_key = "_delta_hi_vs_lo"
 
@@ -369,7 +396,7 @@ def run_simulation(cfg: PDPConfig, device):
         true_fns = {pair: oracle} if oracle is not None else None
 
         res = DV.compute_contrast_pdp_with_ci(
-            model, loader, device, profiles, ci_grid, [pair],
+            model, loader, device, profiles, integrate_grid, [pair],
             target_col=target_col, n_tv=n_tv, mask_type=cfg.mask_type,
             variance_mode=cfg.variance_mode,
             dataset=dataset, collate_fn=collate_xaug,

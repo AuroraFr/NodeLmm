@@ -418,3 +418,27 @@ def plot_all_pairwise_delta_pdp(
     plt.savefig(save_path, dpi=300, format='eps')
     print(f"  → {save_path}")
     plt.close()
+
+def _build_dense_grid(visit_times, dense_step=1.0):
+    """Dense integration grid that includes the eval (report) times.
+ 
+    For fixed-step ODE solvers the integration step size follows the spacing of
+    the grid points, so the accumulated ∫₀ᵗ BMI dτ (cumulative scenario) is only
+    approximated well on a fine, zero-anchored mesh. This returns a dense grid
+    (superset of `visit_times`, spacing ≤ dense_step) plus the indices of the
+    report times within it.
+ 
+    NOTE: for the cumulative scenario `visit_times` should start at 0 so the
+    integration begins at the accumulation origin.
+ 
+    Returns:
+        t_dense:      (M,) sorted numpy array (⊇ visit_times)
+        eval_indices: list[int] — positions of visit_times in t_dense
+    """
+    visit_times = np.asarray(visit_times, dtype=float)
+    t_min, t_max = float(visit_times[0]), float(visit_times[-1])
+    t_dense = np.arange(t_min, t_max + 1e-9, dense_step)
+    t_dense = np.union1d(t_dense, visit_times)
+    t_dense = np.sort(t_dense)
+    eval_indices = [int(np.searchsorted(t_dense, vt)) for vt in visit_times]
+    return t_dense, eval_indices
