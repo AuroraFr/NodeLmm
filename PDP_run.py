@@ -414,16 +414,16 @@ def run_simulation(cfg: PDPConfig, device):
             active_threshold=cfg.active_threshold, verbose=cfg.verbose)
         all_results.append(res)
 
-    summary = DV.aggregate_simulations(all_results, ci_grid, pair_key=pair_key)
-    _print_sim_summary(summary, ci_grid)
+    summary = DV.aggregate_simulations(all_results, integrate_grid, pair_key=pair_key)
+    _print_sim_summary(summary, integrate_grid)
 
     np.savez(os.path.join(cfg.output_dir, f"{cfg.name}_coverage.npz"),
-             ci_grid=ci_grid,
+             ci_grid=integrate_grid,
              **{f"t{t}": np.array([summary[float(t)].get(k, np.nan)
                                    for k in ("mean_hat", "true", "bias",
                                              "var_mc", "mean_var_est",
                                              "coverage95")])
-                for t in ci_grid if float(t) in summary})
+                for t in integrate_grid if float(t) in summary})
     print(f"\n  simulation validation done ({len(ckpts)} replicates) "
           f" {cfg.output_dir}")
     return summary
