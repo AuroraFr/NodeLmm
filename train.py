@@ -60,7 +60,6 @@ class TrainConfig:
     # ── rds_sim data ──────────────────────────────────────────────────────
     data_dir: str = ""
     sim_start: int = 0                   # inclusive, 0-based file index
-    sim_end: int = 0                     # exclusive
     split_seed: int = 42
     test_ratio: float = 0.2
 
@@ -459,6 +458,8 @@ def main():
                         help="path to a JSON (or YAML) config file")
     parser.add_argument("--data", default=None,
                         help="override data_dir (sim) or train_csv (real)")
+    parser.add_argument("--sim_start", default=0, type=int,
+                        help="start index")
     parser.add_argument("--ckpt", default=None,
                         help="override checkpoint directory")
     args = parser.parse_args()
@@ -478,7 +479,7 @@ def main():
     print("=" * 60)
 
     if cfg.data_kind in _SIM_KINDS:
-        for sim_index in range(cfg.sim_start, cfg.sim_end):
+        for sim_index in range(args.sim_start, args.sim_start+10):
             print(f"\n── replicate {sim_index} ({cfg.data_dir}) ─────────────")
             set_seed(cfg.split_seed)
             bundle = prepare_sim(cfg, sim_index)

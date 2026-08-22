@@ -14,8 +14,6 @@
   "id_col": "NUM_ID",
   "time_col": "time",
   "data_dir": "simu_datasets/S2a_sims",
-  "sim_start": 0,
-  "sim_end": 100,
   "split_seed": 42,
   "test_ratio": 0.2,
   "train_csv": "",

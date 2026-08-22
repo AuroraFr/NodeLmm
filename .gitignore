@@ -4,7 +4,7 @@ figures/
 results_simu/
 3C_dataset/
 __pycache__/
-checkpoints/
+checkpoints*/
 simu_datasets/
 EXPs/
 results_3C/
@@ -14,3 +14,4 @@ results_3C/
 diagnostics_results/
 figure_eps/
 logs/
+pdp_result/
