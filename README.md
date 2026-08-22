@@ -45,13 +45,10 @@ The methodology is applied to assess the association between cardiometabolic hea
 ## Repository Structure
 
 ```
-├── R/                  # R scripts
-│   ├── HLME_*.R        # HLME comparison models (lcmm package)
-│   └── simulation*.R   # Simulation pipeline (calibrate → define → loop → aggregate)
-├── python/             # Python scripts
-│   ├── model.py        # Neural ODE-LMM model (PyTorch + torchdiffeq)
-│   ├── train.py        # Training loop (penalised marginal NLL)
-│   └── pdp_analysis.py # ΔPDP, Fisher information, delta-method CIs
+├── NodeLmm/             
+│   ├── model.py        # Neural ODE-LMM model (PyTorch)
+│   ├── train.py        # Training loop
+│   └── PDP_run.py # Contrast predictions, Fisher information, delta-method CIs
 └── ...
 ```
 
@@ -63,9 +60,6 @@ The methodology is applied to assess the association between cardiometabolic hea
 - PyTorch ≥ 2.6.0
 - torchdiffeq
 - NumPy, SciPy
-
-**R**:
-- `lcmm` (for HLME comparison models)
 
 ## Computational Environment
 
