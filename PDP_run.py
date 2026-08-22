@@ -85,9 +85,10 @@ class PDPConfig:
     oracle: dict = field(default_factory=lambda: {"kind": "none"})
 
     # ── output ──────────────────────────────────────────────────────────
-    output_dir: str = "pdp_out"
+    output_dir: str = "pdp_result"
     make_plots: bool = True
     verbose: bool = True
+    resume: bool = True
 
     @classmethod
     def from_dict(cls, d: dict) -> "PDPConfig":
@@ -247,10 +248,10 @@ def build_oracle(spec: dict, v_lo, v_hi, dataset):
 # ══════════════════════════════════════════════════════════════════════════
 
 def _target_col(tc: dict, feature: str) -> int:
-    tvf = tc["time_varying_features"]
-    if feature not in tvf:
-        raise ValueError(f"target_feature {feature!r} not in {tvf}")
-    return tvf.index(feature)
+    tv_features = tc["time_varying_features"]
+    if feature not in tv_features:
+        raise ValueError(f"target_feature {feature!r} not in {tv_features}")
+    return tv_features.index(feature)
 
 
 def _fisher(model, dataset, device, tc, cfg: PDPConfig):
@@ -328,27 +329,26 @@ def _grids(cfg):
     """Return (integrate_grid, report_grid, eval_indices), matching the two
     original discretizations:
  
-      grid_mode="anchor0" (cumulative): integrate on sorted(set([0] ∪ ci_grid)).
+      grid_mode="none" (cumulative): integrate on sorted ci_grid).
           The constant-intervention integral ∫₀ᵗ v dτ = v·t is exact on ANY grid
-          that includes 0, so only the zero anchor matters — no densification.
+          that includes 0 — no densification.
       grid_mode="dense"   (baseline):   integrate on a dense mesh (⊇ ci_grid,
           spacing ≤ dense_step); report at ci_grid.
-      grid_mode="none":                 integrate and report on ci_grid as-is.
     """
     report = np.asarray(cfg.ci_grid, dtype=float)
     mode = cfg.grid_mode
     if mode == "none":
         return report, report, list(range(len(report)))
-    if mode == "anchor0":
-        t_grid = np.array(sorted(set([0.0] + [float(t) for t in report])),
-                          dtype=float)
-        eval_idx = [int(np.argmin(np.abs(t_grid - float(te)))) for te in report]
-        return t_grid, report, eval_idx
+    # if mode == "none":
+    #     t_grid = np.array(sorted(set([0.0] + [float(t) for t in report])),
+    #                       dtype=float)
+    #     eval_idx = [int(np.argmin(np.abs(t_grid - float(te)))) for te in report]
+    #     return t_grid, report, eval_idx
     if mode == "dense":
         step = cfg.dense_step if cfg.dense_step is not None else 1.0
         t_dense, eval_idx = PDP._build_dense_grid(report, step)
         return t_dense, report, eval_idx
-    raise ValueError(f"Unknown grid_mode {mode!r} (none|anchor0|dense)")
+    raise ValueError(f"Unknown grid_mode {mode!r} (none|dense)")
 
 
 def _flatten_ci(ci_results):
@@ -387,8 +387,29 @@ def run_simulation(cfg: PDPConfig, device):
     pair = ("hi", "lo")
     pair_key = "_delta_hi_vs_lo"
 
-    all_results = []
+    # ── resume: reload completed replicates from a run checkpoint ──────────
+    resume_path = os.path.join(cfg.output_dir, f"{cfg.name}_sim_checkpoint.pt")
+    all_results, done = [], set()
+    if cfg.resume and os.path.exists(resume_path):
+        blob = torch.load(resume_path, map_location="cpu", weights_only=False)
+        # guard: don't resume across a changed config
+        if (blob.get("name") != cfg.name
+                or not np.allclose(blob.get("report_grid", []), report_grid)
+                or blob.get("variance_mode") != cfg.variance_mode):
+            print(f"  resume checkpoint {resume_path} is from a different "
+                  f"config; ignoring it and starting fresh.")
+        else:
+            all_results = blob["all_results"]
+            done = set(blob["completed"])
+            print(f"  ↻ resuming: {len(done)} replicate(s) already done "
+                  f"({resume_path})")
+
     for ckpt_path in ckpts:
+
+        base = os.path.basename(ckpt_path)
+        if base in done:
+            continue
+
         sim_index = _sim_index_from_ckpt(ckpt_path)
         if cfg.verbose:
             print(f"\n── replicate {sim_index} ({os.path.basename(ckpt_path)}) ──")
@@ -413,6 +434,29 @@ def run_simulation(cfg: PDPConfig, device):
             true_contrast_fns=true_fns,
             active_threshold=cfg.active_threshold, verbose=cfg.verbose)
         all_results.append(res)
+
+        # ── save resume checkpoint after each replicate ──
+        if cfg.resume:
+            tmp = resume_path + ".tmp"
+            torch.save({"name": cfg.name, "variance_mode": cfg.variance_mode,
+                        "all_results": all_results,
+                        "completed": sorted(done)}, tmp)
+            os.replace(tmp, resume_path)          
+ 
+        # ── per-replicate diagnostic line (bias, SE, stationarity) ──
+        if cfg.verbose:
+            d = res[pair_key]
+            stat = res["_meta"]["stationarity_ratio"]
+            mean_abs_bias = float(np.nanmean(np.abs(d["bias"])))
+            mean_se = float(np.mean(d["se"]))
+            per_t = "  ".join(
+                f"t={float(t):g}: Δ={d['mean'][ell]:+.3f}(se {d['se'][ell]:.3f}, "
+                f"bias {d['bias'][ell]:+.3f})"
+                for ell, t in enumerate(report_grid))
+            print(f"    replicate {sim_index}: stationarity={stat:.3f}  "
+                  f"mean|bias|={mean_abs_bias:.4f}  mean_se={mean_se:.4f}")
+            print(f"      {per_t}")
+
 
     summary = DV.aggregate_simulations(all_results, integrate_grid, pair_key=pair_key)
     _print_sim_summary(summary, integrate_grid)

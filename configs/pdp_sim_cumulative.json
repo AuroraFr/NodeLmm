@@ -6,6 +6,7 @@
   "v_lo": 23.0,
   "v_hi": 28.0,
   "ci_grid": [
+    0.0,
     2.0,
     4.0,
     6.0,
@@ -13,7 +14,7 @@
     10.0,
     12.0
   ],
-  "grid_mode": "anchor0",
+  "grid_mode": "none",
   "dense_step": null,
   "profile_set": "lohi",
   "pairs": [
