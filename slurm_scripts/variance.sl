@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH -J ODE_LMM
+#SBATCH -J var_cumul
 # Asking for one node
-#SBATCH -w sirocco23 --time=2-10:00:00 --exclusive
+#SBATCH -w bora036 --time=2-10:00:00 --exclusive
 # Standard output
-#SBATCH -o slurm.sh%j.out
+#SBATCH -o logs/cumul_variance.out
 # Standard error
-#SBATCH -e slurm.sh%j.err
+#SBATCH -e logs/cumul_variance.err
 
 echo "=====my job information ===="
 echo "Node List: " $SLURM_NODELIST
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python DPDP_cumulative_effect.py --bmi_pairs 23:28 --ledoit_wolf
+python PDP_run.py --config configs/pdp_sim_cumulative.json

@@ -19,8 +19,8 @@ Standalone: it rebuilds the model from the checkpoint's embedded `train_config`
     - aggregate across replicates → Var_est vs Var_MC + 95% coverage table
 
 Run:
-    python pdp_run.py --config configs/pdp_real.json
-    python pdp_run.py --config configs/pdp_sim.json
+    python PDP_run.py --config configs/pdp_real.json
+    python PDP_run.py --config configs/pdp_sim.json
 """
 from __future__ import annotations
 from dataclasses import dataclass, field, fields
