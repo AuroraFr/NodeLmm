@@ -29,6 +29,10 @@ Requires: model_ODE_real.py, Preprocess_3C.py, utils.py in the path.
 
 import os
 import sys
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
+
 import argparse
 import numpy as np
 import torch
@@ -39,8 +43,8 @@ from matplotlib.gridspec import GridSpec
 
 # ── Imports from your codebase ──
 from Preprocess_3C import process_data, EXPECTED_TIMES
-from model_ODE_real import NeuralODEModel, NeuralODEConfig
-from train_ODE_real import RealDataset, collate_real, compute_covariate_stats
+from model import NeuralODEModel, NeuralODEConfig
+from Dataset import XAugDataset, collate_xaug
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -99,7 +103,7 @@ def load_model_and_data(ckpt_path, data_dir, device="cpu"):
         interp_method=interp_method,
         mask_type=mask_type,
     )
-    dataset = RealDataset(patient_data)
+    dataset = XAugDataset(patient_data)
 
     # ── Build model ──
     model = NeuralODEModel(
@@ -130,7 +134,7 @@ def load_model_and_data(ckpt_path, data_dir, device="cpu"):
 
 def get_batch(dataset, indices, device="cpu"):
     """Extract a batch from dataset at given indices."""
-    batch = collate_real([dataset[i] for i in indices])
+    batch = collate_xaug([dataset[i] for i in indices])
     pids, x_aug, y_pad, target_mask, static = batch
     return (
         x_aug.to(device),

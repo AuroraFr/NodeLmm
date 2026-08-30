@@ -8,7 +8,11 @@ first layer of rho_net.
 Usage:
     python check_skip_norms.py --ckpt checkpoints/best_model.pt
 """
-from model_ODE_cumulative import NeuralODEModel, NeuralODEConfig
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
+
+from model import NeuralODEModel, NeuralODEConfig
 import torch
 import argparse
 

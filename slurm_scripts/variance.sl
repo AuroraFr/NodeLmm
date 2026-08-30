@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-#SBATCH -J var_cumul
+#SBATCH -J var_base
 # Asking for one node
-#SBATCH -w bora036 --time=2-10:00:00 --exclusive
+#SBATCH -w bora041 --time=2-10:00:00 --exclusive
 # Standard output
-#SBATCH -o logs/cumul_variance.out
+#SBATCH -o logs/baseline_variance_bmi.%j.out
 # Standard error
-#SBATCH -e logs/cumul_variance.err
+#SBATCH -e logs/baseline_variance_bmi.%j.err
 
 echo "=====my job information ===="
 echo "Node List: " $SLURM_NODELIST
@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python PDP_run.py --config configs/pdp_sim_cumulative.json
+python PDP_run.py --config configs/pdp_sim_baseline.json

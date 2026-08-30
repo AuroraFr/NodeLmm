@@ -8,6 +8,10 @@ Usage:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
+
 import os
 import json
 import time
@@ -19,8 +23,8 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 import pyreadr
-from dataset import LongitudinalDataset, collate_pad
-from model_ODE_cumulative import NeuralODEModel, NeuralODEConfig
+from Dataset import XAugDataset, collate_xaug
+from model import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
 
 
@@ -197,7 +201,7 @@ if __name__ == "__main__":
         df["DIPNIV2"] = (df["DIPNIV"].astype(str) == "2").astype("float64")
         df["DIPNIV3"] = (df["DIPNIV"].astype(str) == "3").astype("float64")
 
-        dataset = LongitudinalDataset(df, "NUM_ID", "time", x_cols, "ISA15_sim",
+        dataset = XAugDataset(df, "NUM_ID", "time", x_cols, "ISA15_sim",
                                       static_cols=static_cols)
 
         N = len(dataset)
@@ -214,9 +218,9 @@ if __name__ == "__main__":
         bmi_std = train_bmis.std().item()
 
         train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                                  shuffle=True, collate_fn=collate_pad)
+                                  shuffle=True, collate_fn=collate_xaug)
         test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE,
-                                 shuffle=False, collate_fn=collate_pad)
+                                 shuffle=False, collate_fn=collate_xaug)
 
         for exp in configs:
             print(f"\n  Config: {exp.name}")

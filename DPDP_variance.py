@@ -460,7 +460,7 @@ def compute_all_profile_pdp_gradients(
         static = static.to(device)
         N_batch = x_aug.shape[0]
  
-        # Resample to grid ONCE per batch
+        # Resample to grid per batch
         x_aug_grid, obs_mask_grid = resample_xaug_to_grid(
             x_aug, target_mask, eval_grid, n_tv,
         )
@@ -474,7 +474,7 @@ def compute_all_profile_pdp_gradients(
                 mask_type=mask_type,
             )
             mu, V, Z, D, sig2, reg = model(
-                x_aug_cf, static_covariates=static, obs_mask=obs_mask_grid,
+                x_aug_cf, static_covariates=static, obs_mask=None,
             )
             mu_dict[pname] = mu  # (N_batch, L)
  
@@ -677,7 +677,8 @@ def compute_contrast_pdp_with_ci(
             torch.from_numpy(pdp_grads[pname][ell]).float()), 0.0))
             for ell in range(L)])
         results[pname] = {
-            'mean': PDPs[pname], 'se': se,
+            'mean': PDPs[pname], 
+            'se': se,
             'ci_lo': PDPs[pname] - z_crit * se,
             'ci_hi': PDPs[pname] + z_crit * se,
             'grad': pdp_grads[pname],
@@ -699,10 +700,12 @@ def compute_contrast_pdp_with_ci(
         true = (np.array([ofn(float(eval_grid[ell])) for ell in range(L)])
                 if ofn is not None else np.full(L, np.nan))
         results[f'_delta_{pa}_vs_{pb}'] = {
-            'mean': delta_mean, 'estimate': delta_mean, 'se': se,
+            'mean': delta_mean, 'estimate': delta_mean, 
+            'se': se,
             'ci_lo': delta_mean - z_crit * se,
             'ci_hi': delta_mean + z_crit * se,
-            'grad': delta_grad, 'true': true, 'bias': delta_mean - true,
+            'grad': delta_grad, 
+            'true': true, 'bias': delta_mean - true,
             'null_frac': nf,
         }
         if verbose:
@@ -926,8 +929,10 @@ def aggregate_simulations(all_results, t_eval, pair_key):
         coverage = (np.mean((ci_los <= trues) & (trues <= ci_his))
                     if D_t > 1 else float('nan'))
         summary[tk] = {
-            'D': D_t, 'mean_hat': ests.mean(), 'true': np.nanmean(trues),
-            'bias': bias, 'var_mc': var_mc,
+            'D': D_t, 
+            'mean_hat': ests.mean(), 'true': np.nanmean(trues),
+            'bias': bias, 
+            'var_mc': var_mc,
             'mean_var_est': (ses ** 2).mean(),
             'mse': (bias ** 2 + var_mc) if D_t > 1 else float('nan'),
             'coverage95': coverage,

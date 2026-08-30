@@ -46,6 +46,7 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 
 # ─────────────────────────────────────────────
@@ -177,7 +178,7 @@ class Decoder(nn.Module):
       - Static  group j : (static_j)                → 1 column
     """
     def __init__(self, latent_dim, n_tv, p, q=3,
-                 fullD=True, jitter=1e-6, rho_hidden=64, D_diag_min=0.1,
+                 fullD=True, jitter=1e-6, rho_hidden=64,
                  use_rho_net=True,
                  use_neural_re=True,
                  g_hidden=16,
@@ -187,12 +188,14 @@ class Decoder(nn.Module):
                  include_mask=True,
                  reg_mode=None,
                  use_rho_norm=True,
-                 beta_init_scale=0.01):
+                 beta_init_scale=0.01,
+                 rho_net_depth=2,
+                 g_net_depth=2):
         super().__init__()
         self.p, self.q = p, q
         self.fullD = fullD
         self.jitter = jitter
-        self.D_diag_min = D_diag_min
+        # self.D_diag_min = D_diag_min
         self.reg_mode = reg_mode
         self.latent_dim = latent_dim
         self.n_tv = n_tv
@@ -241,7 +244,7 @@ class Decoder(nn.Module):
         self.use_rho_net = use_rho_net
         if use_rho_net:
             self.rho_net = MLP(latent_dim + self.skip_dim, rho_hidden, p,
-                               depth=2, dropout=0.0)
+                               depth=rho_net_depth, dropout=0.0)
             self.rho_norm = nn.LayerNorm(p) if use_rho_norm else nn.Identity()
             self.beta_neural = nn.Parameter(beta_init_scale * torch.randn(p))
         else:
@@ -256,7 +259,7 @@ class Decoder(nn.Module):
         # Intercept-only is a scalar random intercept ⇒ q is forced to 1.
         self.use_neural_re = use_neural_re
         if use_neural_re:
-            self.g_net = MLP(latent_dim, g_hidden, q, depth=2, dropout=0.0)
+            self.g_net = MLP(latent_dim, g_hidden, q, depth=g_net_depth, dropout=0.0)
             self.g_norm = nn.LayerNorm(q)
         else:
             self.g_net = None
@@ -280,12 +283,11 @@ class Decoder(nn.Module):
         if self.fullD:
             L = torch.tril(self.L_unconstrained).to(device=device, dtype=dtype)
             diag = torch.diagonal(L, 0)
-            diag_pos = F.softplus(diag) + self.D_diag_min
+            diag_pos = F.softplus(diag)
             L = L - torch.diag(torch.diagonal(L, 0)) + torch.diag(diag_pos)
             return L @ L.t()
         else:
             std = torch.exp(self.log_std).to(device=device, dtype=dtype)
-            std = torch.clamp(std, min=self.D_diag_min ** 0.5)
             return torch.diag(std * std)
 
     # ── Skip input ───────────────────────────────────────────────────────
@@ -382,7 +384,10 @@ class NeuralODEConfig:
     dec_rho_hidden: int = 16
     dec_p: int = 4
     dec_q: int = 3
-    depth: int = 2
+    encoder_depth: int = 1
+    ode_depth: int = 2
+    rho_net_depth: int = 2
+    g_net_depth: int = 2
     dropout: float = 0.0
     euler_steps_per_interval: int = 4    # sub-steps between observation times
     ode_solver: str = "euler"            # euler/midpoint/rk4 (manual) or dopri5/... (torchdiffeq)
@@ -395,9 +400,6 @@ class NeuralODEConfig:
 # ─────────────────────────────────────────────
 
 class NeuralODEModel(nn.Module):
-    """
-    Unified Neural ODE-LMM. See module docstring for the flag→variant map.
-    """
 
     def __init__(self, n_tv, static_dim=0, cfg=None,
                  use_rho_net=True,
@@ -408,7 +410,6 @@ class NeuralODEModel(nn.Module):
                  static_skip_dims=None,
                  use_dynamic_skip=True,
                  reg_mode=None,
-                 # ── generalising flags ────────────────────────
                  include_mask=True,
                  use_dynamic_in_ode=True,
                  encode_baseline_cov=True):
@@ -441,7 +442,7 @@ class NeuralODEModel(nn.Module):
             hidden_dim=cfg.hidden_channels,
             encode_baseline_cov=encode_baseline_cov,
             mlp_hidden=cfg.enc_mlp_hidden,
-            depth=1,
+            depth=cfg.encoder_depth,
             dropout=cfg.dropout,
         )
 
@@ -452,9 +453,9 @@ class NeuralODEModel(nn.Module):
             use_dynamic_in_ode=use_dynamic_in_ode,
             include_mask=include_mask,
             mlp_hidden=cfg.func_mlp_hidden,
-            depth=cfg.depth,
             dropout=cfg.dropout,
             activation=nn.SiLU(),
+            depth=cfg.ode_depth
         )
 
         self.z_norm = nn.LayerNorm(cfg.hidden_channels)
@@ -478,6 +479,8 @@ class NeuralODEModel(nn.Module):
             reg_mode=reg_mode,
             use_rho_norm=cfg.use_rho_norm,
             beta_init_scale=cfg.beta_init_scale,
+            rho_net_depth=cfg.rho_net_depth,
+            g_net_depth=cfg.g_net_depth
         )
 
     # ── Integration ─────────────────────────────────────────────────────

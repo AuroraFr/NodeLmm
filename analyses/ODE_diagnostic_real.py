@@ -15,17 +15,19 @@ Usage:
     plot_zt_diagnostic(zt_dict, pdp_dict, profiles, visit_times)
 """
 from __future__ import annotations
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from PDP_continuous_time import (
+from PDP import (
     resample_xaug_to_grid,
-    make_profiles_continuous,
-    build_profile_xaug_continuous,
+    make_profiles,
+    build_couterfactual_profile_xaug,
     PROFILE_COLOURS,
-    PROFILE_LABELS,
-    PROFILE_ORDER,
+    PROFILE_LABELS
 )
 
 
@@ -71,7 +73,7 @@ def extract_zt_profiles(model, loader, device,
         profiles: {profile_key: (L,) np.array}       the covariate profiles
     """
     model.eval()
-    profiles = make_profiles_continuous(visit_times, q25, q75)
+    profiles = make_profiles(visit_times, q25, q75)
     grid = np.array(visit_times, dtype=np.float64)
     L = len(grid)
     K = n_tv
@@ -97,7 +99,7 @@ def extract_zt_profiles(model, loader, device,
 
         for name, prof_values in profiles.items():
             # Build counterfactual (same as PDP path)
-            x_cf = build_profile_xaug_continuous(
+            x_cf = build_couterfactual_profile_xaug(
                 x_aug_grid, target_col=covariate_idx,
                 profile_values=prof_values, n_tv=K,
                 mask_type=mask_type,

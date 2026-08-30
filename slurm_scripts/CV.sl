@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH -J CV_NODE_LMM
 # Asking for one node
-#SBATCH -w bora041 --time=2-10:00:00 --exclusive
+#SBATCH -w bora044 --time=2-10:00:00 --exclusive
 # Standard output
-#SBATCH -o slurm.sh%j.out
+#SBATCH -o logs/CV2.%j.out
 # Standard error
-#SBATCH -e slurm.sh%j.err
+#SBATCH -e logs/CV2.%j.err
 
 echo "=====my job information ===="
 echo "Node List: " $SLURM_NODELIST
@@ -18,6 +18,6 @@ echo "As the user:" $USER
 
 module purge
 source ~/torch/bin/activate
-cd /beegfs/zli/workspace/CDE_LMM/
+cd /beegfs/zli/workspace/CDE_LMM/model_selections
 
 python CV_NODE_LMM.py

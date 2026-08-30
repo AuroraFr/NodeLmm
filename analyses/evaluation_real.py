@@ -9,9 +9,11 @@ Computes:
   5. Export all results to CSV
 
 Usage:
-    python prediction_ODE.py
-    python prediction_ODE.py --checkpoint checkpoints/best_model_ode_real_3C.pt
+    python evaluation_real.py --checkpoint checkpoints/best_model_ode_real_3C.pt
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -24,8 +26,8 @@ import argparse
 import os
 
 from Preprocess_3C import process_data, EXPECTED_TIMES
-from train_ODE_real import RealDataset, collate_real, compute_covariate_stats
-from model_ODE_real import NeuralODEModel, NeuralODEConfig
+from Dataset import XAugDataset, collate_xaug
+from model import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
 
 import warnings
@@ -469,7 +471,7 @@ def compute_fisher_for_ci(model, dataset, collate_fn, device,
     Compute (or load cached) Fisher inverse for CI computation.
     Shared between prediction CI and ΔPDP CI.
     """
-    from PDP_variance import (
+    from DPDP_variance import (
         compute_empirical_fisher,
         _ledoit_wolf_shrink_fisher,
         _regularise_and_invert,
@@ -743,13 +745,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Prediction and evaluation for Neural ODE-LMM (3C cohort)")
     parser.add_argument("--checkpoint", type=str,
-                        default="checkpoints/cv_final_model.pt")
+                        default="../checkpoints2/cv_final_model.pt")
     parser.add_argument("--data", type=str,
-                        default="3C_dataset/train_3C_data_1.csv")
-    parser.add_argument("--hlme_csv", type=str, default='results_3C/hlme/',
+                        default="../3C_dataset/train_3C_data_1.csv")
+    parser.add_argument("--hlme_csv", type=str, default='../results_3C/hlme/',
                         help="CSV with HLME predictions for comparison")
     parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--output_dir", type=str, default="results_3C")
+    parser.add_argument("--output_dir", type=str, default="../results_3C")
     parser.add_argument("--test_ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     # ── CI arguments ──
@@ -775,19 +777,22 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ── Load checkpoint ─────────────────────────────────────────────────
     checkpoint = torch.load(args.checkpoint, map_location=device,
                             weights_only=False)
-    ckpt_cfg = checkpoint['config']
+    # Support both old ("config") and new ("train_config") checkpoint formats
+    ckpt_cfg = checkpoint.get('config', checkpoint.get('config', {}))
     print(f"Loaded checkpoint: {args.checkpoint}")
     print(f"  Epoch: {checkpoint.get('epoch', '?')}")
-    # print(f"  Best test loss: {checkpoint.get('best_test_loss', '?'):.4f}")
 
     # ── Feature definitions from checkpoint ─────────────────────────────
-    id_col = "NUM_ID"
-    target_col = "ISA15"
-    time_varying_features = ckpt_cfg.get('time_varying_features', ["BMI", "PAS", "PAD", "GLUC", "HDL"])
-    static_features = ckpt_cfg.get('static_features', ["SEX_code", "AGEc", "DIPNIV_2", "DIPNIV_3"])
+    id_col = ckpt_cfg.get('id_col', "NUM_ID")
+    target_col = ckpt_cfg.get('target_col', "ISA15")
+
+    # Old checkpoints may have empty feature lists
+    _default_tv = ["BMI", "PAS", "PAD", "GLUC", "HDL"]
+    _default_sf = ["SEX_code", "AGEc", "DIPNIV_2", "DIPNIV_3"]
+    time_varying_features = ckpt_cfg.get('time_varying_features') or _default_tv
+    static_features = ckpt_cfg.get('static_features') or _default_sf
     K = len(time_varying_features)
     Ks = len(static_features)
     interp_method = ckpt_cfg.get('interp_method', 'linear')
@@ -795,20 +800,15 @@ if __name__ == "__main__":
 
     # ── Load and preprocess data ────────────────────────────────────────
     df = pd.read_csv(args.data)
-    test_df = pd.read_csv("3C_dataset/test_3C_data.csv")
+    test_df = pd.read_csv("../3C_dataset/test_3C_data.csv")
 
     if "AGEc" not in df.columns:
-        # all_df = pd.read_csv("3C_dataset/data_3C.csv")
-        # baseline_age = all_df.groupby(id_col)["AGE0"].transform("first")
-        # baseline_age_mean = baseline_age.mean()
-        # df["AGEc"] = df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
-        # test_df["AGEc"] = test_df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
-
-        all_df = pd.read_csv("3C_dataset/data_3C.csv")
+        all_df = pd.read_csv("../3C_dataset/data_3C.csv")
         baseline_age_mean = all_df.groupby(id_col)["AGE0"].first().mean()
         print('baseline_age_mean', baseline_age_mean)
-        df["AGEc"] = df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
-        test_df["AGEc"] = test_df.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
+        for _df in (df, test_df):
+            _df["AGEc"] = (_df.groupby(id_col)["AGE0"].transform("first")
+                           - baseline_age_mean)
 
     patient_data = process_data(
         df=df,
@@ -830,43 +830,60 @@ if __name__ == "__main__":
         mask_type=mask_type,
     )
 
-    full_dataset = RealDataset(patient_data)
-    test_dataset = RealDataset(test_patient_data)
+    # ── Datasets: XAugDataset replaces RealDataset ─────────────────────
+    full_dataset = XAugDataset.from_processed(patient_data)
+    test_dataset = XAugDataset.from_processed(test_patient_data)
 
+    # ── DataLoaders: collate_xaug replaces collate_real ────────────────
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size,
-                             shuffle=False, collate_fn=collate_real)
+                            shuffle=False, collate_fn=collate_xaug)
     train_loader = DataLoader(full_dataset, batch_size=args.batch_size,
-                             shuffle=False, collate_fn=collate_real)
-
-    # print(f"  Subjects: {N} total → {len(train_idx)} train, {len(test_idx)} test")
+                            shuffle=False, collate_fn=collate_xaug)
 
     # ── Rebuild model from checkpoint config ────────────────────────────
-    cfg = NeuralODEConfig(
-        hidden_channels=ckpt_cfg['hidden_channels'],
-        enc_mlp_hidden=ckpt_cfg.get('enc_mlp_hidden', 16),
-        func_mlp_hidden=ckpt_cfg.get('func_mlp_hidden', 32),
-        dec_rho_hidden=ckpt_cfg.get('dec_rho_hidden', 16),
-        dec_p=ckpt_cfg.get('dec_p', 4),
-        dec_q=ckpt_cfg.get('dec_q', 3),
-        depth=ckpt_cfg.get('depth', 2),
-        euler_steps_per_interval=4,
-        ode_solver=ckpt_cfg.get('ode_solver', 'rk4'),
-        use_rho_norm=ckpt_cfg.get('use_rho_norm', True)
-    )
+    if "cfg" in ckpt_cfg:
+        # New format: nested NeuralODEConfig dict
+        cfg = NeuralODEConfig(**ckpt_cfg["cfg"])
+    else:
+        # Old format: flat config with "depth" instead of encoder_depth/ode_depth
+        cfg = NeuralODEConfig(
+            hidden_channels=ckpt_cfg['hidden_channels'],
+            enc_mlp_hidden=ckpt_cfg.get('enc_mlp_hidden', 16),
+            func_mlp_hidden=ckpt_cfg.get('func_mlp_hidden', 16),
+            dec_rho_hidden=ckpt_cfg.get('dec_rho_hidden', 16),
+            dec_p=ckpt_cfg.get('dec_p', 4),
+            dec_q=ckpt_cfg.get('dec_q', 3),
+            encoder_depth=1,
+            ode_depth=ckpt_cfg.get('depth', 2),
+            rho_net_depth=ckpt_cfg.get('rho_net_depth', 2),
+            g_net_depth=ckpt_cfg.get('g_net_depth', 2),
+            dropout=0.0,
+            euler_steps_per_interval=ckpt_cfg.get('euler_steps_per_interval', 4),
+            ode_solver=ckpt_cfg.get('ode_solver', 'rk4'),
+            use_rho_norm=ckpt_cfg.get('use_rho_norm', True),
+            beta_init_scale=ckpt_cfg.get('beta_init_scale', 0.01),
+        )
+
+    skip_dims = (ckpt_cfg.get('static_skip_dims')
+                 if ckpt_cfg.get('static_skip_dims') is not None
+                 else list(range(Ks)))
 
     model = NeuralODEModel(
         n_tv=K,
         static_dim=Ks,
         cfg=cfg,
-        use_rho_net=True,
-        use_neural_re=True,
-        g_hidden=8,
-        fullD=False,
+        use_rho_net=ckpt_cfg.get('use_rho_net', True),
+        use_neural_re=ckpt_cfg.get('use_neural_re', True),
+        g_hidden=ckpt_cfg.get('g_hidden', 8),
+        fullD=ckpt_cfg.get('fullD', False),
         cov_means=checkpoint['cov_means'],
         cov_stds=checkpoint['cov_stds'],
-        static_skip_dims=ckpt_cfg.get('static_skip_dims', list(range(Ks))),
-        use_dynamic_skip=True,
-        reg_mode='group_lasso',
+        static_skip_dims=skip_dims,
+        use_dynamic_skip=ckpt_cfg.get('use_dynamic_skip', True),
+        reg_mode=ckpt_cfg.get('reg_mode', None),
+        include_mask=ckpt_cfg.get('include_mask', True),
+        use_dynamic_in_ode=ckpt_cfg.get('use_dynamic_in_ode', True),
+        encode_baseline_cov=ckpt_cfg.get('encode_baseline_cov', True),
     ).to(device)
 
     model.load_state_dict(checkpoint['model_state_dict'], strict=True)
@@ -975,7 +992,7 @@ if __name__ == "__main__":
 
         # Step 1: Fisher inverse (from TRAINING data — Var(θ̂))
         fisher_inv = compute_fisher_for_ci(
-            model, full_dataset, collate_real, device,
+            model, full_dataset, collate_xaug, device,
             lambda_reg=lam_reg, weight_decay=lam_wd,
             variance_mode=args.variance_mode,
             fisher_cache=fisher_cache_path,
@@ -987,7 +1004,7 @@ if __name__ == "__main__":
             print(f"\n  ── Delta method CI ──")
             print(f"  Computing gradients on test data (N={len(test_dataset)}) ...")
             delta_ci = delta_method_prediction_ci(
-                model, test_dataset, collate_real, device,
+                model, test_dataset, collate_xaug, device,
                 fisher_inv=fisher_inv,
                 visit_times=EXPECTED_TIMES.tolist(),
                 verbose=True,
@@ -1046,7 +1063,7 @@ if __name__ == "__main__":
     if hlme_val_fit is not None:
         hlme_pop = population_averaged_predictions(
             hlme_val_fit)
-    hlme_pop = pd.read_csv('results_3C/pop_ci_hlme_val.csv', delimiter=",")
+    hlme_pop = pd.read_csv('../results_3C/pop_ci_hlme_val.csv', delimiter=",")
     plot_population_averaged(
         df_pop_test, hlme_pop=hlme_pop, mode="fit",
         ci_dict=ci_ode,

@@ -25,7 +25,7 @@
     42
   ],
   "include_mask": false,
-  "use_dynamic_in_ode": false,
+  "use_dynamic_in_ode": true,
   "encode_baseline_cov": false,
   "use_neural_re": true,
   "g_hidden": 8,
@@ -39,10 +39,13 @@
     "hidden_channels": 8,
     "enc_mlp_hidden": 16,
     "func_mlp_hidden": 16,
-    "dec_rho_hidden": 16,
-    "dec_p": 4,
+    "dec_rho_hidden": 8,
+    "dec_p": 2,
     "dec_q": 3,
-    "depth": 2,
+    "encoder_depth": 1,
+    "ode_depth": 1,
+    "rho_net_depth": 2,
+    "g_net_depth": 2,
     "dropout": 0.0,
     "euler_steps_per_interval": 4,
     "ode_solver": "euler",
@@ -57,6 +60,6 @@
   "patience_init": 300,
   "patience_reset": 300,
   "sched_patience": 50,
-  "ckpt_dir": "checkpoints2/simulation_baseline",
+  "ckpt_dir": "checkpoints2/simulation_baseline_bmi_in_ode",
   "ckpt_template": "best_model_ode_{tag}.pt"
 }

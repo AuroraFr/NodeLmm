@@ -36,18 +36,19 @@
   "reg_mode": "group_lasso",
   "lambda_reg": 0.1,
   "cfg": {
-    "hidden_channels": 4,
+    "hidden_channels": 8,
     "enc_mlp_hidden": 16,
     "func_mlp_hidden": 16,
     "dec_rho_hidden": 16,
     "dec_p": 4,
     "dec_q": 3,
-    "depth": 2,
+    "encoder_depth": 1,
+    "rho_net_depth": 2,
+    "g_net_depth": 2,
     "dropout": 0.0,
     "euler_steps_per_interval": 4,
     "ode_solver": "rk4",
-    "use_rho_norm": false,
-    "beta_init_scale": 0.1
+    "use_rho_norm": false
   },
   "lr": 0.001,
   "wd": 1e-05,
@@ -57,6 +58,6 @@
   "patience_init": 150,
   "patience_reset": 150,
   "sched_patience": 50,
-  "ckpt_dir": "checkpoints2/simulation_cumulative",
+  "ckpt_dir": "checkpoints2/simulation_cumulative2",
   "ckpt_template": "best_model_ode_{tag}.pt"
 }

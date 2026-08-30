@@ -1,7 +1,7 @@
 {
   "name": "sim_baseline",
   "setting": "simulation",
-  "checkpoint": "checkpoints2/simulation_baseline/best_model_ode_*.pt",
+  "checkpoint": "checkpoints2/simulation_baseline_bmi_in_ode/best_model_ode_*.pt",
   "target_feature": "BMI_t",
   "v_lo": 23.0,
   "v_hi": 28.0,
@@ -12,7 +12,7 @@
     10.0
   ],
   "grid_mode": "dense",
-  "dense_step": 1,
+  "dense_step": 0.5,
   "profile_set": "lohi",
   "pairs": [
     [
@@ -27,11 +27,11 @@
   "active_threshold": 0.0001,
   "oracle": {
     "kind": "linear",
-    "beta_bmi": -0.3,
+    "beta_bmi": -0.30,
     "beta_int": -0.05,
     "agec_col": 1
   },
-  "output_dir": "pdp_out/sim_baseline",
-  "make_plots": true,
+  "output_dir": "pdp_result/simulation_baseline_bmi_in_ode",
+  "make_plots": false,
   "verbose": true
 }

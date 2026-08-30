@@ -44,12 +44,13 @@
     "dec_rho_hidden": 8,
     "dec_p": 4,
     "dec_q": 3,
-    "depth": 2,
+    "encoder_depth": 1,
+    "rho_net_depth": 2,
+    "g_net_depth": 2,
     "dropout": 0.0,
     "euler_steps_per_interval": 4,
     "ode_solver": "rk4",
-    "use_rho_norm": true,
-    "beta_init_scale": 0.01
+    "use_rho_norm": true
   },
   "lr": 0.001,
   "wd": 1e-05,

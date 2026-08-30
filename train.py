@@ -121,6 +121,13 @@ class TrainConfig:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def key(self) -> str:
+        return (f"h{self.cfg.hidden_channels}_p{self.cfg.dec_p}_q{self.cfg.dec_q}"
+                f"_reg-{self.reg_mode}_lam{self.lambda_reg:g}"
+                f"_skip-{int(self.use_dynamic_skip)}"
+                f"_rhonorm-{int(self.cfg.use_rho_norm)}"
+                f"_nre-{int(self.use_neural_re)}")
+
 
 def load_config(path: str) -> TrainConfig:
     with open(path) as f:
@@ -303,14 +310,14 @@ def build_optimizer(model, cfg: TrainConfig):
     """AdamW with the group-lasso first-layer weight excluded from weight decay
     (it already carries the group-lasso penalty; double shrinkage otherwise).
     Variance and fixed-effect parameters are also decay-free."""
-    gl_weight = model.decoder.rho_net.net[0].weight
-    gl_ids = {id(gl_weight)}
+    # gl_weight = model.decoder.rho_net.net[0].weight
+    # gl_ids = {id(gl_weight)}
 
     nn_weights, var_params, fe_params = [], [], []
     for n, p in model.named_parameters():
-        if id(p) in gl_ids:
-            continue
-        elif "log_residual_var" in n or "log_std" in n:
+        # if id(p) in gl_ids:
+        #     continue
+        if "log_residual_var" in n or "log_std" in n:
             var_params.append(p)
         elif "beta_neural" in n:
             fe_params.append(p)
@@ -319,7 +326,7 @@ def build_optimizer(model, cfg: TrainConfig):
 
     return torch.optim.AdamW([
         {"params": nn_weights, "weight_decay": cfg.wd},
-        {"params": [gl_weight], "weight_decay": 0.0},
+        # {"params": [gl_weight], "weight_decay": 0.0},
         {"params": var_params, "weight_decay": 0.0},
         {"params": fe_params,  "weight_decay": 0.0},
     ], lr=cfg.lr)

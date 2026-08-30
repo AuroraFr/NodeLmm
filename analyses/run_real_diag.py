@@ -10,6 +10,10 @@ Usage:
     python run_real_diag.py --covariate GLUC
     python run_real_diag.py --covariate HDL
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
+
 import argparse
 import torch
 import numpy as np
@@ -18,15 +22,15 @@ import matplotlib.pyplot as plt
 import os
 from torch.utils.data import DataLoader
 from Preprocess_3C import process_data
-from train_ODE_real import RealDataset, collate_real
-from model_ODE_real import NeuralODEModel, NeuralODEConfig
+from Dataset import XAugDataset, collate_xaug
+from model import NeuralODEModel, NeuralODEConfig
 from ODE_diagnostic_real import (
     extract_zt_profiles,
     plot_zt_diagnostic,
     plot_pairwise_diagnostic,
     print_diagnostic_summary,
 )
-from PDP_continuous_time import PROFILE_COLOURS, PROFILE_LABELS, PROFILE_ORDER
+from PDP import PROFILE_COLOURS, PROFILE_LABELS, PROFILE_ORDER
 
 
 # ─────────────────────────────────────────────────
@@ -285,7 +289,7 @@ def plot_cumulative_diagnostic(model, loader, device, visit_times,
     If Δ > 0 at endpoint → model learned cumulative/path-dependent effect
     """
     from ODE_diagnostic_real import extract_zt_profiles
-    from PDP_continuous_time import make_profiles_continuous
+    from PDP import make_profiles
 
     t = np.array(visit_times)
     L = len(t)
@@ -320,7 +324,7 @@ def plot_cumulative_diagnostic(model, loader, device, visit_times,
     )
 
     # Override with our custom profiles — re-extract
-    from PDP_continuous_time import (
+    from PDP import (
         resample_xaug_to_grid,
         build_profile_xaug_continuous,
     )
@@ -519,9 +523,9 @@ def main():
     )
     print(f"  Preprocessed {len(patient_data)} patients")
 
-    dataset = RealDataset(patient_data)
+    dataset = XAugDataset(patient_data)
     loader = DataLoader(dataset, batch_size=args.batch_size,
-                        shuffle=False, collate_fn=collate_real)
+                        shuffle=False, collate_fn=collate_xaug)
 
     # ── Rebuild model ───────────────────────────────────────────────────
     cfg = NeuralODEConfig(

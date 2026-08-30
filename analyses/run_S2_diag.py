@@ -11,14 +11,18 @@ Expected diagnostic results:
 Usage:
     python run_diagnostic_S2.py --sim_idx 0 --ckpt_path checkpoints/best_model_ode_0.pt
 """
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
+
 import argparse
 import torch
 import numpy as np
 import pyreadr
 from torch.utils.data import DataLoader
 
-from dataset import LongitudinalDataset, collate_pad
-from model_ODE_cumulative import NeuralODEModel, NeuralODEConfig
+from Dataset import XAugDataset, collate_xaug
+from model import NeuralODEModel, NeuralODEConfig
 from ODE_diagnostic_simu import (
     extract_zt_profiles,
     plot_zt_diagnostic,
@@ -60,10 +64,10 @@ def main():
     x_cols = ["BMI_t"]
     static_cols = ["SEX_code", "AGEc", "DIPNIV2", "DIPNIV3"]
 
-    dataset = LongitudinalDataset(df, id_col, time_col, x_cols, y_col,
+    dataset = XAugDataset(df, id_col, time_col, x_cols, y_col,
                                   static_cols=static_cols)
     loader = DataLoader(dataset, batch_size=64, shuffle=False,
-                        collate_fn=collate_pad)
+                        collate_fn=collate_xaug)
 
     # --- Model ---
     # Adjust config to match your training setup

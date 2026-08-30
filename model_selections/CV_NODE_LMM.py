@@ -19,6 +19,10 @@ Run:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
+
 import json
 import time
 import copy
@@ -35,56 +39,8 @@ from torch.utils.data import DataLoader
 from Preprocess_3C import process_data
 from model import NeuralODEModel, NeuralODEConfig
 from utils import masked_NLL
-from train import compute_covariate_stats
+from train import compute_cov_stats, TrainConfig
 from Dataset import XAugDataset, collate_xaug
-
-
-# ─────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────
-
-@dataclass
-class CVConfig:
-    # Architecture
-    hidden_channels: int = 8
-    enc_mlp_hidden: int = 16
-    func_mlp_hidden: int = 16
-    dec_rho_hidden: int = 16
-    dec_p: int = 4
-    dec_q: int = 3
-    depth: int = 2
-    dropout: float = 0.0
-    euler_steps_per_interval: int = 4
-    ode_solver: str = "rk4"
-
-    # Decoder variants
-    use_rho_net: bool = True
-    use_rho_norm: bool = False  
-    use_neural_re: bool = True
-    g_hidden: int = 8
-    fullD: bool = False
-
-    # Skip architecture
-    use_dynamic_skip: bool = True
-    static_skip_all: bool = True
-    static_skip_dims: int = 4,
-    # Regularisation
-    reg_mode: Optional[str] = None
-    lambda_reg: float = 0.0
-
-    # Training
-    lr: float = 1e-3
-    weight_decay: float = 1e-5
-    batch_size: int = 128
-    max_epochs: int = 1000
-    patience: int = 300
-
-    def key(self) -> str:
-        return (f"h{self.hidden_channels}_p{self.dec_p}_q{self.dec_q}"
-                f"_reg-{self.reg_mode}_lam{self.lambda_reg:g}"
-                f"_skip-{int(self.use_dynamic_skip)}"
-                f"_rhonorm-{int(self.use_rho_norm)}"
-                f"_nre-{int(self.use_neural_re)}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -92,10 +48,10 @@ class CVConfig:
 # ─────────────────────────────────────────────────────────────────
 
 def prepare_datasets(
-    train_csv: str = "3C_dataset/train_3C_data_1.csv",
-    val_csv: str = "3C_dataset/val_3C_data_1.csv",
-    test_csv: str = "3C_dataset/test_3C_data.csv",
-    all_csv: str = "3C_dataset/data_3C.csv",
+    train_csv: str = "../3C_dataset/train_3C_data_1.csv",
+    val_csv: str = "../3C_dataset/val_3C_data_1.csv",
+    test_csv: str = "../3C_dataset/test_3C_data.csv",
+    all_csv: str = "../3C_dataset/data_3C.csv",
     id_col: str = "NUM_ID",
     target_col: str = "ISA15",
     time_varying_features=("BMI", "PAS", "PAD", "GLUC", "HDL"),
@@ -112,8 +68,11 @@ def prepare_datasets(
         all_df = pd.read_csv(all_csv)
         baseline_age_mean = all_df.groupby(id_col)["AGE0"].first().mean()
         print('baseline_age_mean', baseline_age_mean)
-        df_train["AGEc"] = df_train.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
-        df_test["AGEc"] = df_test.groupby(id_col)["AGE0"].transform("first") - baseline_age_mean
+        # Center all three splits against the SAME pooled reference so they
+        # stay on a common scale. The loop guarantees val is not skipped.
+        for _df in (df_train, df_val, df_test):
+            _df["AGEc"] = (_df.groupby(id_col)["AGE0"].transform("first")
+                           - baseline_age_mean)
     
     kwargs = dict(
         id_col=id_col,
@@ -124,9 +83,9 @@ def prepare_datasets(
         mask_type=mask_type,
     )
     return (
-        XAugDataset(process_data(df=df_train, **kwargs)),
-        XAugDataset(process_data(df=df_val, **kwargs)),
-        XAugDataset(process_data(df=df_test, **kwargs)),
+        XAugDataset.from_processed(process_data(df=df_train, **kwargs)),
+        XAugDataset.from_processed(process_data(df=df_val, **kwargs)),
+        XAugDataset.from_processed(process_data(df=df_test, **kwargs)),
         {
             "n_tv": len(time_varying_features),
             "static_dim": len(static_features),
@@ -137,42 +96,32 @@ def prepare_datasets(
 
 
 # ─────────────────────────────────────────────────────────────────
-# Model construction from CVConfig
+# Model construction from TrainConfig
 # ─────────────────────────────────────────────────────────────────
 
-def build_model(cfg: CVConfig, n_tv: int, static_dim: int,
+def build_model(cfg: TrainConfig, n_tv: int, static_dim: int,
                 cov_means, cov_stds, device):
-    ode_cfg = NeuralODEConfig(
-        hidden_channels=cfg.hidden_channels,
-        enc_mlp_hidden=cfg.enc_mlp_hidden,
-        func_mlp_hidden=cfg.func_mlp_hidden,
-        dec_rho_hidden=cfg.dec_rho_hidden,
-        dec_p=cfg.dec_p,
-        dec_q=cfg.dec_q,
-        depth=cfg.depth,
-        dropout=cfg.dropout,
-        euler_steps_per_interval=cfg.euler_steps_per_interval,
-        ode_solver=cfg.ode_solver,
-    )
-    static_skip_dims = list(range(static_dim)) if cfg.static_skip_all else []
+    
     model = NeuralODEModel(
         n_tv=n_tv,
         static_dim=static_dim,
-        cfg=ode_cfg,
+        cfg=cfg.cfg,
         use_rho_net=cfg.use_rho_net,
         use_neural_re=cfg.use_neural_re,
         g_hidden=cfg.g_hidden,
         fullD=cfg.fullD,
         cov_means=cov_means.tolist() if torch.is_tensor(cov_means) else cov_means,
         cov_stds=cov_stds.tolist() if torch.is_tensor(cov_stds) else cov_stds,
-        static_skip_dims=static_skip_dims,
+        static_skip_dims=cfg.static_skip_dims,
         use_dynamic_skip=cfg.use_dynamic_skip,
         reg_mode=cfg.reg_mode,
+        include_mask=cfg.include_mask,
+        use_dynamic_in_ode=cfg.use_dynamic_in_ode,
+        encode_baseline_cov=cfg.encode_baseline_cov,
     ).to(device)
 
-    # rho_norm ablation: replace with Identity when turned off
-    if cfg.use_rho_net and not cfg.use_rho_norm:
-        model.decoder.rho_norm = nn.Identity()
+    # rho_norm is now handled inside the Decoder via cfg.use_rho_norm
+    # (use_rho_net=True & use_rho_norm=False ⇒ Decoder installs nn.Identity()).
     return model
 
 
@@ -180,7 +129,7 @@ def build_model(cfg: CVConfig, n_tv: int, static_dim: int,
 # Training: train on train_loader, early-stop on val_loader
 # ─────────────────────────────────────────────────────────────────
 
-def train_model(model, train_loader, val_loader, cfg: CVConfig, device,
+def train_model(model, train_loader, val_loader, cfg: TrainConfig, device,
                 verbose: bool = True):
     """
     Train on train_loader, early-stop on val_loader.
@@ -192,34 +141,46 @@ def train_model(model, train_loader, val_loader, cfg: CVConfig, device,
         without improvement
     """
 
-    nn_weights, gate_params, var_params, fe_params = [], [], [], []
+    # Optimiser param groups mirror train.py:build_optimizer:
+    #   - the group-lasso first-layer rho weight is excluded from weight decay
+    #     (it already carries the group-lasso penalty; decay would double-shrink)
+    #   - variance params (log_residual_var / log_std) and fixed effects
+    #     (beta_neural) are decay-free
+    gl_ids = set()
+    # if getattr(model.decoder, "use_rho_net", False) and \
+    #         model.decoder.rho_net is not None:
+    #     gl_ids = {id(model.decoder.rho_net.net[0].weight)}
+
+    nn_weights, var_params, fe_params = [], [], []
     for n, p in model.named_parameters():
-        print(n)
-        if 'skip_gate_logit' in n:
-            gate_params.append(p)
-        elif 'log_residual_var' in n or 'log_std' in n:
+        # if id(p) in gl_ids:
+        #     continue
+        if 'log_residual_var' in n or 'log_std' in n:
             var_params.append(p)
         elif 'beta_neural' in n:
             fe_params.append(p)
         else:
             nn_weights.append(p)
 
-    opt = torch.optim.AdamW([
-        {'params': nn_weights, 'weight_decay': cfg.weight_decay},
-        {'params': gate_params, 'weight_decay': 0.0},
+    param_groups = [
+        {'params': nn_weights, 'weight_decay': cfg.wd},
         {'params': var_params, 'weight_decay': 0.0},
-        {'params': fe_params,  'weight_decay': 0.0},  # or a small value if desired
-    ])
+        {'params': fe_params,  'weight_decay': 0.0},
+    ]
+    if gl_ids:
+        gl_weight = model.decoder.rho_net.net[0].weight
+        param_groups.insert(1, {'params': [gl_weight], 'weight_decay': 0.0})
+
+    opt = torch.optim.AdamW(param_groups, lr=cfg.lr)
     
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=50,
-        verbose=False)
+        opt, mode="min", factor=0.5, patience=50)
 
     best_val = float("inf")
     best_state = None
     wait = 0
 
-    for epoch in range(1, cfg.max_epochs + 1):
+    for epoch in range(1, cfg.epochs + 1):
         # --- train ---
         model.train()
         n_batches = 0
@@ -267,7 +228,7 @@ def train_model(model, train_loader, val_loader, cfg: CVConfig, device,
             wait = 0
         else:
             wait += 1
-            if wait >= cfg.patience:
+            if wait >= cfg.patience_init:
                 break
 
     if best_state is not None:
@@ -370,7 +331,7 @@ def evaluate_loader(model, loader, device):
 # ─────────────────────────────────────────────────────────────────
 
 def run_config(
-    cfg: CVConfig,
+    cfg: TrainConfig,
     train_loader, val_loader,
     cov_means, cov_stds,
     info: dict, device: str,
@@ -391,7 +352,6 @@ def run_config(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(init_seed)
 
-
     model = build_model(cfg, info["n_tv"], info["static_dim"],
                         cov_means, cov_stds, device)
     model, best_val_nll = train_model(
@@ -406,7 +366,7 @@ def run_config(
 # ─────────────────────────────────────────────────────────────────
 
 def grid_search(
-    configs: list[CVConfig],
+    configs: list[TrainConfig],
     train_dataset, val_dataset, info: dict,
     out_path: Optional[str] = None,
     device: str = "cuda",
@@ -419,7 +379,7 @@ def grid_search(
     The best config's trained model is saved to disk so we don't need to
     retrain it for the test evaluation.
     """
-    cov_means, cov_stds = compute_covariate_stats(
+    cov_means, cov_stds = compute_cov_stats(
         train_dataset, list(range(len(train_dataset))), info["n_tv"])
 
     train_loader = DataLoader(
@@ -433,7 +393,6 @@ def grid_search(
     best_val_nll = float("inf")
 
     for i, cfg in enumerate(configs):
-        print(f"\n[{i+1}/{len(configs)}] {cfg.key()}")
         t0 = time.time()
         try:
             model, val_metrics = run_config(
@@ -456,10 +415,10 @@ def grid_search(
                 best_val_nll = val_metrics["nll_per_subject"]
                 torch.save({
                     "model_state_dict": model.state_dict(),
-                    "config": asdict(cfg),
+                    "train_config": asdict(cfg),
                     "cov_means": cov_means.tolist(),
                     "cov_stds": cov_stds.tolist(),
-                    "val_metrics": val_metrics,
+                    "val_metrics": val_metrics
                 }, save_best_model_path)
                 print(f"  [new best -> saved to {save_best_model_path}]")
 
@@ -468,7 +427,7 @@ def grid_search(
                 torch.cuda.empty_cache()
 
         except Exception as e:
-            res = {"config_key": cfg.key(), "config": asdict(cfg),
+            res = {"config": asdict(cfg),
                    "status": "error", "error": repr(e),
                    "elapsed_s": time.time() - t0}
             print(f"  ERROR: {e}")
@@ -510,7 +469,7 @@ def evaluate_winner_on_test(
     Set `retrain=True` to retrain from scratch on train + early-stop on val.
     """
     ckpt = torch.load(winner_ckpt_path, map_location=device, weights_only=False)
-    cfg = CVConfig(**ckpt["config"])
+    cfg = TrainConfig.from_dict(ckpt["train_config"])
     cov_means = torch.tensor(ckpt["cov_means"])
     cov_stds = torch.tensor(ckpt["cov_stds"])
 
@@ -552,57 +511,10 @@ def evaluate_winner_on_test(
 
 
 # ─────────────────────────────────────────────────────────────────
-# Empirical-Fisher LCVa (optional diagnostic)
-# ─────────────────────────────────────────────────────────────────
-
-def compute_lcva_empirical_fisher(model, loader, device, ridge: float = 1e-3):
-    """Post-hoc LCVa on a single trained model. Run once on the winner."""
-    model.eval()
-    params = [p for p in model.parameters() if p.requires_grad]
-    scores = []
-    total_ll = 0.0
-    n_subj = 0
-
-    for _, x_aug, y, target_mask, static in loader:
-        B = x_aug.shape[0]
-        for i in range(B):
-            model.zero_grad()
-            xi = x_aug[i:i+1].to(device)
-            si = static[i:i+1].to(device)
-            yi = y[i:i+1].to(device)
-            mi = target_mask[i:i+1].to(device)
-            mu, V, _, _, _, _ = model(xi, static_covariates=si, obs_mask=mi)
-            nll_i = masked_NLL(mu, yi, V, mi)
-            nll_i.backward()
-            g = torch.cat([p.grad.detach().flatten()
-                           for p in params if p.grad is not None]).cpu()
-            scores.append(g)
-            total_ll += (-nll_i).item()
-            n_subj += 1
-
-    S = torch.stack(scores, dim=0)
-    F = S.t() @ S
-    F_reg = F + ridge * torch.diag(torch.diag(F).clamp(min=1e-8))
-    try:
-        F_inv = torch.linalg.inv(F_reg)
-        p_eff = float(torch.trace(F_inv @ F).item())
-    except Exception:
-        p_eff = float("nan")
-
-    n = max(n_subj, 1)
-    return {
-        "L_per_subject": total_ll / n,
-        "p_eff": p_eff,
-        "LCVa_per_subject": -total_ll / n + p_eff / n,
-        "n_subjects": n_subj,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────
 # Grid builders
 # ─────────────────────────────────────────────────────────────────
 
-def build_tier1_grid() -> list[CVConfig]:
+def build_tier1_grid() -> list[TrainConfig]:
     """Tier 1: reg_mode × lambda × use_dynamic_skip."""
     grid = []
     for reg_mode in [None, "group_lasso"]:
@@ -611,26 +523,31 @@ def build_tier1_grid() -> list[CVConfig]:
             for use_skip in [True, False]:
                 if not use_skip and reg_mode == "group_lasso":
                     continue  # no skip weights to penalise
-                grid.append(CVConfig(
+                grid.append(TrainConfig(
+                    cfg=NeuralODEConfig(use_rho_norm=True, ode_solver="rk4",
+                                        enc_mlp_hidden=16, func_mlp_hidden=16),
                     reg_mode=reg_mode,
                     lambda_reg=lam,
                     use_dynamic_skip=use_skip,
-                    use_rho_norm=True,
-                    static_skip_dims = [0,1,2,3]
+                    static_skip_dims = [0,1,2,3],
+                    sched_patience=50,
+                    patience_init=300,
+                    include_mask=True,
+                    encode_baseline_cov=True
                 ))
     return grid
 
 
-def build_tier2_grid(best: CVConfig) -> list[CVConfig]:
+def build_tier2_grid(best: TrainConfig) -> list[TrainConfig]:
     """Tier 2: around the winner, sweep rho_norm, latent dim, p."""
     grid = []
     for rho_norm in [False, True]:
         for h in [16]:
             for p in [2, 4]:
-                cfg = CVConfig(**asdict(best))
-                cfg.use_rho_norm = rho_norm
-                cfg.hidden_channels = h
-                cfg.dec_p = p
+                cfg = TrainConfig.from_dict(asdict(best))
+                cfg.cfg.use_rho_norm = rho_norm
+                cfg.cfg.hidden_channels = h
+                cfg.cfg.dec_p = p
                 grid.append(cfg)
     return grid
 
@@ -662,7 +579,7 @@ if __name__ == "__main__":
     # ---- 3. Tier-2 around the Tier-1 winner ----
     ok1 = [r for r in tier1_results if r.get("status") == "ok"]
     ok1.sort(key=lambda r: r["val_metrics"]["nll_per_subject"])
-    best_tier1 = CVConfig(**ok1[0]["config"])
+    best_tier1 = TrainConfig.from_dict(ok1[0]["config"])
     print(f"\nBest Tier 1: {best_tier1.key()}")
 
     tier2 = build_tier2_grid(best_tier1)
@@ -688,18 +605,10 @@ if __name__ == "__main__":
         train_ds, val_ds, test_ds, info,
         winner_ckpt_path=winner_path, device=str(device), retrain=False)
 
-    # ---- 5. Optional: LCVa diagnostic on the winner ----
-    full_train_loader = DataLoader(
-        train_ds, batch_size=final_cfg.batch_size,
-        shuffle=False, collate_fn=collate_xaug)
-    lcva = compute_lcva_empirical_fisher(
-        model_final, full_train_loader, device=str(device))
-    print(f"\nLCVa: {lcva}")
-
     # ---- 6. Save final artifacts ----
     torch.save({
         "model_state_dict": model_final.state_dict(),
-        "config": asdict(final_cfg),
+        "train_config": asdict(final_cfg),
         "cov_means": cov_means.tolist(),
         "cov_stds": cov_stds.tolist(),
         "val_metrics": val_metrics,

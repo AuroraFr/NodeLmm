@@ -13,5 +13,5 @@ mkdir -p logs
 source ~/Torch/bin/activate
 cd /gpfs/home/zli/workspace/CDE_LMM/
  
-python prediction_ODE_real.py --compute_ci --ci_method delta --fisher_cache fisher.npy
+python analyses/evaluation_real.py --compute_ci --ci_method delta --fisher_cache fisher.npy
 

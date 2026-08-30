@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python cumulative_model_selection.py --n_sims 3
+python model_selections/cumulative_model_selection.py --n_sims 10

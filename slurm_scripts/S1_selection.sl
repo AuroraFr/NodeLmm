@@ -20,4 +20,4 @@ module purge
 source ~/torch/bin/activate
 cd /beegfs/zli/workspace/CDE_LMM/
 
-python baseline_model_selection.py --scenario S1 --n_sims 3 --data_dir simu_datasets/S2a_sims
+python model_selections/baseline_model_selection.py --scenario S1 --n_sims 10 --data_dir simu_datasets/S2a_sims

@@ -53,8 +53,8 @@ class PDPConfig:
 
     # ── target intervention ─────────────────────────────────────────────
     target_feature: str = "BMI"           # must be in train_config's TV features
-    v_lo: float = 24.0
-    v_hi: float = 30.0
+    v_lo: float = 23.0
+    v_hi: float = 28.0
 
     # ── evaluation grids ────────────────────────────────────────────────
     ci_grid: List[float] = field(default_factory=lambda: [2.0, 4.0, 8.0, 10.0])
@@ -118,8 +118,16 @@ def rebuild_model_from_checkpoint(ckpt_path, device):
     load its weights. Returns (model, train_config_dict)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     tc = ckpt["train_config"]
+    print(tc)
     cov_means = ckpt["cov_means"]
     cov_stds = ckpt["cov_stds"]
+    # cov_means = ckpt["bmi_mean"]
+    # cov_stds = ckpt["bmi_std"]
+
+    if not tc.get("time_varying_features"):
+        tc["time_varying_features"] = ["BMI", "PAS", "PAD", "GLUC", "HDL"]
+    if not tc.get("static_features"):
+        tc["static_features"] = ["SEX_code", "AGEc", "DIPNIV_2", "DIPNIV_3"]
 
     K = len(tc["time_varying_features"])
     Ks = len(tc["static_features"])
@@ -142,6 +150,7 @@ def rebuild_model_from_checkpoint(ckpt_path, device):
         encode_baseline_cov=tc["encode_baseline_cov"],
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"], strict=True)
+    print(model)
     model.eval()
     return model, tc
 
@@ -162,9 +171,9 @@ def load_training_dataset(tc: dict, sim_index: Optional[int] = None):
     if data_kind == "csv_real":
         import pandas as pd
         from Preprocess_3C import process_data
-        df = pd.read_csv(tc["train_csv"])
+        df = pd.read_csv("3C_dataset/train_3C_data_1.csv")
         if "AGEc" not in df.columns:
-            all_df = pd.read_csv(tc["all_csv"])
+            all_df = pd.read_csv("3C_dataset/data_3C.csv")
             base_mean = all_df.groupby(tc["id_col"])["AGE0"].first().mean()
             df["AGEc"] = df.groupby(tc["id_col"])["AGE0"].transform("first") - base_mean
         patient_data = process_data(
@@ -310,18 +319,17 @@ def run_real(cfg: PDPConfig, device):
     if cfg.make_plots:
         PDP.plot_all_pairwise_delta_pdp(
             ci_results, ci_grid,
-            save_path=os.path.join(cfg.output_dir, f"{cfg.name}_delta_pairs.eps"),
+            save_path=os.path.join(cfg.output_dir, f"{cfg.target_feature}_delta_pairs.eps"),
             target_name=cfg.target_feature, fisher_inv=fisher_inv)
         
-        PDP.plot_trajectory_profile_pdp_continuous(
+        PDP.plot_profile_pdp(
             pdp_by_profile, plot_grid,
-            save_path=os.path.join(cfg.output_dir, f"{cfg.name}_profiles.eps"),
-            target_name=cfg.target_feature)
+            save_path=os.path.join(cfg.output_dir, f"{cfg.target_feature}_profiles.eps"))
 
 
-    np.savez(os.path.join(cfg.output_dir, f"{cfg.name}_results.npz"),
-             ci_grid=ci_grid,
-             **{k: v for k, v in _flatten_ci(ci_results).items()})
+    # np.savez(os.path.join(cfg.output_dir, f"{cfg.name}_results.npz"),
+    #          ci_grid=ci_grid,
+    #          **{k: v for k, v in _flatten_ci(ci_results).items()})
     print(f"  real ΔPDP done: {cfg.output_dir}")
     return ci_results
 
@@ -345,7 +353,7 @@ def _grids(cfg):
     #     eval_idx = [int(np.argmin(np.abs(t_grid - float(te)))) for te in report]
     #     return t_grid, report, eval_idx
     if mode == "dense":
-        step = cfg.dense_step if cfg.dense_step is not None else 1.0
+        step = cfg.dense_step if cfg.dense_step is not None else 0.5
         t_dense, eval_idx = PDP._build_dense_grid(report, step)
         return t_dense, report, eval_idx
     raise ValueError(f"Unknown grid_mode {mode!r} (none|dense)")
@@ -481,15 +489,18 @@ def _print_sim_summary(summary, ci_grid):
           f"{diag.get('mean_stationarity_ratio', float('nan')):.4f}")
     print(f"{'='*72}")
     print(f"  {'t':>6s}  {'ΔPDP_hat':>9s}  {'true':>8s}  {'bias':>8s}  "
-          f"{'Var_MC':>9s}  {'Var_est':>9s}  {'cover95':>8s}  {'D':>4s}")
+          f"{'Var_MC':>9s}  {'Var_est':>9s}  {'cover95':>8s}  {'D':>4s}"
+          )
     for t in ci_grid:
         tk = float(t)
         if tk not in summary:
             continue
         s = summary[tk]
         print(f"  {tk:6.1f}  {s['mean_hat']:+9.4f}  {s['true']:+8.4f}  "
-              f"{s['bias']:+8.4f}  {s['var_mc']:9.4f}  {s['mean_var_est']:9.4f}  "
-              f"{s['coverage95']:8.3f}  {s['D']:4d}")
+              f"{s['bias']:+8.4f}  "  
+              f"{s['var_mc']:9.4f}  {s['mean_var_est']:9.4f}  "
+              f"{s['coverage95']:8.3f}  {s['D']:4d}"
+              )
 
 
 # ══════════════════════════════════════════════════════════════════════════

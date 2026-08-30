@@ -15,6 +15,10 @@ Usage:
     plot_zt_diagnostic(zt_dict, pdp_dict, visit_times, save_path="zt_diag.png")
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # puts CDE_LMM/ on path
 import torch
 import numpy as np
 import matplotlib.pyplot as plt

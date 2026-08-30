@@ -1,7 +1,7 @@
 {
   "name": "sim_cumulative",
   "setting": "simulation",
-  "checkpoint": "checkpoints2/simulation_cumulative/best_model_ode_*.pt",
+  "checkpoint": "checkpoints2/simulation_cumulative2/best_model_ode_*.pt",
   "target_feature": "BMI_t",
   "v_lo": 23.0,
   "v_hi": 28.0,
@@ -33,7 +33,7 @@
     "alpha": -0.05,
     "agec_col": 1
   },
-  "output_dir": "pdp_out/sim_cumulative",
+  "output_dir": "pdp_out/sim_cumulative2",
   "make_plots": false,
   "verbose": true
 }
