@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #SBATCH -J var_base
 # Asking for one node
-#SBATCH -w bora041 --time=2-10:00:00 --exclusive
+#SBATCH -w bora040 --time=2-10:00:00 --exclusive
 # Standard output
-#SBATCH -o logs/baseline_variance_bmi.%j.out
+#SBATCH -o logs/baseline_variance.%j.out
 # Standard error
-#SBATCH -e logs/baseline_variance_bmi.%j.err
+#SBATCH -e logs/baseline_variance.%j.err
 
 echo "=====my job information ===="
 echo "Node List: " $SLURM_NODELIST

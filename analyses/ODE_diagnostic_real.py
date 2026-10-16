@@ -222,7 +222,7 @@ def plot_zt_diagnostic(zt_dict, pdp_dict, profiles, visit_times,
                 linewidth=2, label=label)
     ax.set_ylabel("E[IST]")
     ax.set_xlabel("Time (years)")
-    ax.set_title("Population prediction (PDP)")
+    ax.set_title("Population prediction")
     ax.legend(fontsize=7, loc='upper right')
     ax.grid(True, alpha=0.3)
 

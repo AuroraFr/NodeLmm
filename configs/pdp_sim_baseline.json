@@ -1,7 +1,7 @@
 {
   "name": "sim_baseline",
   "setting": "simulation",
-  "checkpoint": "checkpoints2/simulation_baseline_bmi_in_ode/best_model_ode_*.pt",
+  "checkpoint": "checkpoints2/simulation_baseline_decP_4_bmi/best_model_ode_*.pt",
   "target_feature": "BMI_t",
   "v_lo": 23.0,
   "v_hi": 28.0,
@@ -31,7 +31,7 @@
     "beta_int": -0.05,
     "agec_col": 1
   },
-  "output_dir": "pdp_result/simulation_baseline_bmi_in_ode",
+  "output_dir": "pdp_result/simulation_baseline_decP_4_bmi",
   "make_plots": false,
   "verbose": true
 }

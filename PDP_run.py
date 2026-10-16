@@ -117,7 +117,8 @@ def rebuild_model_from_checkpoint(ckpt_path, device):
     """Reconstruct the model from the embedded train_config + cov stats and
     load its weights. Returns (model, train_config_dict)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    tc = ckpt["train_config"]
+    tc = ckpt["config"]
+    # tc = ckpt["train_config"]
     print(tc)
     cov_means = ckpt["cov_means"]
     cov_stds = ckpt["cov_stds"]
@@ -317,8 +318,11 @@ def run_real(cfg: PDPConfig, device):
         active_threshold=cfg.active_threshold, verbose=cfg.verbose)
 
     if cfg.make_plots:
+        
         PDP.plot_all_pairwise_delta_pdp(
             ci_results, ci_grid,
+            profiles=ci_profiles,
+
             save_path=os.path.join(cfg.output_dir, f"{cfg.target_feature}_delta_pairs.eps"),
             target_name=cfg.target_feature, fisher_inv=fisher_inv)
         

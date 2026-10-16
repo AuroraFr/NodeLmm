@@ -71,85 +71,68 @@ def make_profiles(eval_grid, v_lo, v_hi):
 
 def resample_xaug_to_grid(x_aug, obs_mask, eval_grid, n_tv):
     """
-    Resample x_aug from its original (irregular) time slots onto a continuous grid.
-
-    For each subject and each covariate channel:
-      - Identify observed slots (obs_mask > 0)
-      - Linearly interpolate covariate values to eval_grid
-      - Beyond last observation: LOCF
-      - Before first observation: first-observation-carried-backward
-
-    Args:
-        x_aug:     (N, T_orig, 1+2K) original augmented input
-        obs_mask:  (N, T_orig) binary mask of observed visits
-        eval_grid: (L,) numpy array of new time points
-        n_tv:      K, number of time-varying covariates
-
-    Returns:
-        x_aug_new:    (N, L, 1+2K) resampled x_aug
-        obs_mask_new: (N, L) all-ones mask
+    Reproduce what _integrate_manual feeds f_phi at time t:
+      - values: linear interpolation between slots
+      - masks:  mask of the LAST slot with time <= t. Missed visits are slots
+                with a duplicated time (dt = 0); the integrator skips them and
+                then uses their mask, so the last duplicate is the one in force.
+    obs_mask is not used (kept for signature compatibility).
     """
     K = n_tv
-    N, T_orig, D = x_aug.shape
-    L = len(eval_grid)
-    device = x_aug.device
-    dtype = x_aug.dtype
+    N, T, D = x_aug.shape
+    xa = x_aug.detach().cpu().numpy()
+    grid = np.asarray(eval_grid, dtype=xa.dtype)
+    L = len(grid)
 
-    x_aug_new = torch.zeros(N, L, D, device=device, dtype=dtype)
-
-    grid_tensor = torch.tensor(eval_grid, device=device, dtype=dtype)
-    x_aug_new[:, :, 0] = grid_tensor.unsqueeze(0).expand(N, -1)
+    out = np.zeros((N, L, D), dtype=xa.dtype)
+    out[:, :, 0] = grid
 
     for i in range(N):
-        t_orig = x_aug[i, :, 0].cpu().numpy()
-        obs_i = obs_mask[i].cpu().numpy() > 0.5
-
-        if not obs_i.any():
-            continue
-
-        t_obs = t_orig[obs_i]
-
+        t = xa[i, :, 0]                                   # non-decreasing, may repeat
+        idx = np.clip(np.searchsorted(t, grid, side="right") - 1, 0, T - 1)
+        t_u, first = np.unique(t, return_index=True)      # values equal at duplicates
         for k in range(K):
-            cov_col = 1 + k
-            mask_col = 1 + K + k
+            c, m = 1 + k, 1 + K + k
+            out[i, :, c] = np.interp(grid, t_u, xa[i, first, c])
+            out[i, :, m] = xa[i, idx, m]
 
-            vals_orig = x_aug[i, :, cov_col].cpu().numpy()
-            vals_obs = vals_orig[obs_i]
+    kw = dict(device=x_aug.device, dtype=x_aug.dtype)
+    return torch.as_tensor(out, **kw), torch.ones(N, L, **kw)
 
-            interp_vals = np.interp(eval_grid, t_obs, vals_obs)
-            x_aug_new[i, :, cov_col] = torch.tensor(
-                interp_vals, device=device, dtype=dtype)
+def build_counterfactual_profile_xaug(x_aug_grid, target_col, profile_values, n_tv,
+                                      mask_type="binary", target_mask="real",
+                                      visit_count=None):
+    """
+    Replace the target covariate's values with v(eval_grid).
 
-            mask_orig = x_aug[i, :, mask_col].cpu().numpy()
-            if mask_orig.max() > 1.5:  # cumulative mask
-                x_aug_new[i, :, mask_col] = torch.arange(
-                    1, L + 1, device=device, dtype=dtype)
-            else:
-                x_aug_new[i, :, mask_col] = 1.0
-
-    obs_mask_new = torch.ones(N, L, device=device, dtype=dtype)
-    return x_aug_new, obs_mask_new
-
-def build_couterfactual_profile_xaug(x_aug_grid, target_col, profile_values,
-                                   n_tv, mask_type="binary"):
-    """Replace target covariate in resampled x_aug with profile values."""
+    target_mask:
+      "real"     -> keep the subject's real held mask (eq. 3.13); same for both mask types
+      "observed" -> fictive covariate treated as measured at every visit:
+                    binary: 1 ; cumulative: number of visits <= t (needs visit_count)
+    """
     K = n_tv
     N, L, _ = x_aug_grid.shape
     x_aug_cf = x_aug_grid.clone()
-
     cov_col = 1 + target_col
     mask_col = 1 + K + target_col
 
-    prof = torch.tensor(profile_values, device=x_aug_grid.device,
-                        dtype=x_aug_grid.dtype)
+    prof = torch.as_tensor(profile_values, device=x_aug_grid.device, dtype=x_aug_grid.dtype)
+    assert prof.shape == (L,), "profile_values must be v(eval_grid)"
     x_aug_cf[:, :, cov_col] = prof.unsqueeze(0).expand(N, -1)
 
-    if mask_type == "binary":
-        x_aug_cf[:, :, mask_col] = 1.0
+    if target_mask == "real":
+        pass
+    elif target_mask == "observed":
+        if mask_type == "binary":
+            x_aug_cf[:, :, mask_col] = 1.0
+        elif mask_type == "cumulative":
+            if visit_count is None:
+                raise ValueError("cumulative 'observed' mask needs visit_count from resampling")
+            x_aug_cf[:, :, mask_col] = visit_count
+        else:
+            raise ValueError(f"unknown mask_type {mask_type!r}")
     else:
-        x_aug_cf[:, :, mask_col] = torch.arange(
-            1, L + 1, device=x_aug_grid.device, dtype=x_aug_grid.dtype
-        ).unsqueeze(0).expand(N, -1)
+        raise ValueError(f"unknown target_mask {target_mask!r}")
 
     return x_aug_cf
 
@@ -191,7 +174,7 @@ def compute_pdp_by_profile(
                     x_aug, target_mask, eval_grid, n_tv,
                 )
 
-                x_aug_cf = build_couterfactual_profile_xaug(
+                x_aug_cf = build_counterfactual_profile_xaug(
                     x_aug_grid, target_col=target_col,
                     profile_values=prof_values, n_tv=n_tv,
                     mask_type=mask_type,
@@ -296,26 +279,142 @@ def plot_profile_pdp(
     print(f"  → {save_path}")
     plt.close()
 
+# def plot_all_pairwise_delta_pdp(
+#     ci_results, eval_grid,
+#     save_path="delta_all_pairs.eps",
+#     target_name="covariate", visit_times=None,
+#     n_subjects=None, fisher_inv=None,
+# ):
+#     """
+#     Plot ΔPDP for three diagnostic pairs side by side:
+#       - early_burden vs late_spike  (path-dependence)
+#       - stable_high vs stable_low   (level effect)
+#       - gradual_decline vs gradual_rise (trend effect)
+#     """
+#     import torch
+
+#     pairs = [
+#         # ("late_decline", "late_spike"),
+#         # ("stable_high", "stable_low"),
+#         # ("gradual_decline", "gradual_rise"),
+#         ("late_decline", "stable_low"),
+#         # ("late_decline", "gradual_decline"),
+#         ("stable_high", "late_spike"),
+#         ("stable_high", "gradual_rise"),
+#         ("gradual_decline", "stable_low"),
+#     ]
+#     pairs = [(a, b) for a, b in pairs
+#              if a in ci_results and b in ci_results]
+
+#     if not pairs:
+#         print("  No profile pairs available for pairwise ΔPDP plot")
+#         return
+
+#     if isinstance(fisher_inv, np.ndarray):
+#         F_inv = torch.from_numpy(fisher_inv).float()
+#     elif fisher_inv is not None:
+#         F_inv = fisher_inv.float()
+#     else:
+#         F_inv = None
+
+#     fig, axes = plt.subplots(2, 2, figsize=(18, 12))
+#     axes = axes.flatten()
+#     if len(pairs) == 1:
+#         axes = [axes]
+
+#     pair_colors = ['#37474F', '#1B5E20', '#4A148C', "#C62828", "#E64A19", "#F57C00"]
+#     pair_fill_colors = [
+#     '#B0BEC5', '#C8E6C9', '#E1BEE7',
+#     '#FFCDD2']
+
+#     # First pass: compute all CIs to find global y range
+#     all_ci_lo = []
+#     all_ci_hi = []
+#     all_data = []
+
+#     for idx, (pa, pb) in enumerate(pairs):
+#         a, b = ci_results[pa], ci_results[pb]
+#         delta_mean = a['mean'] - b['mean']
+#         delta_grad = a['grad'] - b['grad']
+
+#         delta_key = f'_delta_{pa}_vs_{pb}'
+#         if delta_key in ci_results:
+#             delta_se = ci_results[delta_key]['se']
+#         elif F_inv is not None:
+#             delta_se = np.zeros(len(eval_grid))
+#             for ell in range(len(eval_grid)):
+#                 g = torch.from_numpy(delta_grad[ell]).float()
+#                 delta_se[ell] = np.sqrt(max((g @ F_inv @ g).item(), 0.0))
+#         else:
+#             delta_se = np.zeros_like(delta_mean)
+
+#         ci_lo = delta_mean - 1.96 * delta_se
+#         ci_hi = delta_mean + 1.96 * delta_se
+#         all_ci_lo.append(ci_lo.min())
+#         all_ci_hi.append(ci_hi.max())
+#         all_data.append((delta_mean, delta_se, ci_lo, ci_hi))
+
+#     # Global y limits with 5% padding
+#     y_min = min(all_ci_lo)
+#     y_max = max(all_ci_hi)
+#     y_pad = 0.05 * (y_max - y_min)
+#     shared_ylim = (y_min - y_pad, y_max + y_pad)
+
+#     # Second pass: plot
+#     for idx, (pa, pb) in enumerate(pairs):
+#         ax = axes[idx]
+#         delta_mean, delta_se, ci_lo, ci_hi = all_data[idx]
+#         color = pair_colors[idx % len(pair_colors)]
+#         fill  = pair_fill_colors[idx % len(pair_fill_colors)]
+
+#         ax.plot(eval_grid, delta_mean, '-', color=color, linewidth=2)
+#         ax.fill_between(eval_grid, ci_lo, ci_hi, color=fill, alpha=0.4)
+#         ax.axhline(0, color='#B71C1C', linestyle='--', linewidth=1, alpha=0.7)
+
+#         # n_sig = 0
+#         # for ell in range(len(eval_grid)):
+#         #     if ci_hi[ell] < 0 or ci_lo[ell] > 0:
+#         #         ax.plot(eval_grid[ell], delta_mean[ell], 'o',
+#         #                 color='#D32F2F', markersize=5, zorder=5)
+#         #         n_sig += 1
+
+#         if visit_times is not None:
+#             for vt in visit_times:
+#                 ax.axvline(vt, color='grey', linestyle=':', alpha=0.2, linewidth=0.5)
+
+#         ax.set_xlabel('Time (years)', fontsize=13)
+#         if idx % int(len(pairs)/4) == 0:
+#             ax.set_ylabel(r'$\Delta\hat{Y}^{*}(t)$', fontsize=13)
+#         ax.tick_params(labelsize=11)
+
+#         ax.set_ylim(shared_ylim)
+
+#         label_a = PROFILE_LABELS.get(pa, pa)
+#         label_b = PROFILE_LABELS.get(pb, pb)
+#         # sig_str = f'{n_sig}/{len(eval_grid)} sig.' if n_sig > 0 else 'n.s.'
+#         ax.set_title(f'{label_a}− {label_b}', fontsize=18)
+#         # ax.grid(True, alpha=0.3)
+
+#     # fig.suptitle(f'Pairwise ΔPDP for {target_name} (delta-method 95% CI)',
+#     #              fontsize=12, y=1.02)
+#     plt.tight_layout()
+#     plt.savefig(save_path, dpi=300, format='eps')
+#     print(f"  → {save_path}")
+#     plt.close()
+
 def plot_all_pairwise_delta_pdp(
     ci_results, eval_grid,
     save_path="delta_all_pairs.eps",
     target_name="covariate", visit_times=None,
     n_subjects=None, fisher_inv=None,
+    profiles=None,          # dict: profile_name -> array of covariate values over eval_grid
+    profile_grid=None,      # time grid for profiles (defaults to eval_grid)
 ):
-    """
-    Plot ΔPDP for three diagnostic pairs side by side:
-      - early_burden vs late_spike  (path-dependence)
-      - stable_high vs stable_low   (level effect)
-      - gradual_decline vs gradual_rise (trend effect)
-    """
     import torch
+    from matplotlib.gridspec import GridSpec
 
     pairs = [
-        # ("late_decline", "late_spike"),
-        # ("stable_high", "stable_low"),
-        # ("gradual_decline", "gradual_rise"),
         ("late_decline", "stable_low"),
-        # ("late_decline", "gradual_decline"),
         ("stable_high", "late_spike"),
         ("stable_high", "gradual_rise"),
         ("gradual_decline", "stable_low"),
@@ -327,6 +426,9 @@ def plot_all_pairwise_delta_pdp(
         print("  No profile pairs available for pairwise ΔPDP plot")
         return
 
+    if profile_grid is None:
+        profile_grid = eval_grid
+
     if isinstance(fisher_inv, np.ndarray):
         F_inv = torch.from_numpy(fisher_inv).float()
     elif fisher_inv is not None:
@@ -334,20 +436,22 @@ def plot_all_pairwise_delta_pdp(
     else:
         F_inv = None
 
-    fig, axes = plt.subplots(2, 2, figsize=(18, 12))
-    axes = axes.flatten()
-    if len(pairs) == 1:
-        axes = [axes]
+    n_pairs = len(pairs)
+    nrows = 2
+    ncols = (n_pairs + 1) // 2
 
-    pair_colors = ['#37474F', '#1B5E20', '#4A148C', "#C62828", "#E64A19", "#F57C00"]
-    pair_fill_colors = [
-    '#B0BEC5', '#C8E6C9', '#E1BEE7',
-    '#FFCDD2']
+    # GridSpec: for each pair, a narrow profile column + a wide contrast column
+    fig = plt.figure(figsize=(11 * ncols, 6 * nrows))
+    gs = GridSpec(nrows, ncols * 2, figure=fig,
+                 width_ratios=[2, 5] * ncols, wspace=0.5, hspace=0.5)
 
-    # First pass: compute all CIs to find global y range
-    all_ci_lo = []
-    all_ci_hi = []
+    pair_colors = ['#37474F', '#1B5E20', '#4A148C', '#C62828']
+    pair_fill_colors = ['#B0BEC5', '#C8E6C9', '#E1BEE7', '#FFCDD2']
+    profile_colors = {'a': '#D32F2F', 'b': '#1565C0'}  # red vs blue for the two profiles
+
+    # --- First pass: compute all CIs for shared y-limits ---
     all_data = []
+    all_ci_lo, all_ci_hi = [], []
 
     for idx, (pa, pb) in enumerate(pairs):
         a, b = ci_results[pa], ci_results[pb]
@@ -371,50 +475,67 @@ def plot_all_pairwise_delta_pdp(
         all_ci_hi.append(ci_hi.max())
         all_data.append((delta_mean, delta_se, ci_lo, ci_hi))
 
-    # Global y limits with 5% padding
-    y_min = min(all_ci_lo)
-    y_max = max(all_ci_hi)
+    y_min, y_max = min(all_ci_lo), max(all_ci_hi)
     y_pad = 0.05 * (y_max - y_min)
     shared_ylim = (y_min - y_pad, y_max + y_pad)
 
-    # Second pass: plot
+    # --- Second pass: plot ---
     for idx, (pa, pb) in enumerate(pairs):
-        ax = axes[idx]
+        row = idx // ncols
+        col = idx % ncols
+
+        ax_prof = fig.add_subplot(gs[row, col * 2])       # narrow: profiles
+        ax_delta = fig.add_subplot(gs[row, col * 2 + 1])   # wide: contrast
+
         delta_mean, delta_se, ci_lo, ci_hi = all_data[idx]
         color = pair_colors[idx % len(pair_colors)]
-        fill  = pair_fill_colors[idx % len(pair_fill_colors)]
-
-        ax.plot(eval_grid, delta_mean, '-', color=color, linewidth=2)
-        ax.fill_between(eval_grid, ci_lo, ci_hi, color=fill, alpha=0.4)
-        ax.axhline(0, color='#B71C1C', linestyle='--', linewidth=1, alpha=0.7)
-
-        # n_sig = 0
-        # for ell in range(len(eval_grid)):
-        #     if ci_hi[ell] < 0 or ci_lo[ell] > 0:
-        #         ax.plot(eval_grid[ell], delta_mean[ell], 'o',
-        #                 color='#D32F2F', markersize=5, zorder=5)
-        #         n_sig += 1
-
-        if visit_times is not None:
-            for vt in visit_times:
-                ax.axvline(vt, color='grey', linestyle=':', alpha=0.2, linewidth=0.5)
-
-        ax.set_xlabel('Time (years)', fontsize=13)
-        if idx % int(len(pairs)/4) == 0:
-            ax.set_ylabel('ΔPDP', fontsize=13)
-        ax.tick_params(labelsize=11)
-
-        ax.set_ylim(shared_ylim)
+        fill = pair_fill_colors[idx % len(pair_fill_colors)]
 
         label_a = PROFILE_LABELS.get(pa, pa)
         label_b = PROFILE_LABELS.get(pb, pb)
-        # sig_str = f'{n_sig}/{len(eval_grid)} sig.' if n_sig > 0 else 'n.s.'
-        ax.set_title(f'{label_a}− {label_b}', fontsize=18)
-        # ax.grid(True, alpha=0.3)
 
-    # fig.suptitle(f'Pairwise ΔPDP for {target_name} (delta-method 95% CI)',
-    #              fontsize=12, y=1.02)
-    plt.tight_layout()
+        # ── Profile panel ──
+        # if profiles is not None and pa in profiles and pb in profiles:
+        #     ax_prof.plot(profile_grid, profiles[pa], '-',
+        #                  color=profile_colors['a'], linewidth=1.8, label=label_a)
+        #     ax_prof.plot(profile_grid, profiles[pb], '-',
+        #                  color=profile_colors['b'], linewidth=1.8, label=label_b)
+        #     ax_prof.legend(fontsize=8, loc='best', framealpha=0.7)
+        # ax_prof.set_xlabel('Time (years)', fontsize=10)
+        # ax_prof.set_ylabel(target_name, fontsize=10)
+        # ax_prof.tick_params(labelsize=9)
+        # ax_prof.set_title('Profiles', fontsize=11)
+
+        # ── Contrast panel ──
+        ax_delta.plot(eval_grid, delta_mean, '-', color=color, linewidth=2)
+        ax_delta.fill_between(eval_grid, ci_lo, ci_hi, color=fill, alpha=0.4)
+        ax_delta.axhline(0, color='#B71C1C', linestyle='--', linewidth=1, alpha=0.7)
+
+        if profiles is not None and pa in profiles and pb in profiles:
+            ax_prof.plot(profile_grid, profiles[pa], '-',
+                        color=profile_colors['a'], linewidth=1.5, label=label_a)
+            ax_prof.plot(profile_grid, profiles[pb], '-',
+                        color=profile_colors['b'], linewidth=1.5, label=label_b)
+            ax_prof.legend(fontsize=7, loc='best', framealpha=0.7)
+        ax_prof.set_xlabel('Time', fontsize=8)
+        ax_prof.set_ylabel('')
+        ax_prof.tick_params(labelsize=7)
+        ax_prof.set_title('', fontsize=9)
+        ax_prof.spines['top'].set_visible(False)
+        ax_prof.spines['right'].set_visible(False)
+        ax_prof.grid(False)
+        ax_prof.set_yticks([])
+
+        if visit_times is not None:
+            for vt in visit_times:
+                ax_delta.axvline(vt, color='grey', linestyle=':', alpha=0.2, linewidth=0.5)
+
+        ax_delta.set_xlabel('Time (years)', fontsize=13)
+        ax_delta.set_ylabel(r'$\Delta\hat{Y}^{*}(t)$', fontsize=13)
+        ax_delta.tick_params(labelsize=11)
+        ax_delta.set_ylim(shared_ylim)
+        ax_delta.set_title(f'{label_a} − {label_b}', fontsize=14)
+
     plt.savefig(save_path, dpi=300, format='eps')
     print(f"  → {save_path}")
     plt.close()

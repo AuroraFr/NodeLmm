@@ -14,7 +14,7 @@ from typing import Dict
 
 from PDP import (
     resample_xaug_to_grid,
-    build_couterfactual_profile_xaug,
+    build_counterfactual_profile_xaug,
 )
 
 
@@ -468,7 +468,7 @@ def compute_all_profile_pdp_gradients(
         # --- Forward pass for each profile (all in same graph) ---
         mu_dict = {}
         for pname, prof_values in profiles.items():
-            x_aug_cf = build_couterfactual_profile_xaug(
+            x_aug_cf = build_counterfactual_profile_xaug(
                 x_aug_grid, target_col=target_col,
                 profile_values=prof_values, n_tv=n_tv,
                 mask_type=mask_type,

@@ -2,9 +2,9 @@
   "name": "real3C",
   "setting": "real",
   "checkpoint": "checkpoints2/cv_final_model.pt",
-  "target_feature": "BMI",
-  "v_lo": 23.0,
-  "v_hi": 28.0,
+  "target_feature": "GLUC",
+  "v_lo": 4.0,
+  "v_hi": 10.0,
   "ci_grid": [
     0.0,
     1.0,

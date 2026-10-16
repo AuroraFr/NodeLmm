@@ -699,7 +699,7 @@ def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
                 capsize=4, label="Observed (mean, 95% CI)")
 
     # ── ODE BLUP with delta method CI error bars ────────────────────
-    label = "Neural ODE-LMM (95% CI)" if mode == "fit" else "Neural ODE-LMM (forecast)"
+    label = "Neural ODE-LMM" if mode == "fit" else "Neural ODE-LMM (forecast)"
     print(df_pop["mean_y_blup"].values)
     if ci_dict is not None:
         y_ode = df_pop["mean_y_blup"].values 
@@ -707,10 +707,11 @@ def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
         yerr_hi = ci_dict["ci_hi_blup"] - y_ode
         print(yerr_hi, yerr_lo)
         print(df_pop["mean_y_blup"].values, ci_dict['mean_blup'])
-        ax.errorbar(ci_dict["time"], y_ode,
-                    yerr=[yerr_lo, yerr_hi],
-                    fmt="o--", color="green", linewidth=2, markersize=6,
-                    capsize=4, label=label)
+        ax.plot(ci_dict["time"], y_ode,
+                    # yerr=[yerr_lo, yerr_hi],
+                    "o--", color="green", linewidth=2, markersize=6,
+                    # capsize=4, 
+                    label=label)
     else:
         ax.plot(df_pop["time"], df_pop["mean_y_blup"], "o--", color="green",
                 linewidth=2, markersize=6, label=label)
@@ -721,10 +722,11 @@ def plot_population_averaged(df_pop, hlme_pop=None, mode="fit",
         yerr_lo = y_hlme - hlme_pop["ci_lo_delta"]
         yerr_hi = hlme_pop["ci_hi_delta"] - y_hlme
         print(yerr_hi, yerr_lo)
-        ax.errorbar(hlme_pop["time"], y_hlme,
-                    yerr=[yerr_lo, yerr_hi],
-                    fmt="o--", color="black", linewidth=2, markersize=6,
-                    capsize=4, label="LMM (95% CI)")
+        ax.plot(hlme_pop["time"], y_hlme,
+                    # yerr=[yerr_lo, yerr_hi],
+                    "o--", color="black", linewidth=2, markersize=6,
+                    # capsize=4, 
+                    label="LMM")
 
     ax.set_xlabel("Time since inclusion (years)", fontsize=12)
     ax.set_ylabel("IST", fontsize=12)

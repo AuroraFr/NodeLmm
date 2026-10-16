@@ -40,7 +40,7 @@
     "enc_mlp_hidden": 16,
     "func_mlp_hidden": 16,
     "dec_rho_hidden": 8,
-    "dec_p": 2,
+    "dec_p": 4,
     "dec_q": 3,
     "encoder_depth": 1,
     "ode_depth": 1,
@@ -60,6 +60,6 @@
   "patience_init": 300,
   "patience_reset": 300,
   "sched_patience": 50,
-  "ckpt_dir": "checkpoints2/simulation_baseline_bmi_in_ode",
+  "ckpt_dir": "checkpoints2/simulation_baseline_decP_4_bmi",
   "ckpt_template": "best_model_ode_{tag}.pt"
 }

@@ -48,7 +48,8 @@
     "dropout": 0.0,
     "euler_steps_per_interval": 4,
     "ode_solver": "rk4",
-    "use_rho_norm": false
+    "use_rho_norm": false,
+    "beta_init_scale": 0.1
   },
   "lr": 0.001,
   "wd": 1e-05,
